@@ -1,0 +1,6 @@
+dvc
+dvc-gdrive
+transformers
+torch
+peft
+trl

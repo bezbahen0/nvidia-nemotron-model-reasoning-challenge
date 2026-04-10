@@ -1,0 +1,18 @@
+schema: '2.0'
+stages:
+  test_pipeline:
+    cmd: echo "Pipeline executed successfully" > data/dummy_output.txt
+    deps:
+    - path: data/raw/test.csv
+      hash: md5
+      md5: 8f315dd81af3ec86dde5c934d5a049fb
+      size: 1461
+    - path: data/raw/train.csv
+      hash: md5
+      md5: d8c87be98a92c6b5398427fc2f02e35a
+      size: 3069304
+    outs:
+    - path: data/dummy_output.txt
+      hash: md5
+      md5: de1108b090ac3053b3ef9b2d46803e49
+      size: 31

@@ -1,0 +1,8 @@
+stages:
+  test_pipeline:
+    cmd: echo "Pipeline executed successfully" > data/dummy_output.txt
+    deps:
+      - data/raw/train.csv
+      - data/raw/test.csv
+    outs:
+      - data/dummy_output.txt

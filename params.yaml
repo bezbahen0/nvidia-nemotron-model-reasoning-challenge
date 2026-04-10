@@ -1,0 +1,7 @@
+prepare:
+  input: data/афыав
+  output: data/train_test.csv
+
+train:
+  input: data/train_test.csv
+  model_path: data/trained_model/аыфва
