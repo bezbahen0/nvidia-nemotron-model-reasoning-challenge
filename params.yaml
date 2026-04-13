@@ -15,11 +15,11 @@ split:
   val_size: 0.1
 
 train:
-  batch_size: 4
+  batch_size: 2
   grad_accum: 4
   epochs: 1
   seed: 31231
-  eval_steps: 500
+  eval_steps: 300
 
 
 evaluate:

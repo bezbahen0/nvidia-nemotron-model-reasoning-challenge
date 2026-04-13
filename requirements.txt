@@ -11,3 +11,4 @@ accelerate
 wandb
 scikit-learn
 pandas
+vllm
