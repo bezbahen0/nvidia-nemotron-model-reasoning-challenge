@@ -1,8 +1,70 @@
 stages:
-  test_pipeline:
-    cmd: echo "Pipeline executed successfully" > data/dummy_output.txt
+  begin_pipeline:
+    cmd: cp data/raw/final_Nemotron_training_data.csv data/raw/final_Nemotron_training_data-new.csv
     deps:
-      - data/raw/train.csv
-      - data/raw/test.csv
+      - data/raw/final_Nemotron_training_data.csv
     outs:
-      - data/dummy_output.txt
+      - data/raw/final_Nemotron_training_data-new.csv
+      
+  split_data:
+    cmd: >
+      python src/split_data.py 
+      --data_path data/raw/final_Nemotron_training_data-new.csv
+      --train_path data/prepared/train_stratified.csv
+      --val_path data/prepared/val_stratified.csv
+      --val_size 0.1
+    deps:
+      - data/raw/final_Nemotron_training_data-new.csv
+      - src/split_data.py
+    outs:
+      - data/prepared/train_stratified.csv
+      - data/prepared/val_stratified.csv
+
+  sft_train:
+    cmd: >
+      python src/sft_train.py 
+      --model_id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+      --data gemini_cot
+      --train_path data/prepared/train_stratified.csv
+      --val_path data/prepared/val_stratified.csv
+      --output_dir models/sft_baseline_v1
+      --batch_size 4
+      --grad_accum 4
+      --epochs 1
+    deps:
+      - data/prepared/train_stratified.csv
+      - data/prepared/val_stratified.csv
+      - src/sft_train.py
+    outs:
+      - models/sft_baseline_v1
+    
+  evaluate_checkpoints:
+    cmd: >
+      python src/evaluate_checkpoints.py
+      --base_model nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+      --val_data data/prepared/val_stratified.csv
+      --checkpoints_dir models/sft_baseline_v1
+      --output_scores validation_scores.json
+    deps:
+      - data/prepared/val_stratified.csv
+      - models/sft_baseline_v1
+      - src/evaluate_checkpoints.py
+    outs:
+      - validation_scores.json
+
+  blend_adapters:
+    cmd: >
+      python src/blend_adapters.py
+      --base_model nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+      --scores_path validation_scores.json
+      --checkpoints_dir models/sft_baseline_v1
+      --output_best models/lora_best
+      --output_soup models/lora_soup
+      --top_k 5
+    deps:
+      - validation_scores.json
+      - models/sft_baseline_v1
+      - src/blend_adapters.py
+    outs:
+      - models/lora_best
+      - models/lora_soup

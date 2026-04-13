@@ -1,18 +1,74 @@
 schema: '2.0'
 stages:
   test_pipeline:
-    cmd: echo "Pipeline executed successfully" > data/dummy_output.txt
+    cmd: cp data/raw/final_Nemotron_training_data.csv 
+      data/raw/final_Nemotron_training_data-new.csv
     deps:
-    - path: data/raw/test.csv
+    - path: data/raw/final_Nemotron_training_data.csv
       hash: md5
-      md5: 8f315dd81af3ec86dde5c934d5a049fb
-      size: 1461
-    - path: data/raw/train.csv
-      hash: md5
-      md5: d8c87be98a92c6b5398427fc2f02e35a
-      size: 3069304
+      md5: 2a179134cacc7d929b70d66839df688f
+      size: 13301331
     outs:
-    - path: data/dummy_output.txt
+    - path: data/raw/final_Nemotron_training_data-new.csv
       hash: md5
-      md5: de1108b090ac3053b3ef9b2d46803e49
-      size: 31
+      md5: 2a179134cacc7d929b70d66839df688f
+      size: 13301331
+  begin_pipeline:
+    cmd: cp data/raw/final_Nemotron_training_data.csv 
+      data/raw/final_Nemotron_training_data-new.csv
+    deps:
+    - path: data/raw/final_Nemotron_training_data.csv
+      hash: md5
+      md5: 2a179134cacc7d929b70d66839df688f
+      size: 13301331
+    outs:
+    - path: data/raw/final_Nemotron_training_data-new.csv
+      hash: md5
+      md5: 2a179134cacc7d929b70d66839df688f
+      size: 13301331
+  split_data:
+    cmd: "python src/split_data.py  --data_path data/raw/final_Nemotron_training_data-new.csv
+      --train_path data/prepared/train_stratified.csv --val_path data/prepared/val_stratified.csv
+      --val_size 0.1\n"
+    deps:
+    - path: data/raw/final_Nemotron_training_data-new.csv
+      hash: md5
+      md5: 2a179134cacc7d929b70d66839df688f
+      size: 13301331
+    - path: src/split_data.py
+      hash: md5
+      md5: 8eb3ed0da0702859137b211414eab6af
+      size: 3021
+    outs:
+    - path: data/prepared/train_stratified.csv
+      hash: md5
+      md5: 95454e443c201fa5dbe22c7443aa6cec
+      size: 12056562
+    - path: data/prepared/val_stratified.csv
+      hash: md5
+      md5: ccb45c58e09ad0b6a481f422d3844ff5
+      size: 1244806
+  sft_train:
+    cmd: "python src/sft_train.py  --model_id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+      --data gemini_cot --train_path data/prepared/train_stratified.csv --val_path
+      data/prepared/val_stratified.csv --output_dir models/sft_baseline_v1 --batch_size
+      4 --grad_accum 4 --epochs 1\n"
+    deps:
+    - path: data/prepared/train_stratified.csv
+      hash: md5
+      md5: 95454e443c201fa5dbe22c7443aa6cec
+      size: 12056562
+    - path: data/prepared/val_stratified.csv
+      hash: md5
+      md5: ccb45c58e09ad0b6a481f422d3844ff5
+      size: 1244806
+    - path: src/sft_train.py
+      hash: md5
+      md5: 3f6bd759bac1ad9bf3043af39b07c5b5
+      size: 5346
+    outs:
+    - path: models/sft_baseline_v1
+      hash: md5
+      md5: 3918aaad561694d4894c32243273176a.dir
+      size: 1584941702
+      nfiles: 140
