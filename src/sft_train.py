@@ -122,6 +122,7 @@ def main():
 
         dataloader_num_workers=16,
         dataloader_prefetch_factor=3,
+        dataset_num_proc=24,
 
         report_to="wandb",
         run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
@@ -132,11 +133,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         peft_config=lora_config,
-        args=training_args,
-
-        dataset_kwargs={
-            "num_proc": 24,
-        }
+        args=training_args
     )
 
     logger.info("Train...")

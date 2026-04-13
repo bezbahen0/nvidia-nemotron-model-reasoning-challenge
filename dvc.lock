@@ -37,8 +37,8 @@ stages:
       size: 13301331
     - path: src/split_data.py
       hash: md5
-      md5: 9705f8563e081ef01d4aff144db256c9
-      size: 3121
+      md5: c2b7fe4e75487100ad773f1fd2b4bbbf
+      size: 3115
     params:
       params.yaml:
         split.val_size: 0.1
@@ -46,12 +46,12 @@ stages:
     outs:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 7c50d3cd2464f841673c9f8e1f36fdda
-      size: 129819
+      md5: c7ff0e7a23138a1ea2ad677fd8d70392
+      size: 12042987
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 3008b66f6e348a6b42c153150a7997b7
-      size: 16083
+      md5: 08ace9607244964b66e4087c0d411e64
+      size: 1258381
   sft_train:
     cmd: "python -m src.sft_train  --wandb_run_basename baseline-debug --model_id
       nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 --data gemini_cot --train_path data/prepared/train_stratified.csv
