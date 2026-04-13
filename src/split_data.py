@@ -20,7 +20,7 @@ def main():
     args = parse_args()
 
     logger.info(f"Загрузка данных из {args.data_path}...")
-    df = pd.read_csv(args.data_path)[:100]
+    df = pd.read_csv(args.data_path)
 
     if 'label' not in df.columns:
         raise ValueError("В датасете отсутствует колонка 'label' для проведения стратификации.")
