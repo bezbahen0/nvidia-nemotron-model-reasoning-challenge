@@ -4,3 +4,4 @@ data
 vllm
 wandb
 models
+__pycache__
