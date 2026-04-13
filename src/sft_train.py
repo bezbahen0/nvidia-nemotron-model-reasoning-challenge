@@ -81,11 +81,10 @@ def main():
     logger.info("Загрузка модели в bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        device_map={"": 0}, # ЖЕСТКО привязываем всё к GPU 0, запрещаем выгрузку в RAM
+        device_map="auto",
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        use_cache=False,
-        attn_implementation="flash_attention_2" # ВКЛЮЧАЕМ Flash Attention
+        use_cache=False 
     )
 
     lora_config = LoraConfig(

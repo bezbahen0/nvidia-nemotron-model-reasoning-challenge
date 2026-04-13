@@ -16,10 +16,10 @@ split:
 
 train:
   batch_size: 2
-  grad_accum: 4
+  grad_accum: 16
   epochs: 1
   seed: 31231
-  eval_steps: 300
+  eval_steps: 200
 
 
 evaluate:
