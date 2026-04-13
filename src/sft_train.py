@@ -12,26 +12,29 @@ from transformers import (
 
 from trl import SFTTrainer, SFTConfig
 
+from src.log import logger
+
 def parse_args():
     parser = argparse.ArgumentParser(description="NVIDIA Nemotron SFT Baseline Trainer")
     
-    # Пути
-    parser.add_argument("--model_id", type=str, default="metric/nemotron-3-nano-30b-a3b-bf16", help="HF ID или локальный путь к модели")
-    parser.add_argument("--data", type=str, required=True, help="Имя датасета для логов W&B")
-    parser.add_argument("--train_path", type=str, required=True, help="Путь к обучающей выборке (train.csv)")
-    parser.add_argument("--val_path", type=str, required=True, help="Путь к валидационной выборке (val.csv)")
-    parser.add_argument("--output_dir", type=str, default="./models/sft_baseline_v1", help="Папка для сохранения адаптера")
+    parser.add_argument("--wandb_run_basename", type=str)
+
+    parser.add_argument("--model_id", type=str, default="nemotron-3-nano-30b-a3b-bf16")
+    parser.add_argument("--data", type=str, required=True, help="dataset name for log W&B")
+    parser.add_argument("--train_path", type=str, required=True, help="train.csv")
+    parser.add_argument("--val_path", type=str, required=True, help="val.csv")
+    parser.add_argument("--output_dir", type=str, default="./models/sft_baseline_v1")
     
-    # Гиперпараметры обучения
+    # train params
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=4, help="Размер батча на один GPU")
-    parser.add_argument("--grad_accum", type=int, default=4, help="Шаги аккумуляции градиента")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--max_seq_len", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--eval_steps", type=int, default=50, help="Шаги между валидациями")
+    parser.add_argument("--eval_steps", type=int, default=50)
     
-    # Параметры LoRA
+    # LoRA
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -39,10 +42,6 @@ def parse_args():
     return parser.parse_args()
 
 def prepare_dataset(csv_path):
-    """
-    Загрузка CSV и приведение к стандартному формату диалогов.
-    Новый SFTTrainer сам применит Chat Template к колонке 'messages'.
-    """
     df = pd.read_csv(csv_path)
 
     instruction_suffix = "\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`"
@@ -68,18 +67,18 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    print(f"Загрузка токенизатора для {args.model_id}...")
+    logger.info(f"Загрузка токенизатора для {args.model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print("Подготовка тренировочного датасета...")
+    logger.info("Подготовка тренировочного датасета...")
     train_dataset = prepare_dataset(args.train_path)
     
-    print("Подготовка валидационного датасета...")
+    logger.info("Подготовка валидационного датасета...")
     val_dataset = prepare_dataset(args.val_path)
 
-    print("Загрузка модели в bfloat16...")
+    logger.info("Загрузка модели в bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         device_map="auto",
@@ -122,7 +121,7 @@ def main():
         group_by_length=True,
 
         report_to="wandb",
-        run_name=f"SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
+        run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
     )
 
     trainer = SFTTrainer(
@@ -133,10 +132,10 @@ def main():
         args=training_args,
     )
 
-    print("Запуск обучения...")
+    logger.info("Train...")
     trainer.train()
 
-    print(f"Сохранение адаптера в {args.output_dir}...")
+    logger.info(f"Save adapters to {args.output_dir}...")
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 

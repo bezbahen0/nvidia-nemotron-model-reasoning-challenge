@@ -2,6 +2,8 @@ import argparse
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+from src.log import logger
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Скрипт для стратифицированного разбиения датасета")
     
@@ -17,8 +19,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    print(f"Загрузка данных из {args.data_path}...")
-    df = pd.read_csv(args.data_path)
+    logger.info(f"Загрузка данных из {args.data_path}...")
+    df = pd.read_csv(args.data_path)[:100]
 
     if 'label' not in df.columns:
         raise ValueError("В датасете отсутствует колонка 'label' для проведения стратификации.")
@@ -27,11 +29,11 @@ def main():
     class_counts = df['label'].value_counts()
     single_item_classes = class_counts[class_counts < 2].index
     if len(single_item_classes) > 0:
-        print(f"\n[!] Внимание: Исключены классы с 1 примером (невозможно стратифицировать):")
-        print(list(single_item_classes))
+        logger.info(f"\n[!] Внимание: Исключены классы с 1 примером (невозможно стратифицировать):")
+        logger.info(list(single_item_classes))
         df = df[~df['label'].isin(single_item_classes)]
 
-    print(f"\nРазбиение данных (val_size = {args.val_size})...")
+    logger.info(f"\nРазбиение данных (val_size = {args.val_size})...")
     train_df, val_df = train_test_split(
         df, 
         test_size=args.val_size, 
@@ -39,10 +41,10 @@ def main():
         stratify=df['label']
     )
 
-    print(f"Сохранение train в {args.train_path} ({len(train_df)} строк)")
+    logger.info(f"Сохранение train в {args.train_path} ({len(train_df)} строк)")
     train_df.to_csv(args.train_path, index=False)
     
-    print(f"Сохранение val в {args.val_path} ({len(val_df)} строк)")
+    logger.info(f"Сохранение val в {args.val_path} ({len(val_df)} строк)")
     val_df.to_csv(args.val_path, index=False)
 
     # Подсчет процентов
@@ -58,11 +60,11 @@ def main():
     # Сортировка по убыванию доли в тренировочной выборке
     dist_df.sort_values(by='Train %', ascending=False, inplace=True)
 
-    print("\n" + "="*50)
-    print("РАСПРЕДЕЛЕНИЕ ЗАДАЧ (LABEL) В ВЫБОРКАХ")
-    print("="*50)
-    print(dist_df.to_string())
-    print("="*50)
+    logger.info("\n" + "="*50)
+    logger.info("РАСПРЕДЕЛЕНИЕ ЗАДАЧ (LABEL) В ВЫБОРКАХ")
+    logger.info("="*50)
+    logger.info(dist_df.to_string())
+    logger.info("="*50)
 
 if __name__ == "__main__":
     main()
