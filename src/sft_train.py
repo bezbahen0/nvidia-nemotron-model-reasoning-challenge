@@ -120,6 +120,9 @@ def main():
         completion_only_loss=True, 
         group_by_length=True,
 
+        dataloader_num_workers=16,
+        dataloader_prefetch_factor=3,
+
         report_to="wandb",
         run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
     )
@@ -130,6 +133,10 @@ def main():
         eval_dataset=val_dataset,
         peft_config=lora_config,
         args=training_args,
+
+        dataset_kwargs={
+            "num_proc": 24,
+        }
     )
 
     logger.info("Train...")
