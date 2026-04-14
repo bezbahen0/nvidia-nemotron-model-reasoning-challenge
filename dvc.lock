@@ -53,95 +53,95 @@ stages:
       md5: 08ace9607244964b66e4087c0d411e64
       size: 1258381
   sft_train:
-    cmd: "python -m src.sft_train  --wandb_run_basename baseline-debug --model_id
-      nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 --data gemini_cot --train_path data/prepared/train_stratified.csv
-      --seed 31231 --eval_steps 2 --val_path data/prepared/val_stratified.csv --output_dir
-      models/sft_baseline_v1 --batch_size 4 --grad_accum 4 --epochs 1\n"
+    cmd: "python -m src.sft_train  --wandb_run_basename baseline --model_id nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+      --data gemini_cot --train_path data/prepared/train_stratified.csv --seed 31231
+      --eval_steps 50 --val_path data/prepared/val_stratified.csv --output_dir models/sft_baseline_v1
+      --batch_size 2 --grad_accum 16 --epochs 1\n"
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 7c50d3cd2464f841673c9f8e1f36fdda
-      size: 129819
+      md5: c7ff0e7a23138a1ea2ad677fd8d70392
+      size: 12042987
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 3008b66f6e348a6b42c153150a7997b7
-      size: 16083
+      md5: 08ace9607244964b66e4087c0d411e64
+      size: 1258381
     - path: src/sft_train.py
       hash: md5
-      md5: 161f9ad0d5455c35fdbc2f0e338ca597
-      size: 4739
+      md5: 43c8edd455131636a0f1e1778a77b008
+      size: 4841
     params:
       params.yaml:
         data.dataset_name: gemini_cot
-        model.id: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
-        train.batch_size: 4
+        model.id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+        train.batch_size: 2
         train.epochs: 1
-        train.eval_steps: 2
-        train.grad_accum: 4
+        train.eval_steps: 50
+        train.grad_accum: 16
         train.seed: 31231
-        wandb.wandb_base_run_name: baseline-debug
+        wandb.wandb_base_run_name: baseline
     outs:
     - path: models/sft_baseline_v1
       hash: md5
-      md5: 3e24a18f3d2ba7f7dbd419ab4b2c42ea.dir
-      size: 474237841
-      nfiles: 44
+      md5: 4f437d7fb52a6168f77cd2c1a51d78b3.dir
+      size: 33228391667
+      nfiles: 81
   evaluate_checkpoints:
-    cmd: "python -m src.evaluate_checkpoints --wandb_run_basename baseline-debug --base_model
-      nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 --val_data data/prepared/val_stratified.csv
+    cmd: "python -m src.evaluate_checkpoints --wandb_run_basename baseline --base_model
+      nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 --val_data data/prepared/val_stratified.csv
       --checkpoints_dir models/sft_baseline_v1 --output_scores data/scores/validation_scores.json\n"
     deps:
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 3008b66f6e348a6b42c153150a7997b7
-      size: 16083
+      md5: 08ace9607244964b66e4087c0d411e64
+      size: 1258381
     - path: models/sft_baseline_v1
       hash: md5
-      md5: 5c50ae3fae8b03d4c90035ee58b1cc18.dir
-      size: 474248205
-      nfiles: 47
+      md5: c3ee832cad69c81093be534f80a2bb83.dir
+      size: 33230272286
+      nfiles: 87
     - path: src/evaluate_checkpoints.py
       hash: md5
       md5: d822563ff57848b5a24da02e7f430159
       size: 6384
     params:
       params.yaml:
-        model.id: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+        model.id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     outs:
     - path: data/scores/validation_scores.json
       hash: md5
-      md5: 26886f48c5c54f8c9c2acedc8f4bc07c
-      size: 77
+      md5: 1fc4bd1e53476d533dcecf166ae5282c
+      size: 256
   blend_adapters:
-    cmd: "python -m src.blend_adapters --base_model nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+    cmd: "python -m src.blend_adapters --base_model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
       --scores_path data/scores/validation_scores.json --checkpoints_dir models/sft_baseline_v1
-      --output_best models/lora_best --output_soup models/lora_soup --top_k 5\n"
+      --output_best models/lora_best --output_soup models/lora_soup --top_k 3\n"
     deps:
     - path: data/scores/validation_scores.json
       hash: md5
-      md5: 26886f48c5c54f8c9c2acedc8f4bc07c
-      size: 77
+      md5: 1fc4bd1e53476d533dcecf166ae5282c
+      size: 256
     - path: models/sft_baseline_v1
       hash: md5
-      md5: 5c50ae3fae8b03d4c90035ee58b1cc18.dir
-      size: 474248205
-      nfiles: 47
+      md5: c3ee832cad69c81093be534f80a2bb83.dir
+      size: 33230272286
+      nfiles: 87
     - path: src/blend_adapters.py
       hash: md5
       md5: e4060b655eeaa7dbb5d45de1f1c28051
       size: 5155
     params:
       params.yaml:
-        evaluate.top_k: 5
-        model.id: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+        evaluate.top_k: 3
+        model.id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     outs:
     - path: models/lora_best
       hash: md5
-      md5: b7587533c117f8049f10991f01696469.dir
-      size: 138827370
+      md5: 0e170d6c17b82dbb413c55f70218dc11.dir
+      size: 5245431014
       nfiles: 13
     - path: models/lora_soup
       hash: md5
-      md5: 518ec013a6fafd73be64de53d76d43a6.dir
-      size: 161970332
+      md5: 4a28d58ddcf5cb984f9271c033f3d565.dir
+      size: 6961692538
       nfiles: 9
