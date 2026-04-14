@@ -1,8 +1,92 @@
 stages:
-  test_pipeline:
-    cmd: echo "Pipeline executed successfully" > data/dummy_output.txt
+  begin_pipeline:
+    cmd: cp ${data.raw_source} ${data.raw_working}
     deps:
-      - data/raw/train.csv
-      - data/raw/test.csv
+      - ${data.raw_source}
     outs:
-      - data/dummy_output.txt
+      - ${data.raw_working}
+      
+  split_data:
+    cmd: >
+      python -m src.split_data
+      --data_path ${data.raw_working}
+      --train_path ${data.train_prepared}
+      --seed ${train.seed}
+      --val_path ${data.val_prepared}
+      --val_size ${split.val_size}
+    deps:
+      - ${data.raw_working}
+      - src/split_data.py
+    params:
+      - train.seed
+      - split.val_size
+    outs:
+      - ${data.train_prepared}
+      - ${data.val_prepared}
+
+  sft_train:
+    cmd: >
+      python -m src.sft_train 
+      --wandb_run_basename ${wandb.wandb_base_run_name}
+      --model_id ${model.id}
+      --data ${data.dataset_name}
+      --train_path ${data.train_prepared}
+      --seed ${train.seed}
+      --eval_steps ${train.eval_steps}
+      --val_path ${data.val_prepared}
+      --output_dir ${model.sft_output_dir}
+      --batch_size ${train.batch_size}
+      --grad_accum ${train.grad_accum}
+      --epochs ${train.epochs}
+    deps:
+      - ${data.train_prepared}
+      - ${data.val_prepared}
+      - src/sft_train.py
+    params:
+      - wandb.wandb_base_run_name
+      - model.id
+      - data.dataset_name
+      - train.batch_size
+      - train.grad_accum
+      - train.epochs
+      - train.eval_steps
+      - train.seed
+    outs:
+      - ${model.sft_output_dir}
+    
+  evaluate_checkpoints:
+    cmd: >
+      python -m src.evaluate_checkpoints
+      --wandb_run_basename ${wandb.wandb_base_run_name}
+      --base_model ${model.id}
+      --val_data ${data.val_prepared}
+      --checkpoints_dir ${model.sft_output_dir}
+      --output_scores ${evaluate.scores_file}
+    deps:
+      - ${data.val_prepared}
+      - ${model.sft_output_dir}
+      - src/evaluate_checkpoints.py
+    params:
+      - model.id
+    outs:
+      - ${evaluate.scores_file}
+
+  blend_adapters:
+    cmd: >
+      python -m src.blend_adapters
+      --base_model ${model.id}
+      --scores_path ${evaluate.scores_file}
+      --checkpoints_dir ${model.sft_output_dir}
+      --output_best ${model.lora_best_dir}
+      --output_soup ${model.lora_soup_dir}
+      --top_k ${evaluate.top_k}
+    deps:
+      - ${evaluate.scores_file}
+      - ${model.sft_output_dir}
+      - src/blend_adapters.py
+    params:
+      - model.id
+      - evaluate.top_k
+    outs:
+      - ${model.lora_best_dir}
+      - ${model.lora_soup_dir}

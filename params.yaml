@@ -1,7 +1,30 @@
-prepare:
-  input: data/афыав
-  output: data/train_test.csv
+data:
+  raw_source: data/raw/final_Nemotron_training_data.csv
+  raw_working: data/raw/final_Nemotron_training_data-new.csv
+  train_prepared: data/prepared/train_stratified.csv
+  val_prepared: data/prepared/val_stratified.csv
+  dataset_name: gemini_cot
+
+model:
+  id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  sft_output_dir: models/sft_baseline_v1
+  lora_best_dir: models/lora_best
+  lora_soup_dir: models/lora_soup
+
+split:
+  val_size: 0.1
 
 train:
-  input: data/train_test.csv
-  model_path: data/trained_model/аыфва
+  batch_size: 2
+  grad_accum: 16
+  epochs: 1
+  seed: 31231
+  eval_steps: 50
+
+
+evaluate:
+  scores_file: data/scores/validation_scores.json
+  top_k: 3
+
+wandb:
+  wandb_base_run_name: baseline

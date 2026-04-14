@@ -1,6 +1,14 @@
 dvc
 dvc-gdrive
-transformers
+transformers==4.57
 torch
 peft
 trl
+causal_conv1d
+mamba_ssm
+datasets
+accelerate
+wandb
+scikit-learn
+pandas
+vllm
