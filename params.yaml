@@ -6,10 +6,8 @@ data:
   dataset_name: gemini_cot
 
 model:
-  id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-  sft_output_dir: models/sft_baseline_v1
-  lora_best_dir: models/lora_best
-  lora_soup_dir: models/lora_soup
+  id: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+  sft_output_dir: models/sft_v0.0.1
 
 split:
   val_size: 0.1
@@ -17,14 +15,13 @@ split:
 train:
   batch_size: 2
   grad_accum: 16
-  epochs: 1
+  epochs: 4
   seed: 31231
-  eval_steps: 50
-
+  eval_steps: 200
+  max_hours: 10.0
 
 evaluate:
   scores_file: data/scores/validation_scores.json
-  top_k: 3
 
 wandb:
-  wandb_base_run_name: baseline
+  wandb_base_run_name: sft_v0.0.1
