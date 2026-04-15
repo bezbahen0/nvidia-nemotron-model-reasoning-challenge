@@ -154,7 +154,7 @@ def main():
         warmup_ratio=0.1,
         max_length=args.max_seq_len,
         completion_only_loss=True, 
-        group_by_length=True,
+        #group_by_length=True,
 
         dataloader_num_workers=16,
         dataloader_prefetch_factor=3,
