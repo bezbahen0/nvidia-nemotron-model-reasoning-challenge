@@ -156,9 +156,9 @@ def main():
         completion_only_loss=True, 
         #group_by_length=True,
 
-        dataloader_num_workers=16,
-        dataloader_prefetch_factor=3,
-        dataset_num_proc=24,
+        dataloader_num_workers=4,
+        dataloader_prefetch_factor=2,
+        dataset_num_proc=8,
 
         report_to="wandb",
         run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
