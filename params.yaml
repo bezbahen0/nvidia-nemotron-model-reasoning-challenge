@@ -17,8 +17,8 @@ train:
   grad_accum: 16
   epochs: 4
   seed: 31231
-  eval_steps: 10
-  max_hours: 1.0
+  eval_steps: 150
+  max_hours: 10.0
 
 evaluate:
   scores_file: data/scores/validation_scores.json
