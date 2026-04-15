@@ -145,7 +145,7 @@ def main():
         eval_steps=args.eval_steps,
         save_strategy="steps",
         save_steps=args.eval_steps,
-        save_total_limit=6, 
+        save_total_limit=3, 
         load_best_model_at_end=True,
         
         optim="adamw_torch",
