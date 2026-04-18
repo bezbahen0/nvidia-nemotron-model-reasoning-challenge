@@ -1,7 +1,9 @@
-data
 .venv
 .dvc
 vllm
 wandb
 models
 __pycache__
+!data/**/*.dvc
+!data/**/.gitignore
+data

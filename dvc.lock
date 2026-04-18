@@ -27,18 +27,18 @@ stages:
       md5: 2a179134cacc7d929b70d66839df688f
       size: 13301331
   split_data:
-    cmd: "python -m src.split_data --data_path data/raw/final_Nemotron_training_data-new.csv
-      --train_path data/prepared/train_stratified.csv --seed 31231 --val_path data/prepared/val_stratified.csv
+    cmd: "python -m src.split_data --data_path data/solved/train-cot.csv --train_path
+      data/prepared/train_stratified.csv --seed 31231 --val_path data/prepared/val_stratified.csv
       --val_size 0.1\n"
     deps:
-    - path: data/raw/final_Nemotron_training_data-new.csv
+    - path: data/solved/train-cot.csv
       hash: md5
-      md5: 2a179134cacc7d929b70d66839df688f
-      size: 13301331
+      md5: dba0ce2916daeee999985a8315432957
+      size: 11472629
     - path: src/split_data.py
       hash: md5
-      md5: c2b7fe4e75487100ad773f1fd2b4bbbf
-      size: 3115
+      md5: c13aae0165db013d5df032bed463e111
+      size: 2420
     params:
       params.yaml:
         split.val_size: 0.1
@@ -46,12 +46,12 @@ stages:
     outs:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: c7ff0e7a23138a1ea2ad677fd8d70392
-      size: 12042987
+      md5: 31b0e521c7f77b53d1f3cc905427e675
+      size: 10320504
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 08ace9607244964b66e4087c0d411e64
-      size: 1258381
+      md5: e7a669f40d0585932778cd3f84369493
+      size: 1152110
   sft_train:
     cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.1 --model_id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
       --data gemini_cot --train_path data/prepared/train_stratified.csv --seed 31231
@@ -146,3 +146,16 @@ stages:
       md5: 4a28d58ddcf5cb984f9271c033f3d565.dir
       size: 6961692538
       nfiles: 9
+  generate_cot:
+    cmd: "python -m src.generate_cot --train_path data/raw/train.csv --output_path
+      data/solved/train-cot.csv\n"
+    deps:
+    - path: data/raw/train.csv
+      hash: md5
+      md5: d8c87be98a92c6b5398427fc2f02e35a
+      size: 3069304
+    outs:
+    - path: data/solved/train-cot.csv
+      hash: md5
+      md5: dba0ce2916daeee999985a8315432957
+      size: 11472629

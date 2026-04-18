@@ -12,3 +12,4 @@ wandb
 scikit-learn
 pandas
 vllm
+pandarallel

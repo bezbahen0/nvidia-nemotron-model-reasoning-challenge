@@ -1,203 +1,153 @@
 import re
-from decimal import Decimal, getcontext, ROUND_HALF_EVEN
+import math
+import argparse
+import pandas as pd
+from pandarallel import pandarallel
+from tqdm import tqdm
 
-getcontext().prec = 50
+pandarallel.initialize(progress_bar=False)
 
-class NumeralSystemSolver:
-    """conversion to diff numeral system"""
+from src.solvers.bit_manipulation import BitManipulationSolver
+from src.solvers.equations import UnifiedEquationsSolver
+from src.solvers.gravitational import GravitationalSolver
+from src.solvers.numeral_system import NumeralSystemSolver
+from src.solvers.unit_conversion import UnitConversionSolver
+from src.solvers.encryption import EncryptionSolver
+from src.log import logger
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="NVIDIA Nemotron alrgorithmic task solver")
     
-    def __init__(self):
-        self.roman_vals = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
-        self.roman_syms = ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"]
+    parser.add_argument("--train_path", type=str, required=True)
+    parser.add_argument("--output_path", type=str, required=True)
 
-    def generate_cot(self, prompt: str) -> str:
-        """Chain-of-Thought"""
-        target_match = re.search(r"write the number (\d+)", prompt, re.IGNORECASE)
-        if not target_match:
-            return "Parse Error: Target not found."
-        
-        target_num = int(target_match.group(1))
-        examples = re.findall(r"(\d+)\s*->\s*([A-Z]+)", prompt)
-        
-        cot = ["Let's identify the secret numeral system used in Wonderland.\n"]
-        cot.append("Looking at the examples provided:")
-        
-        for arab, rom in examples[:3]:
-            cot.append(f"  {arab} -> {rom}")
-            
-        cot.append("\nThe output symbols (I, V, X, L, C, D, M) and their combinations clearly indicate standard Roman Numerals.")
-        cot.append(f"\nWe need to convert the number {target_num} into Roman numerals using greedy decomposition:")
-        
-        remaining = target_num
-        parts = []
-        
-        for v, s in zip(self.roman_vals, self.roman_syms):
-            while remaining >= v:
-                parts.append(s)
-                remaining -= v
-                cot.append(f"  - Subtract {v} ({s}): remainder is {remaining}.")
-                
-        final_roman = "".join(parts)
-        cot.append(f"\nCombining the symbols gives us: {final_roman}.")
-        cot.append(f"The final answer is {final_roman}.")
-        
-        return "\n".join(cot)
+    return parser.parse_args()
 
-    # TODO: 
-    # Добавить \\boxed в ответ?
-    def extract_answer(self, cot_text: str) -> str:
-        if "Parse Error" in cot_text:
-            return None
+def soft_matcher_from_comp_metric(predicted, ground_truth):
+    if re.fullmatch(r'[01]+', ground_truth):
+        return predicted.lower() == ground_truth.lower()
 
-        match = re.search(r"The final answer is ([A-Z]+)\.", cot_text)
-        return match.group(1) if match else None
+    try:
+        # Try to convert the answers to floating point numbers
+        stored_num = float(ground_truth)
+        predicted_num = float(predicted)
+        # Use a small absolute tolerance for numbers near zero
+        return math.isclose(stored_num, predicted_num, rel_tol=1e-2, abs_tol=1e-5)
+    except Exception:
+        # Fallback to case-insensitive string comparison
+        return predicted.lower() == ground_truth.lower()
+
+ 
+def solver(task_df, solver_obj):
+    task_df['generated_cot'] = task_df['prompt'].parallel_apply(solver_obj.generate_cot)
+
+    task_df['computed_answer'] = task_df['generated_cot'].parallel_apply(solver_obj.extract_answer)
+
+    task_df['is_correct'] = task_df['computed_answer'].astype(str).str.strip() == task_df['answer'].astype(str).str.strip()
+    return task_df
     
-
-class UnitConversionSolver:
-    """unit conversion"""
-    
-    def generate_cot(self, prompt: str) -> str:
-        target_match = re.search(r"convert the following measurement:\s*([\d.]+)", prompt, re.IGNORECASE)
-        if not target_match:
-            return "Parse Error: Target not found."
-        
-        target_str = target_match.group(1)
-        target_dec = Decimal(target_str)
-        
-        examples = re.findall(r"([\d.]+)\s*[a-zA-Z]*\s*becomes\s*([\d.]+)", prompt)
-        if not examples:
-            return "Parse Error: Examples not found."
-
-        cot = ["Let's determine the exact unit conversion ratio using infinite precision.\n"]
-        
-        min_possible_ratio = Decimal('0')
-        max_possible_ratio = Decimal('Infinity')
-        delta = Decimal('0.005')
-        
-        for a_str, b_str in examples:
-            a_dec = Decimal(a_str)
-            b_dec = Decimal(b_str)
-            
-            if a_dec > Decimal('0'):
-                lower = (b_dec - delta) / a_dec
-                upper = (b_dec + delta) / a_dec
-                
-                if lower > min_possible_ratio:
-                    min_possible_ratio = lower
-                if upper < max_possible_ratio:
-                    max_possible_ratio = upper
-                    
-                cot.append(f"  {a_str} -> {b_str} implies ratio in [{lower:.8f}, {upper:.8f}]")
-
-        if min_possible_ratio > max_possible_ratio:
-            cot.append("\nMath Error: Bounds contradict. Falling back to least squares midpoint.")
-            sum_x = sum(Decimal(a) for a, _ in examples)
-            sum_y = sum(Decimal(b) for _, b in examples)
-            avg_ratio = sum_y / sum_x if sum_x != Decimal('0') else Decimal('1')
-            result = target_dec * avg_ratio
-            final_answer = str(result.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN))
-            cot.append(f"The final answer is {final_answer}.")
-            return "\n".join(cot)
-
-        y_min = target_dec * min_possible_ratio
-        y_max = target_dec * max_possible_ratio
-        
-        y_min_rounded = y_min.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)
-        y_max_rounded = y_max.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)
-        
-        cot.append(f"\nTarget {target_str} boundaries: [{y_min:.6f}, {y_max:.6f}]")
-        
-        if y_min_rounded == y_max_rounded:
-            final_answer = str(y_min_rounded)
-            cot.append(f"Both bounds round to exactly {final_answer}. 100% certainty.")
-        else:
-            avg_ratio = (min_possible_ratio + max_possible_ratio) / Decimal('2')
-            result = target_dec * avg_ratio
-            final_answer = str(result.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN))
-            cot.append(f"Ambiguity detected (bounds round differently). Using midpoint ratio {avg_ratio:.8f}.")
-            cot.append(f"Calculation yields {result:.6f}, rounding to {final_answer}.")
-            
-        cot.append(f"The final answer is {final_answer}.")
-        
-        return "\n".join(cot)
-
-    def extract_answer(self, cot_text: str) -> str:
-        if not cot_text or "Error" in cot_text:
-            return None
-        match = re.search(r"The final answer is ([\d.]+)\.", cot_text)
-        return match.group(1) if match else None
-
-
-class GravitationalSolver:
-    """gravitational"""
-    
-    def generate_cot(self, prompt: str) -> str:
-        target_match = re.search(r"determine the falling distance for t\s*=\s*([\d.]+)s", prompt, re.IGNORECASE)
-        if not target_match:
-            return "Parse Error: Target time not found."
-        
-        t_query = float(target_match.group(1))
-
-        examples = re.findall(r"t\s*=\s*([\d.]+)s[,\s]*distance\s*=\s*([\d.]+)\s*m", prompt, re.IGNORECASE)
-        if not examples:
-            return "Parse Error: Examples not found."
-
-        cot = ["WARNING: This is Wonderland gravity, NOT Earth's 9.81 m/s^2!\n"]
-        cot.append("Step 1: Calculate the gravitational constant (g).")
-        cot.append("The formula is d = 0.5 * g * t^2. Therefore, g = d / (0.5 * t^2).")
-        cot.append("To minimize rounding errors from individual examples, we will calculate g using the sum of all distances divided by the sum of all (0.5 * t^2) values:\n")
-        
-        sum_d = 0
-        sum_half_t_sq = 0
-        
-        for i, (t_str, d_str) in enumerate(examples[:6], 1):
-            t, d = float(t_str), float(d_str)
-            if t > 0:
-                half_t_sq = 0.5 * (t ** 2)
-                sum_d += d
-                sum_half_t_sq += half_t_sq
-                cot.append(f"  Example {i}:")
-                cot.append(f"    Given: t = {t}s, d = {d}m")
-                cot.append(f"    0.5 * t^2 = 0.5 * {t**2:.4f} = {half_t_sq:.4f}")
-        
-        if sum_half_t_sq == 0:
-            return "Math Error: Sum of t^2 is zero."
-            
-        g_avg = sum_d / sum_half_t_sq
-        
-        cot.append(f"\nStep 2: Average gravitational constant")
-        cot.append(f"  sum(d) = {sum_d:.4f}")
-        cot.append(f"  sum(0.5 * t^2) = {sum_half_t_sq:.4f}")
-        cot.append(f"  g = {sum_d:.4f} / {sum_half_t_sq:.4f} = {g_avg:.6f} m/s^2\n")
-        
-        cot.append(f"Step 3: Apply to query (t = {t_query}s)")
-        
-        t_squared = t_query ** 2
-        product = g_avg * t_squared
-        d_result = 0.5 * product
-        
-        final_answer = f"{d_result:.2f}"
-        
-        cot.append(f"  Formula: d = 0.5 * g * t^2")
-        cot.append(f"  Substitute: d = 0.5 * {g_avg:.6f} * ({t_query})^2")
-        cot.append(f"  Calculate t^2: ({t_query})^2 = {t_squared:.4f}")
-        cot.append(f"  Calculate g*t^2: {g_avg:.6f} * {t_squared:.4f} = {product:.4f}")
-        cot.append(f"  Calculate 0.5*(g*t^2): 0.5 * {product:.4f} = {d_result:.6f}")
-        cot.append(f"  Rounded to 2 decimals: {final_answer} m")
-        cot.append(f"\nThe final answer is {final_answer}.")
-        
-        return "\n".join(cot)
-
-    def extract_answer(self, cot_text: str) -> str:
-        """Извлекает ответ для проверки."""
-        if "Error" in cot_text:
-            return None
-        match = re.search(r"The final answer is ([\d.]+)\.", cot_text)
-        return match.group(1) if match else None
-
 
 def main():
-    pass
+    args = parse_args()
+
+    data = pd.read_csv(args.train_path)
+
+    data["prompt_eda"] = data.prompt.str.split('.').apply(lambda x: x[0])
+
+    task_classes = {
+        "In Alice's Wonderland, a secret bit manipulation rule transforms 8-bit binary numbers":  "bit manipulation",
+        "In Alice's Wonderland, secret encryption rules are used on text": "encryption",
+        "In Alice's Wonderland, numbers are secretly converted into a different numeral system": "conversion to diff numeral system",
+        "In Alice's Wonderland, a secret unit conversion is applied to measurements": "unit conversion",
+        "In Alice's Wonderland, the gravitational constant has been secretly changed": "gravitational",
+        "In Alice's Wonderland, a secret set of transformation rules is applied to equations": "equations transformation"
+    }
+
+    data["label"] = data.prompt_eda.map(task_classes)
+    logger.info(f'\n{data["label"].value_counts()}')
+
+    # For encription
+    global_vocab = set()
+    for prompt in data[data.label == 'encryption']['prompt']:
+        lines = [l.strip() for l in prompt.lower().splitlines() if "->" in l]
+        for line in lines:
+            plain = line.split("->", 1)[1]
+            words = re.sub(r"[^a-z\s]", "", plain).split()
+            global_vocab.update(words)
+
+
+    task_solvers_map = {
+        "bit manipulation": BitManipulationSolver(),
+        "encryption": EncryptionSolver(vocabulary=global_vocab),
+        "conversion to diff numeral system": NumeralSystemSolver(),
+        "unit conversion": UnitConversionSolver(),
+        "gravitational": GravitationalSolver(),
+        "equations transformation": UnifiedEquationsSolver()
+    }    
+
+    raw_accuracy = {}
+    processed_dfs = []
+
+    for task, task_solver in tqdm(task_solvers_map.items(), total=len(task_solvers_map)):
+        task_df = data[data.label == task].copy()
+        
+        task_df = solver(task_df, task_solver)
+        
+        computed = task_df['computed_answer'].astype(str).str.lower().str.strip()
+        true = task_df['answer'].astype(str).str.lower().str.strip()
+        
+        task_df['is_correct'] = computed == true
+        raw_accuracy[task] = task_df['is_correct'].mean() * 100
+        processed_dfs.append(task_df)
+    
+    data = pd.concat(processed_dfs, ignore_index=True)
+    
+    enc_mask = data['label'] == 'encryption'
+    enc_df = data[enc_mask].copy()
+    failed_mask = enc_df['computed_answer'].isna()
+
+    if failed_mask.sum() > 0:
+        enc_solver = task_solvers_map['encryption']
+        
+        def solve_with_fallback(row):
+            return enc_solver.generate_cot(row['prompt'], answer_hint=row['answer'])
+        
+        enc_df.loc[failed_mask, 'generated_cot'] = enc_df[failed_mask].apply(solve_with_fallback, axis=1)
+        enc_df.loc[failed_mask, 'computed_answer'] = enc_df.loc[failed_mask, 'generated_cot'].apply(enc_solver.extract_answer)
+            
+        data.update(enc_df)
+        
+    logger.info(f"Save output in: {args.output_path}")
+    data.to_csv(args.output_path, index=False)
+
+
+    rounded_accuracy = {}
+    for task, task_solver in tqdm(task_solvers_map.items(), total=len(task_solvers_map)):
+        task_df = data[data.label == task].copy()
+        
+
+        task_df["is_correct_rounded"] = task_df.apply(
+            lambda x: soft_matcher_from_comp_metric(
+                x["computed_answer"],
+                x["answer"]
+            ), axis=1
+        )
+
+        final_accuracy = task_df['is_correct_rounded'].mean() * 100
+        rounded_accuracy[task] = final_accuracy
+    
+    
+    records = []
+    for task in task_solvers_map.keys():
+        records.append({
+            "Task Name": task,
+            "Exact Match Accuracy (%)": round(raw_accuracy.get(task, 0), 2),
+            "Round Accuracy (%)": round(rounded_accuracy.get(task, 0), 2)
+        })
+
+    results_df = pd.DataFrame.from_records(records)
+
+    logger.info("\n" + results_df.to_string(index=False, justify='center'))
 
 
 if __name__ == "__main__":

@@ -69,7 +69,7 @@ def prepare_dataset(csv_path):
         user_text = str(row['prompt']) + instruction_suffix
         assistant_text = (
             f"<think>\n{row['generated_cot']}\n</think>\n"
-            f"Final Answer: \\boxed{{{row['answer']}}}"
+            f"Final Answer: \\boxed{{{row['computed_answer']}}}"
         )
         
         formatted_data.append({
@@ -85,7 +85,6 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    # 1. Логика возобновления сессии Weights & Biases
     os.makedirs(args.output_dir, exist_ok=True)
     run_id_file = os.path.join(args.output_dir, "wandb_run_id.txt")
     
