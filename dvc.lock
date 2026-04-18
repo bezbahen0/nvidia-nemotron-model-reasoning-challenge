@@ -53,10 +53,10 @@ stages:
       md5: 08ace9607244964b66e4087c0d411e64
       size: 1258381
   sft_train:
-    cmd: "python -m src.sft_train  --wandb_run_basename baseline --model_id nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.1 --model_id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
       --data gemini_cot --train_path data/prepared/train_stratified.csv --seed 31231
-      --eval_steps 50 --val_path data/prepared/val_stratified.csv --output_dir models/sft_baseline_v1
-      --batch_size 2 --grad_accum 16 --epochs 1\n"
+      --eval_steps 150 --val_path data/prepared/val_stratified.csv --output_dir models/sft_v0.0.1
+      --batch_size 2 --grad_accum 16 --epochs 4 --max_hours 10.0\n"
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
@@ -68,24 +68,25 @@ stages:
       size: 1258381
     - path: src/sft_train.py
       hash: md5
-      md5: 43c8edd455131636a0f1e1778a77b008
-      size: 4841
+      md5: 876f1dcf63c9e8682231c5b37984bc45
+      size: 6844
     params:
       params.yaml:
         data.dataset_name: gemini_cot
-        model.id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+        model.id: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
         train.batch_size: 2
-        train.epochs: 1
-        train.eval_steps: 50
+        train.epochs: 4
+        train.eval_steps: 150
         train.grad_accum: 16
+        train.max_hours: 10.0
         train.seed: 31231
-        wandb.wandb_base_run_name: baseline
+        wandb.wandb_base_run_name: sft_v0.0.1
     outs:
-    - path: models/sft_baseline_v1
+    - path: models/sft_v0.0.1
       hash: md5
-      md5: 4f437d7fb52a6168f77cd2c1a51d78b3.dir
-      size: 33228391667
-      nfiles: 81
+      md5: 8d6115a1aed42d6b19ef8b230c0d31e1.dir
+      size: 15734826195
+      nfiles: 35
   evaluate_checkpoints:
     cmd: "python -m src.evaluate_checkpoints --wandb_run_basename baseline --base_model
       nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 --val_data data/prepared/val_stratified.csv

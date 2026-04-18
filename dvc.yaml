@@ -38,6 +38,7 @@ stages:
       --batch_size ${train.batch_size}
       --grad_accum ${train.grad_accum}
       --epochs ${train.epochs}
+      --max_hours ${train.max_hours}
     deps:
       - ${data.train_prepared}
       - ${data.val_prepared}
@@ -46,13 +47,15 @@ stages:
       - wandb.wandb_base_run_name
       - model.id
       - data.dataset_name
+      - train.max_hours
       - train.batch_size
       - train.grad_accum
       - train.epochs
       - train.eval_steps
       - train.seed
     outs:
-      - ${model.sft_output_dir}
+      - ${model.sft_output_dir}:
+          persist: true
     
   evaluate_checkpoints:
     cmd: >
@@ -70,23 +73,3 @@ stages:
       - model.id
     outs:
       - ${evaluate.scores_file}
-
-  blend_adapters:
-    cmd: >
-      python -m src.blend_adapters
-      --base_model ${model.id}
-      --scores_path ${evaluate.scores_file}
-      --checkpoints_dir ${model.sft_output_dir}
-      --output_best ${model.lora_best_dir}
-      --output_soup ${model.lora_soup_dir}
-      --top_k ${evaluate.top_k}
-    deps:
-      - ${evaluate.scores_file}
-      - ${model.sft_output_dir}
-      - src/blend_adapters.py
-    params:
-      - model.id
-      - evaluate.top_k
-    outs:
-      - ${model.lora_best_dir}
-      - ${model.lora_soup_dir}

@@ -85,7 +85,8 @@ def main():
     )
 
     checkpoints_path = Path(args.checkpoints_dir)
-    checkpoints = sorted([d for d in checkpoints_path.iterdir() if d.is_dir() and d.name.startswith("checkpoint")])
+    checkpoints = [d for d in checkpoints_path.iterdir() if d.is_dir() and d.name.startswith("checkpoint")]
+    checkpoints = sorted(checkpoints, key=lambda d: int(d.name.split('-')[-1]))
 
     if not checkpoints:
         logger.info(f"В {args.checkpoints_dir} не найдено чекпоинтов.")
@@ -176,11 +177,12 @@ def main():
         results[ckpt_name] = accuracy
         max_accuracy = max(max_accuracy, accuracy)
         
+        step_num = int(ckpt_name.split('-')[-1])
+
         wandb.log({
-            "step": i,
             "checkpoint_accuracy": accuracy,
             "checkpoint_name": ckpt_name
-        })
+        }, step=step_num)
         logger.info(f"-> Accuracy ({ckpt_name}): {accuracy:.4f}")
 
         debug_df = pd.DataFrame(debug_records)
