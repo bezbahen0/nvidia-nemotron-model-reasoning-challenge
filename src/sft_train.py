@@ -125,8 +125,7 @@ def main():
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        # Используем регулярное выражение организаторов для захвата Mamba и MLP слоев
-        target_modules=r".*\.(in_proj|out_proj|up_proj|down_proj)$",
+        target_modules=r".*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|in_proj|out_proj)$",
         bias="none",
         task_type="CAUSAL_LM",
     )
