@@ -33,8 +33,8 @@ stages:
     deps:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: dba0ce2916daeee999985a8315432957
-      size: 11472629
+      md5: df12a59f56e74028904bcf849459b839
+      size: 11472586
     - path: src/split_data.py
       hash: md5
       md5: c13aae0165db013d5df032bed463e111
@@ -46,11 +46,11 @@ stages:
     outs:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 31b0e521c7f77b53d1f3cc905427e675
-      size: 10320504
+      md5: 2d05f7c718ee48e8fb258bd637b01163
+      size: 10320455
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: e7a669f40d0585932778cd3f84369493
+      md5: 8d66ab71db5abe3e6e0b5cabe4d507e3
       size: 1152110
   sft_train:
     cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.1 --model_id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
@@ -147,15 +147,15 @@ stages:
       size: 6961692538
       nfiles: 9
   generate_cot:
-    cmd: "python -m src.generate_cot --train_path data/raw/train.csv --output_path
-      data/solved/train-cot.csv\n"
+    cmd: "python -m src.generate_cot --train_path /kaggle/input/nvidia-nemotron-3-reasoning-challenge/train.csv
+      --output_path data/solved/train-cot.csv\n"
     deps:
-    - path: data/raw/train.csv
+    - path: /kaggle/input/nvidia-nemotron-3-reasoning-challenge/train.csv
       hash: md5
       md5: d8c87be98a92c6b5398427fc2f02e35a
       size: 3069304
     outs:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: dba0ce2916daeee999985a8315432957
-      size: 11472629
+      md5: df12a59f56e74028904bcf849459b839
+      size: 11472586
