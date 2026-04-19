@@ -53,39 +53,40 @@ stages:
       md5: 8d66ab71db5abe3e6e0b5cabe4d507e3
       size: 1152110
   sft_train:
-    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.1 --model_id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.2 --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
       --data gemini_cot --train_path data/prepared/train_stratified.csv --seed 31231
-      --eval_steps 150 --val_path data/prepared/val_stratified.csv --output_dir models/sft_v0.0.1
+      --eval_steps 150 --val_path data/prepared/val_stratified.csv --output_dir models/sft_v0.0.2
       --batch_size 2 --grad_accum 16 --epochs 4 --max_hours 10.0\n"
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: c7ff0e7a23138a1ea2ad677fd8d70392
-      size: 12042987
+      md5: 2d05f7c718ee48e8fb258bd637b01163
+      size: 10320455
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 08ace9607244964b66e4087c0d411e64
-      size: 1258381
+      md5: 8d66ab71db5abe3e6e0b5cabe4d507e3
+      size: 1152110
     - path: src/sft_train.py
       hash: md5
-      md5: 876f1dcf63c9e8682231c5b37984bc45
-      size: 6844
+      md5: c0ca4b31adbc722962e0b44a28f9b3f1
+      size: 6774
     params:
       params.yaml:
         data.dataset_name: gemini_cot
-        model.id: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+        model.id: 
+          /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
         train.batch_size: 2
         train.epochs: 4
         train.eval_steps: 150
         train.grad_accum: 16
         train.max_hours: 10.0
         train.seed: 31231
-        wandb.wandb_base_run_name: sft_v0.0.1
+        wandb.wandb_base_run_name: sft_v0.0.2
     outs:
-    - path: models/sft_v0.0.1
+    - path: models/sft_v0.0.2
       hash: md5
-      md5: 8d6115a1aed42d6b19ef8b230c0d31e1.dir
-      size: 15734826195
+      md5: 1fc79db8cd9ea65fcf4ff2322f8c9eb5.dir
+      size: 15734826259
       nfiles: 35
   evaluate_checkpoints:
     cmd: "python -m src.evaluate_checkpoints --wandb_run_basename baseline --base_model
