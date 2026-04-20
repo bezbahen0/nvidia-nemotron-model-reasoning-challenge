@@ -1,6 +1,6 @@
 dvc
 dvc-gdrive
-transformers==4.57
+transformers
 torch
 peft
 trl
@@ -12,5 +12,4 @@ bitsandbytes
 wandb
 scikit-learn
 pandas
-vllm
 pandarallel
