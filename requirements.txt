@@ -8,6 +8,7 @@ causal_conv1d
 mamba_ssm
 datasets
 accelerate
+bitsandbytes
 wandb
 scikit-learn
 pandas
