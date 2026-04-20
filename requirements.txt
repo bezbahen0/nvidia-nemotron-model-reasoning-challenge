@@ -1,6 +1,6 @@
 dvc
 dvc-gdrive
-transformers==4.57
+transformers
 torch
 peft
 trl
@@ -8,7 +8,8 @@ causal_conv1d
 mamba_ssm
 datasets
 accelerate
+bitsandbytes
 wandb
 scikit-learn
 pandas
-vllm
+pandarallel

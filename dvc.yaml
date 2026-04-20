@@ -1,11 +1,14 @@
-stages:
-  begin_pipeline:
-    cmd: cp ${data.raw_source} ${data.raw_working}
+stages:  
+  generate_cot:
+    cmd: >
+      python -m src.generate_cot
+      --train_path ${data.raw_source}
+      --output_path ${data.raw_working}
     deps:
       - ${data.raw_source}
     outs:
       - ${data.raw_working}
-      
+
   split_data:
     cmd: >
       python -m src.split_data

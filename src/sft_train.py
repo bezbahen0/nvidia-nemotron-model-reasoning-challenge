@@ -69,7 +69,7 @@ def prepare_dataset(csv_path):
         user_text = str(row['prompt']) + instruction_suffix
         assistant_text = (
             f"<think>\n{row['generated_cot']}\n</think>\n"
-            f"Final Answer: \\boxed{{{row['answer']}}}"
+            f"Final Answer: \\boxed{{{row['computed_answer']}}}"
         )
         
         formatted_data.append({
@@ -85,7 +85,6 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    # 1. Логика возобновления сессии Weights & Biases
     os.makedirs(args.output_dir, exist_ok=True)
     run_id_file = os.path.join(args.output_dir, "wandb_run_id.txt")
     
@@ -126,7 +125,10 @@ def main():
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        # TODO:
+        # Maybe add lm_head, can be good for math or else
+        # but required more VRAM (hidden_size*vocab_size matrix)
+        target_modules=r".*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|in_proj|out_proj|embed_tokens|lm_head)$", 
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -145,16 +147,17 @@ def main():
         eval_steps=args.eval_steps,
         save_strategy="steps",
         save_steps=args.eval_steps,
-        save_total_limit=3, 
+        save_total_limit=2, 
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         load_best_model_at_end=True,
         
-        optim="adamw_torch",
+        optim="paged_adamw_8bit",
         gradient_checkpointing=True,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         max_length=args.max_seq_len,
         completion_only_loss=True, 
-        #group_by_length=True,
 
         dataloader_num_workers=4,
         dataloader_prefetch_factor=2,

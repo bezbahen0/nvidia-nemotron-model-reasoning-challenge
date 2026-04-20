@@ -1,20 +1,20 @@
 data:
-  raw_source: data/raw/final_Nemotron_training_data.csv
-  raw_working: data/raw/final_Nemotron_training_data-new.csv
+  raw_source: data/raw/train.csv
+  raw_working: data/solved/train-cot.csv
   train_prepared: data/prepared/train_stratified.csv
   val_prepared: data/prepared/val_stratified.csv
   dataset_name: gemini_cot
 
 model:
-  id: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
-  sft_output_dir: models/sft_v0.0.1
+  id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  sft_output_dir: models/sft_v0.0.2
 
 split:
   val_size: 0.1
 
 train:
-  batch_size: 2
-  grad_accum: 16
+  batch_size: 8
+  grad_accum: 4
   epochs: 4
   seed: 31231
   eval_steps: 150
@@ -24,4 +24,4 @@ evaluate:
   scores_file: data/scores/validation_scores.json
 
 wandb:
-  wandb_base_run_name: sft_v0.0.1
+  wandb_base_run_name: sft_v0.0.2
