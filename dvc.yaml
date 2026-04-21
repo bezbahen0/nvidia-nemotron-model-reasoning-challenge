@@ -42,6 +42,7 @@ stages:
       --grad_accum ${train.grad_accum}
       --epochs ${train.epochs}
       --max_hours ${train.max_hours}
+      --lr ${train.lr}
     deps:
       - ${data.train_prepared}
       - ${data.val_prepared}
@@ -56,6 +57,7 @@ stages:
       - train.epochs
       - train.eval_steps
       - train.seed
+      - train.lr
     outs:
       - ${model.sft_output_dir}:
           persist: true

@@ -53,10 +53,10 @@ stages:
       md5: 2eb48f87872c64e3bf5d5f2f5a0767ff
       size: 1152110
   sft_train:
-    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.2 --model_id nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.3 --model_id nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
       --data gemini_cot --train_path data/prepared/train_stratified.csv --seed 31231
-      --eval_steps 150 --val_path data/prepared/val_stratified.csv --output_dir models/sft_v0.0.2
-      --batch_size 8 --grad_accum 4 --epochs 4 --max_hours 10.0\n"
+      --eval_steps 150 --val_path data/prepared/val_stratified.csv --output_dir models/sft_v0.0.3
+      --batch_size 8 --grad_accum 4 --epochs 4 --max_hours 10.0 --lr 0.0001\n"
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
@@ -78,14 +78,15 @@ stages:
         train.epochs: 4
         train.eval_steps: 150
         train.grad_accum: 4
+        train.lr: 0.0001
         train.max_hours: 10.0
         train.seed: 31231
-        wandb.wandb_base_run_name: sft_v0.0.2
+        wandb.wandb_base_run_name: sft_v0.0.3
     outs:
-    - path: models/sft_v0.0.2
+    - path: models/sft_v0.0.3
       hash: md5
-      md5: 9ac0651d20a47497c4e7f1a126260fde.dir
-      size: 7172448017
+      md5: 877ef54f927f155a91a3e05eb6c436ff.dir
+      size: 7172438240
       nfiles: 30
   evaluate_checkpoints:
     cmd: "python -m src.evaluate_checkpoints --wandb_run_basename baseline --base_model

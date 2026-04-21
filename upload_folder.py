@@ -3,9 +3,9 @@ import kagglehub
 #kagglehub.login()
 
 
-LOCAL_MODEL_DIR = 'models/sft_v0.0.2/checkpoint-1050'
+LOCAL_MODEL_DIR = 'models/sft_v0.0.3/'
 
-MODEL_SLUG = 'nemotron_sft_v0.0.2-fixed_lora_1050step' # Replace with model slug.
+MODEL_SLUG = 'nemotron_sft_v0.0.3' # Replace with model slug.
 
 # Learn more about naming model variations at
 # https://www.kaggle.com/docs/models#name-model.
