@@ -1,7 +1,7 @@
 import re
 
 class BitManipulationSolver:
-    """bit_manipulation - SFT Explanatory Edition"""
+    """bit_manipulation"""
     
     def __init__(self):
         self.ops = {

@@ -1,9 +1,7 @@
 import re
 
 
-class EncryptionSolver:
-    """Решатель для моноалфавитного шифра с использованием детерминированного словаря."""
-    
+class EncryptionSolver:    
     def __init__(self, vocabulary: set):
         self.vocab = vocabulary
 
