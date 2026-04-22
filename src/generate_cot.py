@@ -1,5 +1,4 @@
 import re
-import math
 import argparse
 import pandas as pd
 from pandarallel import pandarallel
@@ -8,11 +7,12 @@ from tqdm import tqdm
 pandarallel.initialize(progress_bar=False)
 
 from src.solvers.bit_manipulation import BitManipulationSolver
-from src.solvers.equations import UnifiedEquationsSolver
+from src.solvers.equations import EnsembleEquationsSolver
 from src.solvers.gravitational import GravitationalSolver
 from src.solvers.numeral_system import NumeralSystemSolver
 from src.solvers.unit_conversion import UnitConversionSolver
 from src.solvers.encryption import EncryptionSolver
+from src.metric import verify
 from src.log import logger
 
 def parse_args():
@@ -22,20 +22,6 @@ def parse_args():
     parser.add_argument("--output_path", type=str, required=True)
 
     return parser.parse_args()
-
-def soft_matcher_from_comp_metric(predicted, ground_truth):
-    if re.fullmatch(r'[01]+', ground_truth):
-        return predicted.lower() == ground_truth.lower()
-
-    try:
-        # Try to convert the answers to floating point numbers
-        stored_num = float(ground_truth)
-        predicted_num = float(predicted)
-        # Use a small absolute tolerance for numbers near zero
-        return math.isclose(stored_num, predicted_num, rel_tol=1e-2, abs_tol=1e-5)
-    except Exception:
-        # Fallback to case-insensitive string comparison
-        return predicted.lower() == ground_truth.lower()
 
  
 def solver(task_df, solver_obj):
@@ -82,7 +68,7 @@ def main():
         "conversion to diff numeral system": NumeralSystemSolver(),
         "unit conversion": UnitConversionSolver(),
         "gravitational": GravitationalSolver(),
-        "equations transformation": UnifiedEquationsSolver()
+        "equations transformation": EnsembleEquationsSolver()
     }    
 
     raw_accuracy = {}
@@ -127,7 +113,7 @@ def main():
         
 
         task_df["is_correct_rounded"] = task_df.apply(
-            lambda x: soft_matcher_from_comp_metric(
+            lambda x: verify(
                 x["computed_answer"],
                 x["answer"]
             ), axis=1

@@ -15,7 +15,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 from trl import SFTTrainer, SFTConfig
-
+from src.metric import verify
 from src.log import logger
 
 def parse_args():
@@ -66,6 +66,10 @@ def prepare_dataset(csv_path):
     
     formatted_data = []
     for _, row in df.iterrows():
+        # Skip all task vere solver can't find result
+        if not verify(row["computed_answer"], row["answer"]):
+            continue
+
         user_text = str(row['prompt']) + instruction_suffix
 
         # Use computed answer, reduce noice, we compare results on previosue stage
@@ -125,11 +129,14 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    logger.info("Подготовка тренировочного датасета...")
+    logger.info("Подготовка тренировочного датасета, так же не используем для обучения промпты где solver не дал правильный ответ...")
     train_dataset = prepare_dataset(args.train_path)
+    logger.info(f"train dataset final len: {len(train_dataset)}")
+
     
-    logger.info("Подготовка валидационного датасета...")
+    logger.info("Подготовка валидационного датасета, так же не используем для валидации промпты где solver не дал правильный ответ...")
     val_dataset = prepare_dataset(args.val_path)
+    logger.info(f"val dataset final len: {len(val_dataset)}")
 
     logger.info("Загрузка модели в bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -144,9 +151,6 @@ def main():
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        # TODO:
-        # Maybe add lm_head, can be good for math or else
-        # but required more VRAM (hidden_size*vocab_size matrix)
         target_modules=r".*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|in_proj|out_proj|embed_tokens|lm_head)$", 
         bias="none",
         task_type="CAUSAL_LM",
