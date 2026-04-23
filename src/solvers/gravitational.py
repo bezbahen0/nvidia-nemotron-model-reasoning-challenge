@@ -1,9 +1,7 @@
 import re
 
 
-class GravitationalSolver:
-    """gravitational"""
-    
+class GravitationalSolver:   
     def generate_cot(self, prompt: str) -> str:
         target_match = re.search(r"determine the falling distance for t\s*=\s*([\d.]+)s", prompt, re.IGNORECASE)
         if not target_match:

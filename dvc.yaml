@@ -6,6 +6,8 @@ stages:
       --output_path ${data.raw_working}
     deps:
       - ${data.raw_source}
+      - src/solvers
+      - src/generate_cot.py
     outs:
       - ${data.raw_working}
 

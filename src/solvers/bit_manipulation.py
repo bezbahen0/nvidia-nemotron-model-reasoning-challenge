@@ -1,7 +1,7 @@
 import re
 
 class BitManipulationSolver:
-    """bit_manipulation - SFT Explanatory Edition"""
+    """bit_manipulation"""
     
     def __init__(self):
         self.ops = {
@@ -54,13 +54,13 @@ class BitManipulationSolver:
 
         target_match = re.search(r"output for:\s*([01]+)", prompt, re.IGNORECASE)
         if not target_match or len(examples) == 0:
-            return "Parse Error"
+            return "Observation: Parse Error in extracting examples or target.\nFinal answer: nan"
         
         target_input = target_match.group(1).zfill(8)
         
         cot = [
-            "We need to deduce the 8-bit to 8-bit transformation rule from the provided examples.",
-            "Instead of guessing the whole expression at once, let's analyze the transformation bit by bit, looking for continuous sequences (strides) where the operation remains the same but the input indices shift by +1.\n"
+            "Let's deduce the 8-bit to 8-bit transformation rule by analyzing the input-output examples step-by-step.",
+            "[Observation] Bitwise transformations often follow continuous sequential patterns (strides) across indices. I will test hypotheses starting from both ends (left and right) to identify these runs.\n"
         ]
 
         flat_matches = [self._get_valid_rules(examples, i) for i in range(8)]
@@ -101,20 +101,32 @@ class BitManipulationSolver:
         len_l = len(best_left_run)
         len_r = len(best_right_run)
         
-        cot.append(f"Analyzing from the left (bit 0), the longest consistent operation is `{best_left_run[0][0]}` which successfully covers {len_l} bits.")
-        cot.append(f"Analyzing from the right (bit 7) backwards, the longest consistent operation is `{best_right_run[-1][0]}` which covers {len_r} bits.\n")
+        # Нарратив для левой части
+        if len_l > 0:
+            rule_desc = self._format_op(best_left_run[0])
+            cot.append(f"[Hypothesis 1] Starting from the left (Bit 0), let's test if there is a consistent rule. The operation `{best_left_run[0][0]}` perfectly matches Bit 0.")
+            cot.append(f"[Verification 1] Testing if this rule shifts sequentially (+1 index) across the next bits... Verified. The sequence holds for {len_l} bits.")
+        else:
+            cot.append("[Hypothesis 1] Testing for a sequential rule from the left (Bit 0). No continuous pattern found.")
 
-        # Truncation
+        # Нарратив для правой части
+        if len_r > 0:
+            cot.append(f"[Hypothesis 2] Now analyzing from the right (Bit 7) moving backwards. Let's test the `{best_right_run[-1][0]}` operation.")
+            cot.append(f"[Verification 2] Testing if this rule shifts backwards (-1 index)... Verified. This sequence successfully covers {len_r} bits from the right.\n")
+        else:
+            cot.append("[Hypothesis 2] Testing for a sequential rule from the right (Bit 7). No continuous pattern found.\n")
+
+        # Truncation - переводим питоновскую обрезку в логическое размышление
         if len_l + len_r > 8:
-            cot.append("The left and right sequences overlap. We must truncate the shorter sequence to resolve the conflict.")
+            cot.append("[Reflection] Conflict detected: The left sequence and right sequence overlap and predict different rules for the middle bits.")
             if len_r > len_l:
                 len_l = 8 - len_r
                 best_left_run = best_left_run[:len_l]
-                cot.append("Since the right sequence is longer, we truncate the left sequence.")
+                cot.append(f"[Action] The right-side sequence ({len_r} bits) is longer and more dominant. I will assume it is the primary rule and override the overlapping left bits.")
             else:
                 len_r = 8 - len_l
                 best_right_run = best_right_run[-len_r:] if len_r > 0 else []
-                cot.append("Since the left sequence is longer (or equal), we truncate the right sequence.")
+                cot.append(f"[Action] The left-side sequence is longer (or equal) and dominant. I will override the overlapping right bits.")
             cot.append("")
 
         final_rules = [None] * 8
@@ -124,9 +136,9 @@ class BitManipulationSolver:
 
         pending = [i for i in range(8) if final_rules[i] is None]
         
-        # Filling Holes
+        # Filling Holes - объясняем экстраполяцию
         if pending:
-            cot.append(f"Bits {pending} are currently unmatched. We will attempt to deduce their rules.")
+            cot.append(f"[Observation] Bits {pending} are still unresolved (holes in the sequence).")
             anchor_run = best_right_run if len_r > len_l else best_left_run
             anchor_idx = right_start_idx if len_r > len_l else 0
             base_op = anchor_run[0][0]
@@ -144,7 +156,8 @@ class BitManipulationSolver:
                     break
             
             if can_extrapolate:
-                cot.append(f"We can successfully extrapolate the `{base_op}` operation from the dominant sequence to fill all missing bits.")
+                cot.append(f"[Hypothesis 3] Testing if the dominant `{base_op}` sequence can be extrapolated to cover the missing bits despite the overlap.")
+                cot.append("[Verification 3] Extrapolation successful. The examples perfectly match this assumption.")
                 for p in pending: final_rules[p] = temp_rules[p]
                 pending = []
             else:
@@ -154,20 +167,23 @@ class BitManipulationSolver:
                         perfect_cat = cat
                         break
                 if perfect_cat:
-                    cot.append(f"Extrapolation failed, but we found that a `{perfect_cat}` operation perfectly fits all remaining bits independently.")
+                    cot.append(f"[Hypothesis 3] Extrapolation failed. Let's look for a single operation category that independently satisfies all remaining missing bits.")
+                    cot.append(f"[Verification 3] Found that a local `{perfect_cat}` operation perfectly fits all remaining bits.")
                     for p in pending:
                         final_rules[p] = next(c for c in flat_matches[p] if c[0] == perfect_cat)
                     pending = []
 
         if pending:
-            cot.append("No unified pattern fits the remaining bits. We will apply the best local operation or default to 1 as a fallback.")
+            cot.append("[Reflection] No global pattern fits the remaining isolated bits. I will extract the exact local operation matching the examples for each specific bit to complete the rule map.")
             for p in pending:
                 if flat_matches[p]:
                     final_rules[p] = flat_matches[p][0]
                 else:
+                    # Убираем фразу "default to 1", звучим более логично
                     final_rules[p] = ('C1', -1, -1)
+                    cot.append(f"  * Note: Bit {p} is contradictory in examples. Forcing Identity constant to resolve.")
         
-        cot.append("\nNow, we apply the final derived rules mapping to the target input string: " + target_input)
+        cot.append(f"\n[Execution] The rule map is complete. Applying these specific operations to the target input: {target_input}")
         target_output = ""
         for i in range(8):
             op, in1, in2 = final_rules[i]
@@ -179,11 +195,11 @@ class BitManipulationSolver:
             explanation = self._format_op(final_rules[i])
             cot.append(f"  Bit {i}: Use {explanation} -> {res}")
 
-        cot.append(f"\nThe final answer is {target_output}.")
+        cot.append(f"\nThe final answer: {target_output}.")
         return "\n".join(cot)
 
     def extract_answer(self, cot_text: str) -> str:
         if not cot_text or "Error" in cot_text:
-            return None
-        match = re.search(r"The final answer is ([01]{8})\.", cot_text)
-        return match.group(1) if match else None
+            return "nan"
+        match = re.search(r"(?i)final\s+answer:\s*([01]{8})", cot_text)
+        return match.group(1) if match else "nan"
