@@ -6,6 +6,8 @@ import pandas as pd
 import wandb
 from datasets import Dataset
 from peft import LoraConfig
+import torch.nn.functional as F
+
 from transformers import (
     AutoModelForCausalLM, 
     AutoTokenizer, 
@@ -13,6 +15,7 @@ from transformers import (
     TrainerCallback
 )
 from transformers.trainer_utils import get_last_checkpoint
+
 
 from trl import SFTTrainer, SFTConfig
 from src.metric import verify
@@ -57,6 +60,39 @@ class TimeLimitCallback(TrainerCallback):
             logger.info(f"\n[ВНИМАНИЕ] Достигнут лимит времени ({elapsed_time/3600:.2f} часов). Мягкая остановка...")
             control.should_training_stop = True
             control.should_save = True
+
+class FocalLossSFTTrainer(SFTTrainer):
+    def __init__(self, gamma=2.0, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gamma = gamma
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+        labels = inputs.pop("labels")
+        
+        outputs = model(**inputs)
+        logits = outputs.logits
+        
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        ce_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)), 
+            shift_labels.view(-1), 
+            reduction='none',
+            ignore_index=-100
+        )
+        
+        ce_loss = ce_loss.float()
+        
+        pt = torch.exp(-ce_loss)
+        
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        valid_mask = shift_labels.view(-1) != -100
+        
+        loss = focal_loss[valid_mask].mean() if valid_mask.sum() > 0 else torch.tensor(0.0, device=logits.device)
+        
+        return (loss, outputs) if return_outputs else loss
 
 
 def prepare_dataset(csv_path):
@@ -190,7 +226,8 @@ def main():
         run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
     )
 
-    trainer = SFTTrainer(
+    trainer = FocalLossSFTTrainer(
+        gamma=2.0,
         model=model,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
