@@ -25,19 +25,41 @@ class EncryptionSolver:
             "The task is to solve a monoalphabetic substitution cipher. First, we need to extract the known letter mappings from the provided examples."
         ]
         
+        cot.append("Let's align the words from the examples to deduce the initial letter mappings by matching word lengths and positions.")
+        
         mapping = {}
         for i, (ciph, plain) in enumerate(pairs, 1):
-            c_chars = ciph.replace(" ", "")
-            p_chars = plain.replace(" ", "")
-            for c, p in zip(c_chars, p_chars):
-                if c not in mapping:
-                    mapping[c] = p
-                    
+            c_words = ciph.split()
+            p_words = plain.split()
+            
+            # Проверяем, совпадает ли количество слов для безопасного выравнивания
+            if len(c_words) == len(p_words):
+                cot.append(f"\nAnalyzing Example {i}: '{ciph}' -> '{plain}'.")
+                
+                for cw, pw in zip(c_words, p_words):
+                    # Сопоставляем только слова одинаковой длины
+                    if len(cw) == len(pw):
+                        new_mappings = []
+                        for c, p in zip(cw, pw):
+                            if c not in mapping:
+                                mapping[c] = p
+                                new_mappings.append(f"'{c}'='{p}'")
+                                
+                        if new_mappings:
+                            cot.append(f"Word '{cw}' ({len(cw)} letters) maps to '{pw}'. Extracted: {', '.join(new_mappings)}.")
+            else:
+                # Фолбэк на случай, если структура предложений не совпадает
+                c_chars = ciph.replace(" ", "")
+                p_chars = plain.replace(" ", "")
+                for c, p in zip(c_chars, p_chars):
+                    if c not in mapping:
+                        mapping[c] = p
+
         if mapping:
             map_display = ", ".join([f"'{k}' -> '{v}'" for k, v in sorted(mapping.items())])
-            cot.append(f"Based on the examples, we can establish the following letter substitutions: {map_display}.")
+            cot.append(f"\nCombining these extracted rules, we establish the overall initial dictionary: {map_display}.")
         else:
-            cot.append("There are no examples provided to extract initial mappings.")
+            cot.append("There are no valid examples provided to extract initial mappings.")
 
         target_words = target_cipher.split()
         decoded_words = []

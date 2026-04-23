@@ -7,7 +7,7 @@ data:
 
 model:
   id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-  sft_output_dir: models/sft_v0.0.4
+  sft_output_dir: models/sft_v0.0.5
 
 split:
   val_size: 0.1
@@ -25,4 +25,4 @@ evaluate:
   scores_file: data/scores/validation_scores.json
 
 wandb:
-  wandb_base_run_name: sft_v0.0.4
+  wandb_base_run_name: sft_v0.0.5
