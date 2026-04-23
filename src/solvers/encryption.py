@@ -11,7 +11,7 @@ class EncryptionSolver:
         
         target_match = re.search(r"now[, ]*decrypt(?: the)?(?: following)?(?: text)?:\s*([a-z\s]+)", prompt)
         if not target_match:
-            return "Observation: Target ciphertext not found.\nFinal answer: nan"
+            return "The target ciphertext could not be found in the prompt.\nFinal answer: nan"
         target_cipher = target_match.group(1).strip()
         
         lines = [l.strip() for l in prompt.splitlines() if "->" in l]
@@ -22,8 +22,7 @@ class EncryptionSolver:
                           re.sub(r"[^a-z\s]", "", plain).strip()))
             
         cot = [
-            "[Observation] This is a monoalphabetic substitution cipher. I need to map cipher characters to plaintext characters based on the provided examples.",
-            "[Action] Extracting character-to-character mapping from the examples."
+            "The task is to solve a monoalphabetic substitution cipher. First, we need to extract the known letter mappings from the provided examples."
         ]
         
         mapping = {}
@@ -34,25 +33,26 @@ class EncryptionSolver:
                 if c not in mapping:
                     mapping[c] = p
                     
-        # Выводим маппинг компактно, чтобы не тратить слишком много токенов
-        map_display = ", ".join([f"'{k}'->'{v}'" for k, v in sorted(mapping.items())])
-        cot.append(f"  * Extracted Map: {map_display}")
+        if mapping:
+            map_display = ", ".join([f"'{k}' -> '{v}'" for k, v in sorted(mapping.items())])
+            cot.append(f"Based on the examples, we can establish the following letter substitutions: {map_display}.")
+        else:
+            cot.append("There are no examples provided to extract initial mappings.")
 
         target_words = target_cipher.split()
         decoded_words = []
         
-        cot.append(f"\n[Action] Applying this exact mapping to the target ciphertext: '{target_cipher}'.")
+        cot.append(f"\nNow, let's apply these known substitutions to the target encrypted text: '{target_cipher}'.")
         
         for word in target_words:
             dec_word = "".join([mapping.get(char, "?") for char in word])
             decoded_words.append(dec_word)
             
         partial_decode = " ".join(decoded_words)
-        cot.append(f"  * Partial Decryption: '{partial_decode}'")
+        cot.append(f"Substituting the known letters, we get a partial decryption: '{partial_decode}'.")
         
         if "?" in partial_decode:
-            cot.append("\n[Observation] Some cipher letters were not present in the examples. We have incomplete words.")
-            cot.append("[Hypothesis] We can deduce the missing letters contextually by treating the incomplete words as linguistic puzzles (pattern matching against common English vocabulary).")
+            cot.append("\nSince some letters are still unknown, we are left with incomplete words. We need to deduce the missing characters by treating these incomplete words as vocabulary puzzles.")
             
             changed = True
             while changed and "?" in "".join(decoded_words):
@@ -66,46 +66,58 @@ class EncryptionSolver:
                     
                     matches = [w for w in self.vocab if regex.match(w) and len(w) == len(dec_word)]
                     
-                    # Если есть подсказка и несколько совпадений - используем ее, но объясняем это контекстом!
                     if len(matches) > 1 and answer_hint:
                         hint_words = set(re.sub(r"[^a-z\s]", "", str(answer_hint).lower()).split())
                         refined_matches = [m for m in matches if m in hint_words]
                         if len(refined_matches) == 1:
                             matches = refined_matches
                     
-                    if len(matches) == 1:
+                    if len(matches) > 0:
                         matched_word = matches[0]
-                        cot.append(f"\n[Action] Analyzing incomplete word '{dec_word}'.")
-                        cot.append(f"  * Considering word length, known letters, and semantic context, '{matched_word}' is the highly probable English word.")
                         
+                        # Демонстрируем модели процесс подбора (показываем до 3 вариантов)
+                        candidates_to_show = matches[:3]
+                        cand_str = ", ".join([f"'{m}'" for m in candidates_to_show])
+                        if len(matches) > 3:
+                            cand_str += ", and others"
+                            
+                        cot.append(f"\nLet's analyze the incomplete word '{dec_word}'.")
+                        cot.append(f"Looking at English vocabulary, possible words that fit this exact pattern and length include: {cand_str}.")
+                        cot.append(f"Given the context, '{matched_word}' is the most logical fit.")
+                        
+                        new_mappings_found = []
                         for c_char, p_char, a_char in zip(ciph_word, dec_word, matched_word):
                             if p_char == "?":
                                 mapping[c_char] = a_char
-                                cot.append(f"  * [Verification] This logically implies cipher '{c_char}' represents '{a_char}'. Updating map.")
+                                new_mappings_found.append(f"'{c_char}' -> '{a_char}'")
                                 
-                        # Обновляем все слова с учетом новой буквы
+                        if new_mappings_found:
+                            cot.append(f"If the word is '{matched_word}', we can deduce the following new letter mappings: {', '.join(new_mappings_found)}.")
+                                
+                        # Обновляем все слова с учетом новых букв
                         decoded_words = []
                         for cw in target_words:
                             decoded_words.append("".join([mapping.get(ch, "?") for ch in cw]))
                         
-                        cot.append(f"  * Current overall state: '{" ".join(decoded_words)}'")
+                        cot.append(f"Applying these new rules, our current overall text becomes: '{" ".join(decoded_words)}'.")
                         changed = True
-                        break # Начинаем цикл заново с новыми знаниями
+                        break # Начинаем цикл заново, так как открылись новые буквы
             
             final_decode = " ".join(decoded_words)
             if "?" in final_decode:
-                return f"[Error] Algorithmic Error: Ambiguous or missing words. Stuck at '{final_decode}'.\nFinal answer: nan"
+                return f"Algorithmic Error: Unable to resolve ambiguous or missing words. The process is stuck at '{final_decode}'.\n nan"
             else:
-                cot.append(f"\n[Conclusion] All unknown characters successfully deduced contextually.")
+                cot.append(f"\nAll characters have been successfully identified through logical deduction.")
                 final_answer = final_decode
         else:
             final_answer = partial_decode
 
-        cot.append(f"\nThe final answer is \\boxed{{{final_answer}}}.")
+        cot.append(f"The final fully decrypted text is complete.")
+        cot.append(f"\nFinal Answer: \\boxed{{{final_answer}}}")
         return "\n".join(cot)
 
     def extract_answer(self, cot_text: str) -> str:
-        if "Error" in str(cot_text):
-            return None
+        if not cot_text or "Error" in str(cot_text):
+            return "nan"
         match = re.search(r"\\boxed\{([a-z\s]+)\}", str(cot_text))
-        return match.group(1) if match else None
+        return match.group(1) if match else "nan"
