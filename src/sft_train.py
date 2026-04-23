@@ -59,8 +59,44 @@ class TimeLimitCallback(TrainerCallback):
             control.should_save = True
 
 
-def prepare_dataset(csv_path):
+def upsample_dataframe(df, label_col="label"):
+    multipliers = {
+        "equations transformation": 3.0,
+        "bit manipulation": 2.0,
+        "encryption": 1.5
+    }
+    
+    upsampled_pieces = []
+    
+    for task_name, group in df.groupby(label_col):
+        multiplier = multipliers.get(task_name, 1.0)
+        
+        full_repeats = int(multiplier)
+        fraction = multiplier - full_repeats
+        
+        if full_repeats > 0:
+            upsampled_pieces.append(pd.concat([group] * full_repeats))
+            
+        if fraction > 0:
+            fractional_group = group.sample(frac=fraction, random_state=42)
+            upsampled_pieces.append(fractional_group)
+            
+    final_df = pd.concat(upsampled_pieces, ignore_index=True)
+    
+    final_df = final_df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+    
+    return final_df
+
+
+
+def prepare_dataset(csv_path, eval=False):
     df = pd.read_csv(csv_path)
+    logger.info(f"Datset countes: {df.label.value_counts()}")
+    if not eval:
+        df = upsample_dataframe(df.copy())
+
+        logger.info(f"Datset after upsampling: {df.label.value_counts()}")
+
 
     instruction_suffix = "\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`"
     
