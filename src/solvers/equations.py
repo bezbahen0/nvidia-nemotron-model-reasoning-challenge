@@ -224,16 +224,59 @@ class EnsembleEquationsSolver:
         op_text = self.op_desc.get(rule.op_name, f"perform a specialized math operation")
         fmt_text = self.fmt_desc.get(rule.out_fmt, f"format the result mathematically")
 
+        # 1. Раскрываем промежуточные значения для Step 1 (подготовка операндов)
+        step1_calc = ""
+        if rule.op_config == "fwd": 
+            step1_calc = f"Operands remain unchanged: {qa} and {qb}."
+        elif rule.op_config == "rev_digits": 
+            step1_calc = f"{qa} becomes {cfg[0]}, and {qb} becomes {cfg[1]}."
+        elif rule.op_config == "swap_ops": 
+            step1_calc = f"Operands are swapped: {cfg[0]} and {cfg[1]}."
+        elif rule.op_config == "swap_rev": 
+            step1_calc = f"Operands are reversed and swapped: {cfg[0]} and {cfg[1]}."
+
+        # 2. Раскрываем математику для Step 2
+        op_math_strings = {
+            "add": f"{cfg[0]} + {cfg[1]} = {val}",
+            "sub": f"{cfg[0]} - {cfg[1]} = {val}",
+            "rev_sub": f"{cfg[1]} - {cfg[0]} = {val}",
+            "mul": f"{cfg[0]} * {cfg[1]} = {val}",
+            "div": f"{cfg[0]} / {cfg[1]} = {val}" if cfg[1] != 0 else f"{cfg[0]} / {cfg[1]} = 0",
+            "mod": f"{cfg[0]} % {cfg[1]} = {val}" if cfg[1] != 0 else f"{cfg[0]} % {cfg[1]} = 0",
+            "rev_div": f"{cfg[1]} / {cfg[0]} = {val}" if cfg[0] != 0 else f"{cfg[1]} / {cfg[0]} = 0",
+            "rev_mod": f"{cfg[1]} % {cfg[0]} = {val}" if cfg[0] != 0 else f"{cfg[1]} % {cfg[0]} = 0",
+            "max_mod_min": f"max({cfg[0]}, {cfg[1]}) % min({cfg[0]}, {cfg[1]}) = {val}",
+            "cat": f"'{cfg[2]}' concatenated with '{cfg[3]}' = {val}",
+            "rev_cat": f"'{cfg[3]}' concatenated with '{cfg[2]}' = {val}",
+            "add1": f"{cfg[0]} + {cfg[1]} + 1 = {val}",
+            "addm1": f"{cfg[0]} + {cfg[1]} - 1 = {val}",
+            "mul1": f"{cfg[0]} * {cfg[1]} + 1 = {val}",
+            "mulm1": f"{cfg[0]} * {cfg[1]} - 1 = {val}",
+            "sub1": f"{cfg[0]} - {cfg[1]} + 1 = {val}",
+            "subm1": f"{cfg[0]} - {cfg[1]} - 1 = {val}",
+            "abs_diff": f"abs({cfg[0]} - {cfg[1]}) = {val}",
+            "neg_abs_diff": f"-abs({cfg[0]} - {cfg[1]}) = {val}"
+        }
+        step2_calc = op_math_strings.get(rule.op_name, f"Result is {val}")
+        
+        # 3. Раскрываем форматирование для Step 3
+        if rule.out_fmt == "raw" and rule.neg_fmt == "standard":
+            step3_calc = f"Result remains {final_str}."
+        else:
+            step3_calc = f"Computed {val} becomes {final_str}."
+
         cot_lines = [
             "First, let's analyze the underlying pattern in the provided examples.",
             "The standard mathematical operators are being used as placeholders for a hidden, multi-step rule.",
             "By observing the relationship between the inputs and outputs, the consistent sequence of operations is:",
-            f"Step 1: We must {cfg_text}.",
-            f"Step 2: Next, we {op_text}.",
-            f"Step 3: Finally, we {fmt_text}.",
+            f"Rule 1: We must {cfg_text}.",
+            f"Rule 2: Next, we {op_text}.",
+            f"Rule 3: Finally, we {fmt_text}.",
             "",
             f"Now, let's apply this exact sequence to the target query: {qa} {q_op} {qb}.",
-            f"- Working through the steps on the base operands generates the final formatted output.",
+            f"- Step 1 (Apply Rule 1): {step1_calc}",
+            f"- Step 2 (Apply Rule 2): {step2_calc}",
+            f"- Step 3 (Apply Rule 3): {step3_calc}",
             f"\nFinal answer: {final_str}"
         ]
         return "\n".join(cot_lines)
