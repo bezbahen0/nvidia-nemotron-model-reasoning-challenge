@@ -384,9 +384,11 @@ class EnsembleEquationsSolver:
                     break
                     
         if found_perm:
-            inv_map = {v: k for k, v in zip(unique_syms, found_perm)}
-            v1 = int("".join(str(found_perm[unique_syms.index(c)]) for c in q_a))
-            v2 = int("".join(str(found_perm[unique_syms.index(c)]) for c in q_b))
+            char_to_digit = {c: str(found_perm[unique_syms.index(c)]) for c in unique_syms}
+            digit_to_char = {str(v): k for k, v in zip(unique_syms, found_perm)}
+            
+            v1 = int("".join(char_to_digit[c] for c in q_a))
+            v2 = int("".join(char_to_digit[c] for c in q_b))
             
             actual_op = found_op_map[q_op]
             if actual_op == '+': ans = v1 + v2
@@ -394,15 +396,22 @@ class EnsembleEquationsSolver:
             elif actual_op == '*': ans = v1 * v2
             elif actual_op == '/': ans = v1 // v2 if v2 != 0 else 0
             
-            ans_str = "".join(inv_map.get(int(d), d) if d.isdigit() else d for d in str(ans))
+            ans_str = "".join(digit_to_char.get(d, d) for d in str(ans))
+            
+            mapping_str = ", ".join(f"'{k}' -> {v}" for k, v in char_to_digit.items())
             
             cot_lines = [
-                "The unusual symbols and results in the examples suggest a cryptarithm or a substitution cipher where each character maps to a specific decimal digit.",
-                f"By analyzing the mathematical relationships, we can deduce a valid 1-to-1 mapping and determine that the operator `{q_op}` actually performs standard `{actual_op}`.",
-                "",
-                f"Let's apply this logic to the target operands.",
-                f"First, we translate the target strings into their true base-10 values, apply the operation, and then encrypt the result back into characters using the derived mapping.",
-                f"\nFinal answer: {ans_str}"
+                "Let's solve this step-by-step by deciphering the symbols.",
+                f"1. Based on the examples, we deduce the exact character-to-digit mapping: {mapping_str}.",
+                f"2. The operator '{q_op}' corresponds to the standard arithmetic operation '{actual_op}'.",
+                "3. We translate the target operands into base-10 numbers using the mapping.",
+                f"   - Operand 1: '{q_a}' translates character-by-character to {v1}.",
+                f"   - Operand 2: '{q_b}' translates character-by-character to {v2}.",
+                "4. Execute the mathematical operation in decimal format:",
+                f"   {v1} {actual_op} {v2} = {ans}",
+                "5. Encrypt the numerical result back into symbols.",
+                f"   The number {ans} translates character-by-character to '{ans_str}'.",
+                f"\n {ans_str}"
             ]
             return "\n".join(cot_lines)
             

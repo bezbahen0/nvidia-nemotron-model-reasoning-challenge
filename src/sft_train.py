@@ -91,6 +91,9 @@ def upsample_dataframe(df, label_col="label"):
 
 def prepare_dataset(csv_path, eval=False):
     df = pd.read_csv(csv_path)
+    df = df[~df.computed_answer.isna()]
+    df = df[df.apply(lambda row: verify(row["computed_answer"], row["answer"]), axis=1)]
+
     logger.info(f"Datset countes: {df.label.value_counts()}")
     if not eval:
         df = upsample_dataframe(df.copy())
@@ -102,10 +105,6 @@ def prepare_dataset(csv_path, eval=False):
     
     formatted_data = []
     for _, row in df.iterrows():
-        # Skip all task vere solver can't find result
-        if not verify(row["computed_answer"], row["answer"]):
-            continue
-
         user_text = str(row['prompt']) + instruction_suffix
 
         # Use computed answer, reduce noice, we compare results on previosue stage
@@ -171,7 +170,7 @@ def main():
 
     
     logger.info("Подготовка валидационного датасета, так же не используем для валидации промпты где solver не дал правильный ответ...")
-    val_dataset = prepare_dataset(args.val_path)
+    val_dataset = prepare_dataset(args.val_path, eval=True)
     logger.info(f"val dataset final len: {len(val_dataset)}")
 
     logger.info("Загрузка модели в bfloat16...")
