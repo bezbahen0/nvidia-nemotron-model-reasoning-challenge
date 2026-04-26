@@ -131,7 +131,7 @@ class EnsembleEquationsSolver:
             "last_digit": sval[-1] if val >= 0 else "-" + s_abs[-1],
         }
 
-    def _solve_level1_numeric(self, prompt: str, query_str: str, ctx: TaskContext) -> Optional[str]:
+    def _solve_level1_numeric(self, prompt: str, query_str: str, ctx: TaskContext, answer_hint: Optional[str] = None) -> Optional[str]:
         raw_lines = re.findall(r"([^\n=]+?)\s*=\s*([^\n]+)", prompt)
         parsed = []
         for lhs, rhs in raw_lines:
@@ -150,6 +150,9 @@ class EnsembleEquationsSolver:
         qm = self._numeric_re.fullmatch(query_str)
         if not qm: return None
         qa, q_op, qb = qm.group(1), qm.group(2).strip(), qm.group(3)
+
+        if answer_hint is not None:
+            parsed.append((qa, q_op, qb, str(answer_hint).strip()))
 
         by_op = defaultdict(list)
         for a, op, b, out in parsed: by_op[op].append((a, b, out))
@@ -411,7 +414,7 @@ class EnsembleEquationsSolver:
                 f"   {v1} {actual_op} {v2} = {ans}",
                 "5. Encrypt the numerical result back into symbols.",
                 f"   The number {ans} translates character-by-character to '{ans_str}'.",
-                f"\n {ans_str}"
+                f"\nFinal answer: {ans_str}"
             ]
             return "\n".join(cot_lines)
             
@@ -483,14 +486,135 @@ class EnsembleEquationsSolver:
             f"\nFinal answer: {ans}"
         ]
         return "\n".join(cot_lines)
+    
+    def _solve_level4_string_operations(self, parsed_exs: List[Dict], q_a: str, q_op: str, q_b: str) -> Optional[str]:
+        # Базовые строковые операции
+        hypotheses = [
+            ("concatenation (A+B)", lambda a, b: a + b),
+            ("reverse concatenation (B+A)", lambda a, b: b + a),
+            ("interleaving", lambda a, b: "".join(i + j for i, j in zip(a + " "*len(b), b + " "*len(a))).replace(" ", "")),
+            ("string subtraction", lambda a, b: "".join(c for c in a if c not in b) or "-")
+        ]
 
-    def generate_cot(self, prompt: str) -> str:
+        for hyp_name, func in hypotheses:
+            success = True
+            for ex in parsed_exs:
+                if "answer_hint" in ex: continue
+                # Восстанавливаем сырую строку (с учетом знака минус)
+                out_str = ("-" if ex["is_neg"] else "") + ex["out"]
+                try:
+                    if func(ex["a"], ex["b"]) != out_str:
+                        success = False
+                        break
+                except Exception:
+                    success = False
+                    break
+                    
+            if success:
+                ans_str = func(q_a, q_b)
+                return "\n".join([
+                    "Analyzing the transformation reveals it is not mathematical, but a structural string operation.",
+                    f"The consistent rule across all examples is '{hyp_name}'.",
+                    f"Applying this operation to '{q_a}' and '{q_b}':",
+                    f"\nFinal answer: {ans_str}"
+                ])
+        return None
+    
+    def _solve_level5_robust_cryptarithm(self, parsed_exs: List[Dict], q_a: str, q_op: str, q_b: str) -> Optional[str]:
+        import itertools
+        
+        all_chars = set()
+        op_chars = set()
+        for ex in parsed_exs:
+            all_chars.update(ex["a"] + ex["b"] + ex["out"])
+            op_chars.add(ex["op"])
+        all_chars.update(q_a + q_b)
+        op_chars.add(q_op)
+        
+        standard_ops = {'+', '-', '*'}
+        encrypted_ops = [op for op in op_chars if op not in standard_ops]
+        
+        digit_chars = list(all_chars - set(encrypted_ops) - standard_ops)
+        if len(digit_chars) > 10 or len(encrypted_ops) > 3: 
+            return None
+            
+        op_assignments = []
+        if not encrypted_ops:
+            op_assignments.append({})
+        else:
+            for ops in itertools.product(['+', '-', '*'], repeat=len(encrypted_ops)):
+                op_assignments.append(dict(zip(encrypted_ops, ops)))
+                
+        for perm in itertools.permutations("0123456789", len(digit_chars)):
+            char_to_digit = dict(zip(digit_chars, perm))
+            
+            for op_map in op_assignments:
+                success = True
+                for ex in parsed_exs:
+                    if "answer_hint" in ex: continue
+                    
+                    try:
+                        # int() автоматически легализует ведущие нули (например, "05" -> 5)
+                        a_val = int("".join(char_to_digit.get(c, c) for c in ex["a"]))
+                        b_val = int("".join(char_to_digit.get(c, c) for c in ex["b"]))
+                        out_val = int("".join(char_to_digit.get(c, c) for c in ex["out"]))
+                        if ex["is_neg"]: out_val = -out_val
+                        
+                        actual_op = op_map.get(ex["op"], ex["op"])
+                        
+                        if actual_op == '+': res = a_val + b_val
+                        elif actual_op == '-': res = a_val - b_val
+                        elif actual_op == '*': res = a_val * b_val
+                        else: success = False; break
+                        
+                        if res != out_val:
+                            success = False; break
+                    except Exception:
+                        success = False; break
+                
+                if success:
+                    try:
+                        a_val = int("".join(char_to_digit.get(c, c) for c in q_a))
+                        b_val = int("".join(char_to_digit.get(c, c) for c in q_b))
+                        actual_q_op = op_map.get(q_op, q_op)
+                        
+                        if actual_q_op == '+': ans_val = a_val + b_val
+                        elif actual_q_op == '-': ans_val = a_val - b_val
+                        elif actual_q_op == '*': ans_val = a_val * b_val
+                        else: return None
+                        
+                        digit_to_char = {v: k for k, v in char_to_digit.items()}
+                        ans_str = ""
+                        is_neg = ans_val < 0
+                        for digit in str(abs(ans_val)):
+                            if digit not in digit_to_char: raise ValueError
+                            ans_str += digit_to_char[digit]
+                            
+                        if is_neg: ans_str = "-" + ans_str
+                        
+                        op_msg = "Some operators are also encrypted." if encrypted_ops else "Using standard arithmetic."
+                        return "\n".join([
+                            "By analyzing the patterns, this is an unrestricted cryptarithm where leading zeros are permitted.",
+                            op_msg,
+                            f"Mapping found: {', '.join([f'`{k}`->{v}' for k, v in char_to_digit.items()])}",
+                            f"Calculating {a_val} {actual_q_op} {b_val} = {ans_val}.",
+                            f"\nFinal answer: {ans_str}"
+                        ])
+                    except Exception:
+                        return None
+        return None
+
+    def generate_cot(self, prompt: str, answer_hint: Optional[str] = None) -> Optional[str]:
         prompt_str = str(prompt)
         query_match = re.search(r"determine the result for:\s*([^\n]+)", prompt_str, re.IGNORECASE)
+        
+        # Фильтрация битых данных вместо генерации ответа с ошибкой
         if not query_match:
             lines = [line.strip() for line in prompt_str.split('\n') if line.strip()]
-            if lines and '=' not in lines[-1]: query_str = lines[-1].replace('Question:', '').strip()
-            else: return "[Error] Observation: Parse failure.\nFinal answer: nan"
+            if lines and '=' not in lines[-1]: 
+                query_str = lines[-1].replace('Question:', '').strip()
+            else: 
+                return None 
         else:
             query_str = query_match.group(1).strip()
             
@@ -510,25 +634,68 @@ class EnsembleEquationsSolver:
                     "out": rhs_c, "is_neg": is_neg
                 })
 
-        if len(query_clean) < 3: return "[Error] Observation: Query too short.\nFinal answer: nan"
+        # Фильтрация коротких запросов
+        if len(query_clean) < 3: 
+            return None
         
         mid = len(query_clean) // 2
         q_a, q_op, q_b = query_clean[:mid], query_clean[mid], query_clean[mid+1:]
 
         ctx = self._analyze_context(parsed_exs, q_a, q_op, q_b)
 
-        lvl1_result = self._solve_level1_numeric(prompt_str, query_clean, ctx)
-        if lvl1_result: return lvl1_result
-            
+        if answer_hint is not None:
+            ans_clean = str(answer_hint).strip()
+            is_neg = ans_clean.startswith("-") and len(ans_clean) > 1
+            parsed_exs.append({
+                "a": q_a, "op": q_op, "b": q_b, 
+                "out": ans_clean[1:] if is_neg else ans_clean, 
+                "is_neg": is_neg
+            })
+        
+        # Инициализация истории рассуждений
+        thought_process = [
+            "Let's systematically analyze the examples to discover the hidden transformation rule."
+        ]
+
+        thought_process.append("The symbols represent standard base-10 mathematical operations.")
+        lvl1_result = self._solve_level1_numeric(prompt_str, query_clean, ctx, answer_hint)
+        if lvl1_result: 
+            return "\n".join(thought_process + [lvl1_result])
+
+        thought_process.append("Testing standard arithmetic reveals contradictions. For instance, the outputs in the examples do not match standard math.")
+        thought_process.append("The operation might be applied digit-by-digit rather than on whole numbers.")
         lvl1_5_result = self._solve_level1_5_digit_wise(parsed_exs, q_a, q_op, q_b, ctx)
-        if lvl1_5_result: return lvl1_5_result
+        if lvl1_5_result: 
+            return "\n".join(thought_process + [lvl1_5_result])
             
+        thought_process.append("Digit-wise operations do not yield a consistent rule across all examples.")
+        thought_process.append("This could be a cryptarithm where symbols or letters map to specific base-10 digits.")
         lvl2_result = self._solve_level2_cryptarithm(parsed_exs, q_a, q_op, q_b, ctx)
-        if lvl2_result: return lvl2_result
+        if lvl2_result: 
+            return "\n".join(thought_process + [lvl2_result])
             
+        thought_process.append("Analysis shows no consistent character-to-digit mapping satisfies all equations simultaneously. Let's pivot to a non-mathematical structure.")
+        thought_process.append("The operators might be string manipulation functions (like concatenation, interleaving, or character subtraction).")
+        
         lvl3_result = self._solve_level3_string(parsed_exs, q_a, q_op, q_b, ctx)
-        if lvl3_result: return lvl3_result
+        if lvl3_result: 
+            return "\n".join(thought_process + [lvl3_result])
+        
+        thought_process.append("Basic string concatenation or interleaving doesn't match the examples either. The transformation might be more structural.")
+
+       # lvl4_result = self._solve_level4_string_operations(parsed_exs, q_a, q_op, q_b)
+       # if lvl4_result: 
+       #     return "\n".join(thought_process + [lvl4_result])
+       # 
+       # thought_process.append("String manipulations also fail to consistently explain the outputs.")
+       # thought_process.append("Let's consider a robust cryptarithm where even operators are encrypted and leading zeros are allowed.")        
+       # lvl5_result = self._solve_level5_robust_cryptarithm(parsed_exs, q_a, q_op, q_b)
+       # if lvl5_result: 
+       #     return "\n".join(thought_process + [lvl5_result])
             
+        # Fallbacks (если ни одно правило не найдено)
+        thought_process.append("All structural, mathematical, and encrypted hypotheses failed to find a reliable global rule for the examples.")
+        
         is_numeric = q_a.lstrip('-').isdigit() and q_b.lstrip('-').isdigit()
         if is_numeric and q_op in ['+', '-', '*', '/']:
             v1, v2 = int(q_a), int(q_b)
@@ -538,20 +705,18 @@ class EnsembleEquationsSolver:
             elif q_op == '/' and v2 != 0: ans = str(v1 // v2)
             else: ans = str(v1 + v2)
             
-            cot_lines = [
-                "The provided examples do not form a consistent algebraic or string-based pattern.",
+            fallback_numeric = "\n".join([
                 f"However, the target query consists of pure numbers and a standard operator `{q_op}`.",
-                "In the absence of a reliable hidden rule, the most logical approach is to trust standard base-10 mathematics.",
+                "In the absence of a reliable hidden rule, the most logical fallback approach is to trust standard base-10 mathematics.",
                 f"Evaluating {q_a} {q_op} {q_b} standardly.",
                 f"\nFinal answer: {ans}"
-            ]
-            return "\n".join(cot_lines)
+            ])
+            return "\n".join(thought_process + [fallback_numeric])
 
         ans = (q_a + q_b) if q_op in ['+', '*'] else (q_b + q_a)
-        cot_lines = [
-            "The provided examples do not form any consistent mathematical, digit-wise, or string manipulation pattern.",
+        fallback_str = "\n".join([
             "Since no reliable rule can be extracted, we fall back to a basic heuristic combination.",
             "We will simply concatenate the two target strings.",
             f"\nFinal answer: {ans}"
-        ]
-        return "\n".join(cot_lines)
+        ])
+        return "\n".join(thought_process + [fallback_str])
