@@ -142,9 +142,8 @@ def main():
         args.model_id,
         device_map="auto",
         torch_dtype=torch.bfloat16,
-        trust_remote_code=False,
-        use_cache=False,
-        attn_implementation="flash_attention_2"
+        trust_remote_code=True,
+        use_cache=False
     )
 
 
