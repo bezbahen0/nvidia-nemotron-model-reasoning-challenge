@@ -29,13 +29,28 @@ stages:
       - ${data.train_prepared}
       - ${data.val_prepared}
 
+  prepare_data:
+    cmd: >
+      python -m src.prepare_dataset
+      --data_path ${data.train_prepared}
+      --output_path ${data.train_generated}
+      --seed ${train.seed}
+    deps:
+      - ${data.train_prepared}
+      - src/prepare_dataset.py
+    params:
+      - train.seed
+    outs:
+      - ${data.train_generated}
+
+
   sft_train:
     cmd: >
       python -m src.sft_train 
       --wandb_run_basename ${wandb.wandb_base_run_name}
       --model_id ${model.id}
       --data ${data.dataset_name}
-      --train_path ${data.train_prepared}
+      --train_path ${data.train_generated}
       --seed ${train.seed}
       --eval_steps ${train.eval_steps}
       --val_path ${data.val_prepared}
@@ -46,7 +61,7 @@ stages:
       --max_hours ${train.max_hours}
       --lr ${train.lr}
     deps:
-      - ${data.train_prepared}
+      - ${data.train_generated}
       - ${data.val_prepared}
       - src/sft_train.py
     params:
@@ -64,19 +79,3 @@ stages:
       - ${model.sft_output_dir}:
           persist: true
     
-  evaluate_checkpoints:
-    cmd: >
-      python -m src.evaluate_checkpoints
-      --wandb_run_basename ${wandb.wandb_base_run_name}
-      --base_model ${model.id}
-      --val_data ${data.val_prepared}
-      --checkpoints_dir ${model.sft_output_dir}
-      --output_scores ${evaluate.scores_file}
-    deps:
-      - ${data.val_prepared}
-      - ${model.sft_output_dir}
-      - src/evaluate_checkpoints.py
-    params:
-      - model.id
-    outs:
-      - ${evaluate.scores_file}
