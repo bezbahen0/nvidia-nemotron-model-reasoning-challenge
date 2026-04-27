@@ -1,7 +1,6 @@
 import os
 import time
 import argparse
-import types
 import torch
 import pandas as pd
 import wandb
@@ -148,17 +147,6 @@ def main():
         attn_implementation="flash_attention_2"
     )
 
-    logger.info("Патчинг модели для поддержки Gradient Checkpointing...")
-    
-    model.supports_gradient_checkpointing = True
-    
-    def _set_gradient_checkpointing(self, module, value=False):
-        if hasattr(module, "gradient_checkpointing"):
-            module.gradient_checkpointing = value
-
-    model._set_gradient_checkpointing = types.MethodType(_set_gradient_checkpointing, model)
-    
-    model.gradient_checkpointing_enable()
 
     lora_config = LoraConfig(
         r=args.lora_r,
@@ -190,7 +178,6 @@ def main():
         
         optim="paged_adamw_8bit",
         gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={'use_reentrant': False},
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         max_length=args.max_seq_len,
