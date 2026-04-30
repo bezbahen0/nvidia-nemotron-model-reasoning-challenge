@@ -11,14 +11,11 @@ Here are some examples of input -> output:
 Now, determine the output for: {target_input}"""
 
 
-class BitManipulationTaskGenerator:
-    """Генератор синтетических задач для битовых манипуляций."""
-    
+class BitManipulationTaskGenerator:    
     def __init__(self, seed: int = None):
         self.bit_manipulation_solver = BitManipulationSolver()
         self.rng = random.Random(seed)
 
-        # Поддерживаемые операции (аналогично решателю)
         self.ops = {
             'I': lambda a, b: a, 'NOT': lambda a, b: 1 - a,
             'C0': lambda a, b: 0, 'C1': lambda a, b: 1,
@@ -61,15 +58,8 @@ class BitManipulationTaskGenerator:
         return out
 
     def generate_task(self, num_examples=8, mode='pattern'):
-        """
-        Генерирует задачу.
-        :param num_examples: Количество примеров перед таргетом (обычно 4-5)
-        :param mode: 'pattern' (закономерность) или 'mixed' (хаос)
-        :return: (prompt, target_output, rules)
-        """
         rules = self._generate_pattern_rules() if mode == 'pattern' else self._generate_mixed_rules()
 
-        # Генерируем набор уникальных 8-битных строк
         inputs = set()
         while len(inputs) < num_examples + 1:
             inputs.add(format(self.rng.randint(0, 255), '08b'))
@@ -90,7 +80,9 @@ class BitManipulationTaskGenerator:
     def generate_dataset(self, num_samples):
         results = []
         for i in range(num_samples):
-            examples_line, answer, target_input, rules = self.generate_task(num_examples=8, mode='pattern')
+            # after EDA i see that example in train bit manipulation task is in range of [8, 12]
+            random_num_examples = self.rng.randint(8, 12)
+            examples_line, answer, target_input, rules = self.generate_task(num_examples=random_num_examples, mode='pattern')
             prompt = bit_manipulation_prompt_template.format(examples=examples_line, target_input=target_input)
             generated_cot = self.bit_manipulation_solver.generate_cot(prompt)
             computed_answer = self.bit_manipulation_solver.extract_answer(generated_cot)
