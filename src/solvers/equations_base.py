@@ -120,8 +120,11 @@ class BaseEquationSolver:
             result = self.csp_solver.solve(examples, target)
         elif task_type == "Pseudo-Math (Format/String)":
             result = self.string_solver.solve(examples, target)
-            
-        cot.extend(result["debug"])
-        cot.append(f"Final answer: {result['answer']}")
+        else:
+            cot += ["FAIL"]
+            return "\n".join(cot)
 
+        
+        cot += result["debug"]
+        cot.append(f"Final answer: {result['answer']}")
         return "\n".join(cot)
