@@ -184,7 +184,7 @@ def main():
         max_length=args.max_seq_len,
         completion_only_loss=True, 
 
-        ddp_find_unused_parameters=False
+        ddp_find_unused_parameters=False,
 
         dataloader_num_workers=4,
         dataloader_prefetch_factor=2,
