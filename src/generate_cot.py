@@ -7,7 +7,7 @@ from tqdm import tqdm
 pandarallel.initialize(progress_bar=False)
 
 from src.solvers.bit_manipulation import BitManipulationSolver
-from src.solvers.equations import EnsembleEquationsSolver
+from src.solvers.equations_base import BaseEquationSolver
 from src.solvers.gravitational import GravitationalSolver
 from src.solvers.numeral_system import NumeralSystemSolver
 from src.solvers.unit_conversion import UnitConversionSolver
@@ -68,7 +68,7 @@ def main():
         "conversion to diff numeral system": NumeralSystemSolver(),
         "unit conversion": UnitConversionSolver(),
         "gravitational": GravitationalSolver(),
-        "equations transformation": EnsembleEquationsSolver()
+        "equations transformation": BaseEquationSolver()
     }    
 
     raw_accuracy = {}
