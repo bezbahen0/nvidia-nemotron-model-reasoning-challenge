@@ -51,17 +51,17 @@ class BaseEquationSolver:
                     
                     if len(operands) == 2:
                         left, right = operands[0], operands[1]
-                        
+
                         # Direct concatenation (A + B = AB)
                         if rhs_clean == "".join(operands):
                             cot.append(f"Example '{line}' is a string concatenation: left '{left}' + right '{right}' = '{rhs_clean}'.")
                             return "Pseudo-Math (Format/String)", cot
-                        
+
                         # Reverse concatenation of operands (A + B = BA)
                         if rhs_clean == "".join(reversed(operands)):
                             cot.append(f"Example '{line}' is a reversed string concatenation: right '{right}' + left '{left}' = '{rhs_clean}'.")
                             return "Pseudo-Math (Format/String)", cot
-                        
+
                         # Full character-by-character reverse of direct concatenation (rare, but happens: AB -> BA)
                         if rhs_clean == "".join(operands)[::-1]:
                             cot.append(f"Example '{line}' is a fully reversed string concatenation: ('{left}' + '{right}') reversed = '{rhs_clean}'.")
@@ -91,8 +91,7 @@ class BaseEquationSolver:
         if task_type == "AST Brute-force":
             return self.ast_solver.solve(examples, target)
         elif task_type == "Cryptarithm (CSP)":
-            #return self.csp_solver.solve(examples, target)
-            return "HUI"
+            return self.csp_solver.solve(examples, target)
         elif task_type == "Pseudo-Math (Format/String)":
             return self.string_solver.solve(examples, target)
             
