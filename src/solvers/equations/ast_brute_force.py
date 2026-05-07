@@ -356,7 +356,6 @@ class ASTBruteForceSolver:
             return {"answer": final_ans, "debug": log}
             
         else:
-            # Словарь для красивого вывода названий операций в CoT
             op_readable_names = {
                 "add": "addition", 
                 "sub": "subtraction", 
@@ -371,12 +370,10 @@ class ASTBruteForceSolver:
             pool_str = ", ".join([op_readable_names.get(op, op) for op in strict_base_pool])
             log.append(f"The standard pool of operations used in this environment includes: {pool_str}.")
             
-            # Логируем, какие операции уже заняты (предполагается, что used_base_ops - это список)
             if used_base_ops:
                 used_str = ", ".join([op_readable_names.get(op, op) for op in used_base_ops])
                 log.append(f"From analyzing the previous examples, we have already identified the use of: {used_str}.")
             
-            # Вычисляем доступные
             avail_ops = [op for op in strict_base_pool if op not in used_base_ops]
             
             if not avail_ops:
@@ -386,20 +383,16 @@ class ASTBruteForceSolver:
                 avail_str = ", ".join([op_readable_names.get(op, op) for op in avail_ops])
                 log.append(f"This leaves the following unused operations as candidates for the '{q_op}' operator: {avail_str}.")
                 
-            # Выбираем операцию и логируем этот выбор
             best_op = avail_ops[0]
             chosen_op_str = op_readable_names.get(best_op, best_op)
             log.append(f"I will select the first available candidate, {chosen_op_str}, to formulate the hypothesis for this operator.")
             
-            # Получаем текстовые описания шагов
             desc_cfg = self.config_desc.get(global_config, global_config)
             desc_op = self.op_desc.get(best_op, best_op)
             desc_fmt = self.fmt_desc.get(global_fmt, global_fmt)
             
-            # Формируем итоговое правило
             log.append(f"Assuming it follows the global style established by the other equations, the complete rule is: {desc_cfg}, then {desc_op}, and finally {desc_fmt}.")
             
-            # Выполнение вычислений
             cfg = self._get_operand_configs(q_a, q_b)[global_config]
             ops = self._get_operations(*cfg)
             
