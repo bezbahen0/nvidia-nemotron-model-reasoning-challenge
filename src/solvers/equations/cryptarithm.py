@@ -3,12 +3,6 @@ import itertools
 from typing import Optional, List, Dict, Any
 
 class CryptarithmCSPSolver:
-    """
-    Ультимативный контекстный солвер v17 (Deterministic High-Speed Hybrid).
-    - Возвращено детальное логирование.
-    - Жестко зафиксирован приоритет математических правил (убран баг с set).
-    - Отключено слепое угадывание Holistic-правил для неизвестных операторов (Zero-Shot только через Math).
-    """
     def __init__(self):
         self.char_map = {
             '!': 1, '"': 2, '#': 3, '$': 4, '%': 5, '&': 6, "'": 7, '(': 8, ')': 9, 
@@ -42,9 +36,6 @@ class CryptarithmCSPSolver:
             
         return L_str, R_str, op_char, right
 
-    # ==========================================
-    # ДВИЖОК 1: СТРУКТУРНЫЕ И ВЕКТОРНЫЕ ПРАВИЛА
-    # ==========================================
     def _get_holistic_rules(self) -> List[Dict[str, Any]]:
         def mod26(val): return int(((val - 1) % 26) + 1)
         
@@ -81,11 +72,7 @@ class CryptarithmCSPSolver:
 
         return rules
 
-    # ==========================================
-    # ДВИЖОК 2: ГЕНЕРАЦИЯ И КЭШИРОВАНИЕ ПРАВИЛ
-    # ==========================================
     def _generate_math_rules(self) -> List[Dict[str, Any]]:
-        # Порядок словарей важен! Он задает естественный приоритет правил.
         math_ops = {
             'add': lambda a, b: a + b, 'sub': lambda a, b: a - b, 'sub_rev': lambda a, b: b - a,
             'abs': lambda a, b: abs(a - b), 'mul': lambda a, b: a * b, 'add1': lambda a, b: a + b + 1,
@@ -123,16 +110,14 @@ class CryptarithmCSPSolver:
                     rules.append(rule)
         return rules
 
-    # ==========================================
-    # ГЛАВНЫЙ МЕТОД: HYBRID PIPELINE
-    # ==========================================
     def solve(self, examples_text: str, target_text: str) -> Dict[str, Any]:
         log = []
         try:
             equations = []
             eqs_by_op = {}
             
-            log.append("--- Parsing ---")
+            log.append("Let's figure out the hidden rules behind these symbolic equations by analyzing the provided examples.")
+            
             for idx, line in enumerate(examples_text.strip().split('\n')):
                 parsed = self._parse_equation(line)
                 if parsed:
@@ -148,13 +133,15 @@ class CryptarithmCSPSolver:
                     equations.append(eq_data)
                     eqs_by_op[op_char].append(eq_data)
 
+            if not equations:
+                log.append("I couldn't find any valid examples to learn from. Please check the format.")
+                return {"answer": None, "debug": log}
+
             clean_target = re.sub(r'(?i)now,\s*d[e]?termine\s*the\s*result\s*for:\s*', '', target_text).replace(" ", "").strip()
             t_L_str, t_R_str, target_op, _ = self._parse_equation(clean_target + "=X")
             t_L_val = self._decode(t_L_str)
             t_R_val = self._decode(t_R_str)
             target_op_val = self.char_map.get(target_op, 0)
-            
-            log.append(f"Target: {clean_target} (Op: '{target_op}')")
 
             resolved_ops = {}
             math_pool = []
@@ -162,6 +149,8 @@ class CryptarithmCSPSolver:
 
             # ФАЗА 1: Holistic Filter
             for op, eqs in eqs_by_op.items():
+                log.append(f"Let's analyze the '{op}' operator. First, I will check if it represents a structural manipulation of the characters rather than a mathematical operation.")
+                
                 found_rule = None
                 for rule in holistic_rules:
                     match = True
@@ -178,9 +167,9 @@ class CryptarithmCSPSolver:
                 
                 if found_rule:
                     resolved_ops[op] = {'type': 'holistic', 'rule': found_rule}
-                    log.append(f"[PHASE 1] Op '{op}' is Holistic: {found_rule['name']}")
+                    log.append(f"By observing the inputs and outputs for '{op}', a clear structural pattern emerges. Instead of random mapping, we must apply the rule: '{found_rule['name']}'.")
                 else:
-                    # Фильтр для математики: пропускаем только строгие AB_CD форматы
+                    log.append(f"The '{op}' operator does not match any simple structural or vector rules. It likely involves hidden arithmetic where characters map to digits (0-9).")
                     for eq in eqs:
                         if len(eq['L_str']) == 2 and len(eq['R_str']) == 2:
                             math_pool.append(eq)
@@ -188,7 +177,7 @@ class CryptarithmCSPSolver:
             # ФАЗА 2: Filtered Math CSP
             final_map = {}
             if math_pool:
-                log.append(f"[PHASE 2] Starting Math CSP with {len(math_pool)} equations...")
+                log.append("Since some equations rely on underlying mathematical operations, I need to deduce the hidden digit assignments (0-9) for each character.")
                 char_counts = {}
                 for eq in math_pool:
                     for ch in eq['L_str'] + eq['R_str'] + eq['Res_str']:
@@ -197,9 +186,10 @@ class CryptarithmCSPSolver:
                 all_chars_set = set(char_counts.keys()).union(set(t_L_str + t_R_str))
                 chars = sorted(list(all_chars_set), key=lambda c: -char_counts.get(c, 0))
 
+                log.append(f"We have {len(chars)} unique characters involved in math operations: {', '.join(chars)}. I will systematically search for a valid assignment where all equation constraints hold true.")
+
                 if len(chars) <= 10:
                     math_op_chars = set(eq['op_char'] for eq in math_pool)
-                    # Используем LIST вместо SET для сохранения приоритета правил
                     initial_cands = {op: list(range(len(self.math_rules))) for op in math_op_chars}
                     
                     for eq in math_pool:
@@ -230,7 +220,6 @@ class CryptarithmCSPSolver:
                             current_map[c] = d
                             
                             valid = True
-                            # Сохраняем списки (list), а не множества
                             new_candidates = {k: list(v) for k, v in op_rule_candidates.items()}
                             
                             for eq in math_pool:
@@ -253,41 +242,57 @@ class CryptarithmCSPSolver:
                     final_map, final_cands = solve_csp(0, {}, set(), initial_cands)
                     
                     if final_map:
-                        log.append("[PHASE 2] Math CSP Success!")
+                        mapping_str = ", ".join([f"'{c}'={d}" for c, d in final_map.items()])
+                        log.append(f"By logically evaluating the constraints across all examples, I deduced the exact digit mapping: {mapping_str}.")
                         for op, cands in final_cands.items():
                             if cands:
-                                resolved_ops[op] = {'type': 'math', 'rule': self.math_rules[cands[0]]}
+                                m_rule = self.math_rules[cands[0]]
+                                resolved_ops[op] = {'type': 'math', 'rule': m_rule}
+                                log.append(f"Under this mapping, equations using '{op}' are valid if the operator dictates this math logic: {m_rule['desc']}.")
                     else:
-                        log.append("[PHASE 2] Math CSP Failed: No valid 0-9 mapping found.")
+                        log.append("After testing possible 0-9 assignments, no valid mathematical mapping was found.")
                 else:
-                    log.append(f"[PHASE 2] Math CSP Skipped: Too many unique characters ({len(chars)} > 10).")
+                    log.append(f"There are too many unique characters ({len(chars)} > 10) to map to a standard base-10 numerical system. Arithmetic evaluation skipped.")
 
             # ФАЗА 3: Zero-Shot / Resolution
+            log.append(f"Now, let's solve the target expression: {clean_target}.")
+            
             if target_op in resolved_ops:
                 r_data = resolved_ops[target_op]
                 if r_data['type'] == 'holistic':
                     try:
+                        rule_name = r_data['rule']['name']
+                        log.append(f"Applying the established structural rule '{rule_name}' for the '{target_op}' operator.")
                         ans = r_data['rule']['fn'](t_L_val, t_R_val, target_op_val)
                         enc = self._encode(ans)
                         if '?' not in enc: 
-                            log.append(f"[PHASE 3] Evaluated using known Holistic rule: {r_data['rule']['name']}")
+                            log.append(f"Executing this structural manipulation yields the exact string answer: {enc}.")
                             return {"answer": enc, "debug": log}
                     except: pass
                 elif r_data['type'] == 'math' and final_map:
                     try:
                         m_rule = r_data['rule']
+                        log.append(f"Applying the known mathematical rule ({m_rule['desc']}) using our deduced mapping.")
                         vL, vR = m_rule['op_func'](final_map, t_L_str, t_R_str)
-                        ans_str = m_rule['out_f'](m_rule['math_f'](vL, vR))
+                        log.append(f"Substituting the characters, our left operand becomes {vL} and our right operand becomes {vR}.")
+                        
+                        ans_num = m_rule['math_f'](vL, vR)
+                        ans_str = m_rule['out_f'](ans_num)
+                        log.append(f"Calculating the result gives {ans_num}, which formats to '{ans_str}'.")
+                        
                         rev_map = {v: k for k, v in final_map.items()}
                         if all(int(ch) in rev_map for ch in ans_str):
                             ans_enc = "".join(rev_map[int(ch)] for ch in ans_str)
-                            log.append(f"[PHASE 3] Evaluated using known Math rule: {m_rule['desc']}")
+                            log.append(f"Finally, mapping the digits back to characters provides the final answer: {ans_enc}.")
                             return {"answer": ans_enc, "debug": log}
+                        else:
+                            log.append(f"Could not convert the result '{ans_str}' back into characters because some digits are missing from our mapping.")
                     except: pass
 
             else:
-                log.append("[PHASE 3] Zero-Shot Target. Applying Math Elimination...")
+                log.append(f"The operator '{target_op}' was not present in the examples. We must deduce its function without prior precedent.")
                 if final_map:
+                    log.append(f"However, we already know the underlying digit mapping for the characters. I will test available unused math operations on the target variables.")
                     used_m_descs = {r['rule']['desc'] for r in resolved_ops.values() if r['type'] == 'math'}
                     for m_rule in self.math_rules:
                         if m_rule['desc'] not in used_m_descs:
@@ -297,11 +302,12 @@ class CryptarithmCSPSolver:
                                 rev_map = {v: k for k, v in final_map.items()}
                                 if all(int(ch) in rev_map for ch in ans_str):
                                     enc = "".join(rev_map[int(ch)] for ch in ans_str)
-                                    log.append(f"  [ZERO-SHOT] Matched Math: {m_rule['desc']}")
+                                    log.append(f"Assuming it follows the first valid unused math rule ({m_rule['desc']}), we get {vL} and {vR}. Calculating this yields '{ans_str}'.")
+                                    log.append(f"Mapping these digits back to characters provides the final deduced answer: {enc}.")
                                     return {"answer": enc, "debug": log}
                             except: pass
 
-            log.append("[FAIL] Target could not be resolved.")
+            log.append("Unable to resolve the target expression due to insufficient pattern data or missing variables.")
             return {"answer": None, "debug": log}
 
         except Exception as e:
