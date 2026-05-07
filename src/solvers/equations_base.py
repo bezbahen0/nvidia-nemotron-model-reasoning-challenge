@@ -38,9 +38,7 @@ class BaseEquationSolver:
         
         if target_op_match:
             target_op = target_op_match.group(0)
-            cot.append(f"The target operator in the expression is '{target_op}'.")
-            cot.append("Let's analyze the examples with this operator.")
-            
+
             for line in examples.split('\n'):
                 if '=' in line and target_op in line.split('=')[0]:
                     lhs, rhs = line.split('=', 1)
@@ -54,20 +52,27 @@ class BaseEquationSolver:
 
                         # Direct concatenation (A + B = AB)
                         if rhs_clean == "".join(operands):
+                            cot.append(f"The target operator in the expression is '{target_op}'.")
+                            cot.append("Let's analyze the examples with this operator.")
+            
                             cot.append(f"Example '{line}' is a string concatenation: left '{left}' + right '{right}' = '{rhs_clean}'.")
                             return "Pseudo-Math (Format/String)", cot
 
                         # Reverse concatenation of operands (A + B = BA)
                         if rhs_clean == "".join(reversed(operands)):
+                            cot.append(f"The target operator in the expression is '{target_op}'.")
+                            cot.append("Let's analyze the examples with this operator.")
+            
                             cot.append(f"Example '{line}' is a reversed string concatenation: right '{right}' + left '{left}' = '{rhs_clean}'.")
                             return "Pseudo-Math (Format/String)", cot
 
                         # Full character-by-character reverse of direct concatenation (rare, but happens: AB -> BA)
                         if rhs_clean == "".join(operands)[::-1]:
+                            cot.append(f"The target operator in the expression is '{target_op}'.")
+                            cot.append("Let's analyze the examples with this operator.")
+            
                             cot.append(f"Example '{line}' is a fully reversed string concatenation: ('{left}' + '{right}') reversed = '{rhs_clean}'.")
                             return "Pseudo-Math (Format/String)", cot
-        else:
-            cot.append("It is not immediately obvious, but this is likely a mathematical problem rather than string manipulation.")
         
 
         # If there are no digits at all and it's not string concatenation, route to cryptarithm
@@ -106,7 +111,7 @@ class BaseEquationSolver:
 
     def generate_cot(self, prompt: str) -> str:
         examples, target = self._extract_sections(prompt)
-        cot = [f"I see this is an equations problem. Based on the examples, we need to determine the result for: {target}."]
+        cot = [f"Based on the examples, we need to determine the result for: {target}."]
 
         if not examples or not target:
             return ""
@@ -121,7 +126,7 @@ class BaseEquationSolver:
         elif task_type == "Pseudo-Math (Format/String)":
             result = self.string_solver.solve(examples, target)
         else:
-            cot += ["FAIL"]
+            cot += ["I can't solve this type of problem"]
             return "\n".join(cot)
 
         
