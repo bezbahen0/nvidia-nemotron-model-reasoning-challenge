@@ -107,6 +107,8 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
     os.makedirs(args.output_dir, exist_ok=True)
     run_id_file = os.path.join(args.output_dir, "wandb_run_id.txt")
     
@@ -140,7 +142,7 @@ def main():
     logger.info("Загрузка модели в bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        device_map="auto",
+        device_map={"": local_rank},
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         use_cache=False
@@ -181,6 +183,8 @@ def main():
         warmup_ratio=0.1,
         max_length=args.max_seq_len,
         completion_only_loss=True, 
+
+        ddp_find_unused_parameters=False
 
         dataloader_num_workers=4,
         dataloader_prefetch_factor=2,

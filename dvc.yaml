@@ -46,7 +46,7 @@ stages:
 
   sft_train:
     cmd: >
-      python -m src.sft_train 
+      torchrun --nproc_per_node=auto -m src.sft_train 
       --wandb_run_basename ${wandb.wandb_base_run_name}
       --model_id ${model.id}
       --data ${data.dataset_name}
