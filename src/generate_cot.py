@@ -124,16 +124,18 @@ def main():
     
     
     records = []
+    result = []
     for task in task_solvers_map.keys():
         records.append({
             "Task Name": task,
             "Exact Match Accuracy (%)": round(raw_accuracy.get(task, 0), 2),
             "Round Accuracy (%)": round(rounded_accuracy.get(task, 0), 2)
         })
+        result.append(round(rounded_accuracy.get(task, 0), 2))
 
     results_df = pd.DataFrame.from_records(records)
-
     logger.info("\n" + results_df.to_string(index=False, justify='center'))
+    logger.info(f"Teoretical global accuracy: {sum(result) / len(result)}")
 
 
 if __name__ == "__main__":
