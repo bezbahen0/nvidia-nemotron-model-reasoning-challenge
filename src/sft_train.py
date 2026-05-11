@@ -74,25 +74,10 @@ def prepare_dataset(csv_path, eval=False):
         # Use computed answer, reduce noice, we compare results on previosue stage
         computed_answer = str(row['computed_answer']).strip()
         
-        # } break compputed metric provided by orgs, reg search only to first }
-        # matches = re.findall(r'\\boxed\{([^}]*)(?:\}|$)', text)
-        if '}' in computed_answer:
-            meta_reasoning = (
-                "\n\nWait, the calculated answer contains a closing curly brace '}'. "
-                "Wrapping it in a standard LaTeX \\boxed{} tag would create malformed syntax and ambiguity "
-                "where the bounding box terminates prematurely. To avoid formatting errors and preserve the exact answer, "
-                "I will use the plain text format instead."
-            )
-            
-            assistant_text = (
-                f"<think>\n{row['generated_cot']}{meta_reasoning}\n</think>\n"
-                f"The final answer is: {computed_answer}"
-            )
-        else:
-            assistant_text = (
-                f"<think>\n{row['generated_cot']}\n</think>\n"
-                f"Final Answer: \\boxed{{{computed_answer}}}"
-            )
+        assistant_text = (
+            f"<think>\n{row['generated_cot']}\n</think>\n"
+            f"Final Answer: \\boxed{{{computed_answer}}}"
+        )
         
         formatted_data.append({
             "messages": [

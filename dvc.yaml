@@ -60,6 +60,8 @@ stages:
       --epochs ${train.epochs}
       --max_hours ${train.max_hours}
       --lr ${train.lr}
+      --lora_r ${train.lora_r}
+      --lora_alpha ${train.lora_alpha}
     deps:
       - ${data.train_generated}
       - ${data.val_prepared}
@@ -75,6 +77,8 @@ stages:
       - train.eval_steps
       - train.seed
       - train.lr
+      - train.lora_r
+      - train.lora_alpha
     outs:
       - ${model.sft_output_dir}:
           persist: true
