@@ -1,30 +1,25 @@
 data:
-  raw_source: data/raw/train.csv
+  raw_source: /kaggle/input/nvidia-nemotron-3-reasoning-challenge/train.csv
   raw_working: data/solved/train-cot.csv
   train_prepared: data/prepared/train_stratified.csv
   train_generated: data/generated/train_with_syntetic.csv
   val_prepared: data/prepared/val_stratified.csv
   dataset_name: algorithmic_cot
-
 model:
-  id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  id: /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
   sft_output_dir: models/sft_v0.0.9
-
 split:
   val_size: 0.1
-
 train:
   lr: 2e-4
-  batch_size: 8
-  grad_accum: 4
+  batch_size: 4
+  grad_accum: 8
   epochs: 4
   seed: 31231
   eval_steps: 205
   max_hours: 10.0
   lora_r: 32
   lora_alpha: 64
-
-
 evaluate:
   scores_file: data/scores/validation_scores.json
 wandb:

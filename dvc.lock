@@ -7,8 +7,8 @@ stages:
     deps:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: be88cc09bb422400562ecf6d09c6588e
-      size: 16429127
+      md5: 2b1211c2a91111c6ce6f9d023d608512
+      size: 18705211
     - path: src/split_data.py
       hash: md5
       md5: c13aae0165db013d5df032bed463e111
@@ -20,31 +20,32 @@ stages:
     outs:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 1eab7df10291e63aa8d6f4265772055a
-      size: 14776513
+      md5: 73bfa5bf58db4d08dc122037c0b8cb43
+      size: 16817765
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 93ee533070ee51457d58b673e7cc9e8a
-      size: 1652689
+      md5: 9be037b77353f9ef8721a30b44ea9ed3
+      size: 1885423
   sft_train:
-    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.7 --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
+    cmd: "torchrun --nproc_per_node=auto -m src.sft_train  --wandb_run_basename sft_v0.0.9
+      --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
       --data algorithmic_cot --train_path data/generated/train_with_syntetic.csv --seed
       31231 --eval_steps 205 --val_path data/prepared/val_stratified.csv --output_dir
-      models/sft_v0.0.7 --batch_size 4 --grad_accum 8 --epochs 4 --max_hours 10.0
-      --lr 0.0002\n"
+      models/sft_v0.0.9 --batch_size 4 --grad_accum 8 --epochs 4 --max_hours 10.0
+      --lr 0.0002 --lora_r 32 --lora_alpha 64\n"
     deps:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 9ac19b267a09c8ee6a07b0c9ab437fb6
-      size: 37080328
+      md5: ced8841377a0c8e2bd2a8cc6b06fd9ed
+      size: 44391405
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 93ee533070ee51457d58b673e7cc9e8a
-      size: 1652689
+      md5: 9be037b77353f9ef8721a30b44ea9ed3
+      size: 1885423
     - path: src/sft_train.py
       hash: md5
-      md5: 0ef4cbe83b39836971361a176d70cec3
-      size: 8209
+      md5: 64ab3117c6613257c21da0713ce576b5
+      size: 7488
     params:
       params.yaml:
         data.dataset_name: algorithmic_cot
@@ -54,15 +55,17 @@ stages:
         train.epochs: 4
         train.eval_steps: 205
         train.grad_accum: 8
+        train.lora_alpha: 64
+        train.lora_r: 32
         train.lr: 0.0002
         train.max_hours: 10.0
         train.seed: 31231
-        wandb.wandb_base_run_name: sft_v0.0.7
+        wandb.wandb_base_run_name: sft_v0.0.9
     outs:
-    - path: models/sft_v0.0.7
+    - path: models/sft_v0.0.9
       hash: md5
-      md5: e04426876f00b3a3d5254dc25ae66357.dir
-      size: 7172434718
+      md5: c1d2b79b2850ae036eab857b29adeded.dir
+      size: 14261413058
       nfiles: 30
   evaluate_checkpoints:
     cmd: "python -m src.evaluate_checkpoints --wandb_run_basename baseline --base_model
@@ -100,26 +103,26 @@ stages:
       size: 3069304
     - path: src/generate_cot.py
       hash: md5
-      md5: 18901451686307b81798e70ff9468386
-      size: 5213
+      md5: fc2b5071d17a62e3a41054b289d36b79
+      size: 5362
     - path: src/solvers
       hash: md5
-      md5: 6cffb93c37b62d63c3a819c2372c55fb.dir
-      size: 155747
-      nfiles: 14
+      md5: ef4f2f4c922c810139b0d6db79e29ee1.dir
+      size: 207275
+      nfiles: 22
     outs:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: be88cc09bb422400562ecf6d09c6588e
-      size: 16429127
+      md5: 2b1211c2a91111c6ce6f9d023d608512
+      size: 18705211
   prepare_data:
     cmd: "python -m src.prepare_dataset --data_path data/prepared/train_stratified.csv
       --output_path data/generated/train_with_syntetic.csv --seed 31231\n"
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 1eab7df10291e63aa8d6f4265772055a
-      size: 14776513
+      md5: 73bfa5bf58db4d08dc122037c0b8cb43
+      size: 16817765
     - path: src/prepare_dataset.py
       hash: md5
       md5: 1cb86307d5fecd4ed99ea208d6772260
@@ -130,5 +133,5 @@ stages:
     outs:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 9ac19b267a09c8ee6a07b0c9ab437fb6
-      size: 37080328
+      md5: ced8841377a0c8e2bd2a8cc6b06fd9ed
+      size: 44391405
