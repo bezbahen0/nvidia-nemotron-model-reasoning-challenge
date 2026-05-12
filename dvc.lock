@@ -7,8 +7,8 @@ stages:
     deps:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: b14a5b3c935acaaa8bf6594736f948f7
-      size: 18716435
+      md5: d3d3a62c799dccba9b6f92d6a96afa9c
+      size: 18715679
     - path: src/split_data.py
       hash: md5
       md5: c13aae0165db013d5df032bed463e111
@@ -20,12 +20,12 @@ stages:
     outs:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: bf9bd5c6509909706ed2dcf00ba2dfb3
-      size: 16826312
+      md5: 54ea027e9b64524e24487d3939007bc0
+      size: 16827861
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: b1c8d2584f35bee336e239571584e678
-      size: 1888105
+      md5: 8a284c8c89110898533d3f1395dafafa
+      size: 1885816
   sft_train:
     cmd: "torchrun --nproc_per_node=auto -m src.sft_train  --wandb_run_basename sft_v0.0.9
       --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
@@ -36,12 +36,12 @@ stages:
     deps:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: d7ef1c5337e06f9469f348abbddf9d23
-      size: 44500422
+      md5: 61a620624fdd502cad16c53066ef2043
+      size: 44257147
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: b1c8d2584f35bee336e239571584e678
-      size: 1888105
+      md5: 8a284c8c89110898533d3f1395dafafa
+      size: 1885816
     - path: src/sft_train.py
       hash: md5
       md5: 64ab3117c6613257c21da0713ce576b5
@@ -64,8 +64,8 @@ stages:
     outs:
     - path: models/sft_v0.0.9
       hash: md5
-      md5: ec4f3c4530477584b5e6ba20b20412d7.dir
-      size: 14323936124
+      md5: 6c588eb7e06b6aac0ecf4c4aded8343b.dir
+      size: 14323944365
       nfiles: 30
   evaluate_checkpoints:
     cmd: "python -m src.evaluate_checkpoints --wandb_run_basename baseline --base_model
@@ -107,22 +107,22 @@ stages:
       size: 5362
     - path: src/solvers
       hash: md5
-      md5: 8edc80d702516b3af1c62f72fce6f9ee.dir
+      md5: 220689f4cc716302c6426e7277ff9ec0.dir
       size: 207275
       nfiles: 22
     outs:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: b14a5b3c935acaaa8bf6594736f948f7
-      size: 18716435
+      md5: d3d3a62c799dccba9b6f92d6a96afa9c
+      size: 18715679
   prepare_data:
     cmd: "python -m src.prepare_dataset --data_path data/prepared/train_stratified.csv
       --output_path data/generated/train_with_syntetic.csv --seed 31231\n"
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: bf9bd5c6509909706ed2dcf00ba2dfb3
-      size: 16826312
+      md5: 54ea027e9b64524e24487d3939007bc0
+      size: 16827861
     - path: src/prepare_dataset.py
       hash: md5
       md5: 1cb86307d5fecd4ed99ea208d6772260
@@ -133,5 +133,5 @@ stages:
     outs:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: d7ef1c5337e06f9469f348abbddf9d23
-      size: 44500422
+      md5: 61a620624fdd502cad16c53066ef2043
+      size: 44257147
