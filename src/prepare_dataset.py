@@ -39,7 +39,7 @@ def main():
     logger.info(f"Datset countes: \n{data.label.value_counts()}")
 
     multipliers = {
-        "bit manipulation": 3.0,
+        "bit manipulation": 5.0,
         "": 2.0,
     }
 
@@ -52,6 +52,7 @@ def main():
     bit_mp_gen_dataset = bit_manipulation_generator.generate_dataset(
         int(len(data[data.label == "bit manipulation"]) * multipliers["bit manipulation"])
     )
+    logger.info(bit_mp_gen_dataset.task_mode.value_counts())
 
     # Encryption
 
@@ -68,7 +69,6 @@ def main():
              global_vocab.update(re.sub(r"[^a-z\s]", "", ans.lower()).split())
 
     encryption_generator = EncryptionTaskGenerator(vocabulary=global_vocab, seed=args.seed)
-    print(global_vocab)
 
     encryption_gen_dataset = encryption_generator.generate_dataset(
         int(len(data[data.label == "encryption"]) * 3.0) # или любое нужное количество
