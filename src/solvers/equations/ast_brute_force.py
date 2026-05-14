@@ -1,4 +1,5 @@
 import re
+import random
 from typing import List, Tuple, Dict, Optional, Any
 from collections import defaultdict, Counter
 
@@ -7,61 +8,31 @@ class ASTBruteForceSolver:
     def __init__(self):
         self._numeric_re = re.compile(r"^(-?\d+)\s*([^\d\s]+)\s*(-?\d+)$")
         
-        # Natural language descriptions for configurations
         self.config_desc = {
-            "fwd": "take the original numbers",
-            "swap_ops": "swap the positions of the two numbers",
-            "rev_digits": "reverse the digits of both numbers",
-            "swap_rev": "reverse the digits and swap the numbers"
+            "fwd": "fwd (a, b)",
+            "swap_ops": "swap (b, a)",
+            "rev_digits": "rev_digits (rev(a), rev(b))",
+            "swap_rev": "swap_rev (rev(b), rev(a))"
         }
 
-        # Natural language descriptions for operations
         self.op_desc = {
-            "add": "add them together",
-            "sub": "subtract the second number from the first",
-            "mul": "multiply them",
-            "abs_diff": "find their absolute difference",
-            "div": "divide the first by the second",
-            "mod": "find the remainder when the first is divided by the second",
-            "rev_div": "divide the second by the first",
-            "rev_mod": "find the remainder when the second is divided by the first",
-            "rev_sub": "subtract the first number from the second",
-            "add1": "add them together and add 1",
-            "sub1": "subtract the second from the first and add 1",
-            "mul1": "multiply them and add 1",
-            "addm1": "add them together and subtract 1",
-            "subm1": "subtract the second from the first and subtract 1",
-            "mulm1": "multiply them and subtract 1",
-            "neg_abs_diff": "find the negative absolute difference",
-            "cat": "concatenate them as strings",
-            "rev_cat": "concatenate them in reverse order",
-            "dsum_add": "add the sum of their digits",
-            "dsum_mul": "multiply the sum of their digits",
-            "max_mod_min": "find the remainder of the larger divided by the smaller",
-            "cross_sum": "multiply the tens digits and add the product of the units digits",
-            "cross_diff_abs": "find the absolute difference between cross sums",
-            "cross_concat": "concatenate the products of the respective digits",
-            "cross_rev_concat": "concatenate the cross products of the digits"
+            "add": "add", "sub": "sub", "mul": "mul", "abs_diff": "abs_diff",
+            "div": "div", "mod": "mod", "rev_div": "rev_div", "rev_mod": "rev_mod",
+            "rev_sub": "rev_sub", "add1": "add+1", "sub1": "sub+1", "mul1": "mul+1",
+            "addm1": "add-1", "subm1": "sub-1", "mulm1": "mul-1", "neg_abs_diff": "-abs_diff",
+            "cat": "concat", "rev_cat": "rev_concat", "dsum_add": "digit_sum_add",
+            "dsum_mul": "digit_sum_mul", "max_mod_min": "max_mod_min",
+            "cross_sum": "cross_sum", "cross_diff_abs": "cross_diff_abs",
+            "cross_concat": "cross_concat", "cross_rev_concat": "cross_rev_concat"
         }
 
-        # Natural language descriptions for formats
         self.fmt_desc = {
-            "raw": "leave the result as is",
-            "abs": "take the absolute value of the result",
-            "zpad2": "pad the result to two digits",
-            "zpad3": "pad the result to three digits",
-            "rev": "reverse the resulting digits while keeping the sign",
-            "abs_rev": "reverse the resulting digits and drop the sign",
-            "first_digit": "take only the first digit",
-            "last_digit": "take only the last digit",
-            "sign_pref_raw": "prepend the operator symbol to the absolute value",
-            "sign_suff_raw": "append the operator symbol to the absolute value",
-            "sign_pref_rev": "reverse the digits and prepend the operator symbol",
-            "sign_suff_rev": "reverse the digits and append the operator symbol",
-            "raw_pref": "prepend the operator symbol to the result",
-            "raw_suff": "append the operator symbol to the result",
-            "abs_pref": "prepend the operator symbol to the absolute value",
-            "abs_suff": "append the operator symbol to the absolute value"
+            "raw": "raw", "abs": "abs", "zpad2": "zpad2", "zpad3": "zpad3",
+            "rev": "rev", "abs_rev": "abs_rev", "first_digit": "first_digit",
+            "last_digit": "last_digit", "sign_pref_raw": "sign_pref_raw",
+            "sign_suff_raw": "sign_suff_raw", "sign_pref_rev": "sign_pref_rev",
+            "sign_suff_rev": "sign_suff_rev", "raw_pref": "raw_pref",
+            "raw_suff": "raw_suff", "abs_pref": "abs_pref", "abs_suff": "abs_suff"
         }
 
     def _rev(self, s: str) -> str:
@@ -158,7 +129,6 @@ class ASTBruteForceSolver:
 
     def _score_hypothesis(self, config: str, op_name: str, fmt: str, num_examples: int, global_config: str = None, global_fmt: str = None) -> int:
         score = 0
-        
         if config == "swap_ops": score += 20
         elif config == "rev_digits": score += 30
         elif config == "swap_rev": score += 50
@@ -180,24 +150,16 @@ class ASTBruteForceSolver:
             "cross_sum": 40, "cross_diff_abs": 41, "cross_concat": 42, "cross_rev_concat": 43
         }
         score += op_penalties.get(op_name, 50)
-        
-        if num_examples == 1 and op_name in ["mod", "div", "rev_mod", "rev_div"]:
-            score += 100
-            
+        if num_examples == 1 and op_name in ["mod", "div", "rev_mod", "rev_div"]: score += 100
         if global_config and global_fmt:
-            if config == global_config and fmt == global_fmt:
-                score -= 1000 
-                
+            if config == global_config and fmt == global_fmt: score -= 1000 
         return score
 
     def solve(self, examples_text: str, target_text: str) -> Dict[str, Any]:
         log = []
-        log.append("Let's figure out the hidden rules behind these equations by analyzing the provided examples.")
-        
         qm = self._numeric_re.fullmatch(target_text.strip())
         if not qm: 
-            log.append("I couldn't parse the target expression. Please check the formatting.")
-            return {"answer": None, "debug": log}
+            return {"answer": None, "debug": ["Parse Error."]}
             
         q_a, q_op, q_b = qm.group(1), qm.group(2).strip(), qm.group(3)
 
@@ -208,15 +170,10 @@ class ASTBruteForceSolver:
             m = self._numeric_re.fullmatch(lhs.strip())
             if m:
                 a, op, b = m.group(1), m.group(2).strip(), m.group(3)
-                rhs_clean = rhs.replace(" ", "").strip()
-                all_parsed.append({
-                    'a': a, 'op': op, 'b': b, 
-                    'raw_out': rhs_clean
-                })
+                all_parsed.append({'a': a, 'op': op, 'b': b, 'raw_out': rhs.replace(" ", "").strip()})
 
         if not all_parsed: 
-            log.append("I couldn't find any valid examples to learn from.")
-            return {"answer": None, "debug": log}
+            return {"answer": None, "debug": ["No valid examples found."]}
 
         ops_grouped = defaultdict(list)
         for ex in all_parsed:
@@ -225,6 +182,7 @@ class ASTBruteForceSolver:
         configs_order = ["fwd", "rev_digits", "swap_ops", "swap_rev"]
         full_ops_keys = list(self._get_operations(12, 34, "12", "34").keys())
         
+        # --- ФАЗА 1: ОРАКУЛ (Определение лучших правил в фоне) ---
         op_hypotheses = {}
         for op, group in ops_grouped.items():
             valid_hyps = []
@@ -233,34 +191,19 @@ class ASTBruteForceSolver:
             for op_config in configs_order:
                 for op_name in full_ops_keys:
                     for out_fmt in fmt_names:
-                        if out_fmt in ["first_digit", "last_digit"] and len(group) < 3:
-                            continue
-                            
+                        if out_fmt in ["first_digit", "last_digit"] and len(group) < 3: continue
                         all_pass = True
                         for ex in group:
                             cfg = self._get_operand_configs(ex['a'], ex['b'])[op_config]
                             ops = self._get_operations(*cfg)
-                            
-                            if op_name not in ops:
+                            if op_name not in ops or out_fmt not in self._get_formats(ops[op_name], op) or self._get_formats(ops[op_name], op)[out_fmt] != ex['raw_out']:
                                 all_pass = False; break
-                                
-                            fmts = self._get_formats(ops[op_name], op)
-                            if out_fmt not in fmts:
-                                all_pass = False; break
-                                
-                            generated_str = fmts[out_fmt]
-                            
-                            if generated_str != ex['raw_out']:
-                                all_pass = False
-                                break
-                                
                         if all_pass:
                             valid_hyps.append((op_config, op_name, out_fmt))
             op_hypotheses[op] = valid_hyps
 
-        # Extract Global Style for Tie-Breaking
-        anomaly_config = None
-        anomaly_fmt = None
+        # Вывод глобального стиля для Tie-Breaking
+        anomaly_config, anomaly_fmt = None, None
         config_penalties = {"fwd": 0, "swap_ops": 20, "rev_digits": 30, "swap_rev": 50}
         
         for op, hyps in op_hypotheses.items():
@@ -278,8 +221,7 @@ class ASTBruteForceSolver:
                 anomaly_fmt = best_h[2]
                 break
 
-        config_counts = Counter()
-        fmt_counts = Counter()
+        config_counts, fmt_counts = Counter(), Counter()
         for op, hyps in op_hypotheses.items():
             if hyps:
                 best_base_hyp = min(hyps, key=lambda h: self._score_hypothesis(h[0], h[1], h[2], len(ops_grouped[op])))
@@ -289,109 +231,99 @@ class ASTBruteForceSolver:
         global_config = anomaly_config or (config_counts.most_common(1)[0][0] if config_counts else "fwd")
         global_fmt = anomaly_fmt or (fmt_counts.most_common(1)[0][0] if fmt_counts else "raw")
 
-        # Resolve rules and verify with an example
+        # --- ФАЗА 2: ГЕНЕРАЦИЯ CoT (Визуализация процесса для LLM) ---
         resolved_ops = {}
         used_base_ops = set()
         
         for op, hyps in op_hypotheses.items():
-            if hyps:
-                best_hyp = min(hyps, key=lambda h: self._score_hypothesis(h[0], h[1], h[2], len(ops_grouped[op]), global_config, global_fmt))
-                resolved_ops[op] = best_hyp
-                
-                for base_op in ["add", "sub", "mul", "div", "mod", "cat"]:
-                    if base_op in best_hyp[1]:
-                        used_base_ops.add(base_op)
-                
-                op_config, op_name, out_fmt = best_hyp
-                desc_cfg = self.config_desc.get(op_config, op_config)
-                desc_op = self.op_desc.get(op_name, op_name)
-                desc_fmt = self.fmt_desc.get(out_fmt, out_fmt)
-                
-                if ops_grouped[op]:
-                    ex = ops_grouped[op][0]
-                    log.append(f"Let's analyze the '{op}' operator using the example: {ex['a']} {op} {ex['b']} = {ex['raw_out']}.")
-                    
-                    try:
-                        safe_op = op if op in ['+', '-', '*'] else '+'
-                        naive_res = eval(f"int('{ex['a']}') {safe_op} int('{ex['b']}')")
-                        if str(naive_res) != ex['raw_out']:
-                            log.append(f"A standard calculation yields {naive_res}, which completely differs from the target {ex['raw_out']}. This confirms a multi-step transformation.")
-                    except:
-                        log.append(f"Since '{op}' is not a standard arithmetic symbol, we must deduce its specific mathematical mapping.")
+            if not hyps: continue
+            best_hyp = min(hyps, key=lambda h: self._score_hypothesis(h[0], h[1], h[2], len(ops_grouped[op]), global_config, global_fmt))
+            resolved_ops[op] = best_hyp
+            
+            for base_op in ["add", "sub", "mul", "div", "mod", "cat"]:
+                if base_op in best_hyp[1]: used_base_ops.add(base_op)
+            
+            op_config, op_name, out_fmt = best_hyp
+            ex = ops_grouped[op][0]
+            
+            log.append(f"Evaluating operator '{op}' using Example: {ex['a']} {op} {ex['b']} = {ex['raw_out']}")
+            
+            common_ops = ["add", "sub", "mul", "abs_diff", "neg_abs_diff", "cat", "rev_cat", "rev_sub"]
+            
+            # Формируем ярусы поиска
+            if op_name in common_ops:
+                ops_tiers = [("Base", common_ops)]
+            else:
+                rare_pool = [k for k in self.op_desc.keys() if k not in common_ops and k != op_name]
+                rares_to_show = random.sample(rare_pool, min(6, len(rare_pool))) 
+                rares_to_show.append(op_name)
+                ops_tiers = [("Base", common_ops), ("Extended", rares_to_show)]
+            
+            configs_to_show = ["fwd", "swap_ops"]
+            if "rev_digits" not in configs_to_show: configs_to_show.append("rev_digits")
+            if op_config not in configs_to_show: configs_to_show.append(op_config)
 
-                    # Сначала получаем конфигурации, чтобы понимать промежуточные значения
-                    cfg = self._get_operand_configs(ex['a'], ex['b'])[op_config]
-                    ops_test = self._get_operations(*cfg)
-                    val_test = ops_test[op_name]
-                    ans_test = self._get_formats(val_test, op)[out_fmt]
+            is_found = False
 
-                    # УБИРАЕМ ложь про "systematically test various transformations"
-                    # ЗАМЕНЯЕМ на дедуктивное наблюдение
-                    log.append("Instead of random guessing, let's look for structural clues in the input-output relationship.")
+            for tier_name, current_ops in ops_tiers:
+                if is_found: break
+                log.append(f"Testing {tier_name} mathematical and structural combinations:")
+                
+                for cfg_k in configs_to_show:
+                    if is_found: break
                     
-                    # Формируем логичный вывод (insight)
-                    log.append(f"By analyzing the magnitude and digit structure of the result ({ex['raw_out']}), the correct underlying pattern emerges: we must {desc_cfg}, then {desc_op}, and finally {desc_fmt}.")
+                    cfg_val = self._get_operand_configs(ex['a'], ex['b'])[cfg_k]
+                    ops_dict = self._get_operations(*cfg_val)
+                    log.append(f" Config: {self.config_desc[cfg_k]} -> Input A: {cfg_val[0]}, Input B: {cfg_val[1]}")
                     
-                    # Трассировка
-                    log.append(f"Tracing this hypothesis on our example: first we {desc_cfg}, turning {ex['a']} and {ex['b']} into {cfg[0]} and {cfg[1]}. Next, we {desc_op}, resulting in {val_test}. Finally, we {desc_fmt}, yielding the exact output {ans_test}.")
+                    for test_op in current_ops: # Исправлено: теперь перебираем current_ops
+                        if test_op in ops_dict:
+                            test_val = ops_dict[test_op]
+                            formats = self._get_formats(test_val, op)
+                            
+                            if cfg_k == op_config and test_op == op_name:
+                                out_str = formats[out_fmt] if out_fmt in formats else test_val
+                                log.append(f"  - {test_op} -> {test_val} | format ({self.fmt_desc.get(out_fmt, out_fmt)}) -> {out_str} [MATCH]")
+                                is_found = True
+                                break 
+                            else:
+                                log.append(f"  - {test_op} -> {test_val}")
+            
+            log.append(f"Rule identified for '{op}': {op_config} -> {op_name} -> {out_fmt}")
+            
+            if len(ops_grouped[op]) > 1:
+                log.append("Verifying across remaining examples:")
+                for o_ex in ops_grouped[op][1:]:
+                    c_val = self._get_operand_configs(o_ex['a'], o_ex['b'])[op_config]
+                    o_val = self._get_operations(*c_val)[op_name]
+                    ans = self._get_formats(o_val, op)[out_fmt]
+                    log.append(f"  {o_ex['a']} {op} {o_ex['b']} -> inputs {c_val[0]}, {c_val[1]} -> result {o_val} -> format {ans}")
+            log.append("")
 
-        log.append(f"Now, let's solve the target expression: {q_a} {q_op} {q_b}.")
+        # --- ФАЗА 3: ЦЕЛЕВОЕ ВЫЧИСЛЕНИЕ ---
+        log.append(f"Target calculation: {q_a} {q_op} {q_b}")
         
         if q_op in resolved_ops:
             op_config, op_name, out_fmt = resolved_ops[q_op]
-            
-            desc_cfg = self.config_desc.get(op_config, op_config)
-            desc_op = self.op_desc.get(op_name, op_name)
-            desc_fmt = self.fmt_desc.get(out_fmt, out_fmt)
-            
-            log.append(f"Applying the established rule for the '{q_op}' operator.")
-            
             cfg = self._get_operand_configs(q_a, q_b)[op_config]
             ops = self._get_operations(*cfg)
             val = ops[op_name]
             final_ans = self._get_formats(val, q_op)[out_fmt]
             
-            log.append(f"First, we {desc_cfg}, giving us {cfg[0]} and {cfg[1]}. Then, we {desc_op}, which calculates to {val}. Finally, we {desc_fmt}, providing the exact answer: {final_ans}.")
+            log.append(f"1. Apply config '{op_config}': A = {cfg[0]}, B = {cfg[1]}")
+            log.append(f"2. Apply operation '{op_name}': {val}")
+            log.append(f"3. Apply format '{out_fmt}': {final_ans}")
             
             return {"answer": final_ans, "debug": log}
             
         else:
-            op_readable_names = {
-                "add": "addition", 
-                "sub": "subtraction", 
-                "cat": "concatenation", 
-                "mul": "multiplication", 
-                "div": "division"
-            }
-            
-            log.append(f"The operator '{q_op}' was not present in the examples. To deduce its hidden function, I need to analyze the pool of possible core operations.")
-            
+            # Логика резервного оператора (fallback)
+            log.append(f"Operator '{q_op}' not found in examples. Identifying unused core operation.")
             strict_base_pool = ["add", "sub", "cat", "mul", "div"]
-            pool_str = ", ".join([op_readable_names.get(op, op) for op in strict_base_pool])
-            log.append(f"The standard pool of operations used in this environment includes: {pool_str}.")
-            
-            if used_base_ops:
-                used_str = ", ".join([op_readable_names.get(op, op) for op in used_base_ops])
-                log.append(f"From analyzing the previous examples, we have already identified the use of: {used_str}.")
-            
             avail_ops = [op for op in strict_base_pool if op not in used_base_ops]
             
-            if not avail_ops:
-                log.append("All standard operations have already been assigned. I will reconsider the entire pool as fallback candidates.")
-                avail_ops = strict_base_pool 
-            else:
-                avail_str = ", ".join([op_readable_names.get(op, op) for op in avail_ops])
-                log.append(f"This leaves the following unused operations as candidates for the '{q_op}' operator: {avail_str}.")
-                
-            best_op = avail_ops[0]
-            chosen_op_str = op_readable_names.get(best_op, best_op)
-            log.append(f"I will select the first available candidate, {chosen_op_str}, to formulate the hypothesis for this operator.")
-            
-            desc_cfg = self.config_desc.get(global_config, global_config)
-            desc_op = self.op_desc.get(best_op, best_op)
-            desc_fmt = self.fmt_desc.get(global_fmt, global_fmt)
-            
-            log.append(f"Assuming it follows the global style established by the other equations, the complete rule is: {desc_cfg}, then {desc_op}, and finally {desc_fmt}.")
+            best_op = avail_ops[0] if avail_ops else strict_base_pool[0]
+            log.append(f"Selected fallback operation: '{best_op}' with global style (config: {global_config}, format: {global_fmt})")
             
             cfg = self._get_operand_configs(q_a, q_b)[global_config]
             ops = self._get_operations(*cfg)
@@ -400,17 +332,18 @@ class ASTBruteForceSolver:
                 val = ops[best_op]
                 final_ans = self._get_formats(val, q_op)[global_fmt]
                 
-                log.append(f"Processing the target variables: we {desc_cfg} to get {cfg[0]} and {cfg[1]}. We {desc_op} to get {val}, and we {desc_fmt} to output {final_ans}.")
+                log.append(f"1. Apply global config '{global_config}': A = {cfg[0]}, B = {cfg[1]}")
+                log.append(f"2. Apply operation '{best_op}': {val}")
+                log.append(f"3. Apply global format '{global_fmt}': {final_ans}")
                 
                 return {"answer": final_ans, "debug": log}
 
         if q_op in ['+', '-', '*', '/', '**', '%']:
             try:
                 res = str(int(eval(f"{int(q_a)}{q_op}{int(q_b)}")))
-                log.append(f"Since no specific rules could be extracted, evaluating strictly as a standard mathematical expression: {res}.")
+                log.append(f"Evaluated as standard mathematical expression: {res}")
                 return {"answer": res, "debug": log}
-            except Exception as e:
-                log.append(f"Standard mathematical evaluation failed.")
+            except Exception:
+                log.append("Standard evaluation failed.")
 
-        log.append("Unable to resolve the target expression due to insufficient pattern data.")
         return {"answer": None, "debug": log}
