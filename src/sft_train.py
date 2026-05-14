@@ -164,7 +164,7 @@ def main():
         load_best_model_at_end=True,
         
         optim="paged_adamw_8bit",
-        gradient_checkpointing=True,
+        #gradient_checkpointing=True,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         max_length=args.max_seq_len,
