@@ -34,7 +34,6 @@ class BaseEquationSolver:
         # Find the first non-alphanumeric character, excluding spaces and '='
         target_op_match = re.search(r'[^\w\s=]', target)
         cot.append("Let's look at the target expression and its operator, which is usually located in the middle.")
-        cot.append("Initially, we need to determine if this equation is not a standard mathematical problem, but rather simple string operations.")
         
         if target_op_match:
             target_op = target_op_match.group(0)
@@ -73,7 +72,6 @@ class BaseEquationSolver:
             
                             cot.append(f"Example '{line}' is a fully reversed string concatenation: ('{left}' + '{right}') reversed = '{rhs_clean}'.")
                             return "Pseudo-Math (Format/String)", cot
-        
 
         # If there are no digits at all and it's not string concatenation, route to cryptarithm
         if not re.search(r'\d', examples):
