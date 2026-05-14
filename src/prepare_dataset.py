@@ -2,7 +2,8 @@ import re
 import argparse
 import pandas as pd
 
-from src.augmentation.upsample import upsample_dataframe
+from src.augmentation.equations.cryptarithm_generator import CryptarithmTaskGenerator
+from src.augmentation.equations.ast_brute_force_generator import ASTBruteForceTaskGenerator
 from src.augmentation.bit_manipulation import BitManipulationTaskGenerator
 from src.augmentation.encryption import EncryptionTaskGenerator
 from src.metric import verify
@@ -44,7 +45,25 @@ def main():
     }
 
     # Equations
-    data = upsample_dataframe(data, multipliers_map={"equations transformation": 4.0}, seed=args.seed)
+    equations_cryptarithm_generator = CryptarithmTaskGenerator(seed=args.seed)
+
+    equations_cryptarithm_dataset = equations_cryptarithm_generator.generate_dataset(
+        num_samples=int(len(data[data.label == "equations transformation"]) * 4.0),
+        mode="random",
+        nb_workers=24,
+        progress_bar=False,
+    )
+    logger.info("")
+    logger.info(f"\nCryptarithm generator:\n{equations_cryptarithm_dataset.task_mode.value_counts()}")
+
+    equations_ast_generator = CryptarithmTaskGenerator(seed=args.seed)
+
+    equations_ast_dataset = equations_ast_generator.generate_dataset(
+        num_samples=int(len(data[data.label == "equations transformation"]) * 4.0),
+        nb_workers=24,
+        progress_bar=False,
+    )
+    logger.info(f"\Ast brute force generator:\n{equations_ast_dataset.task_mode.value_counts()}")
 
     # bit manipulation
     bit_manipulation_generator = BitManipulationTaskGenerator(seed=args.seed)
@@ -71,11 +90,11 @@ def main():
     encryption_generator = EncryptionTaskGenerator(vocabulary=global_vocab, seed=args.seed)
 
     encryption_gen_dataset = encryption_generator.generate_dataset(
-        int(len(data[data.label == "encryption"]) * 3.0) # или любое нужное количество
+        int(len(data[data.label == "encryption"]) * 3.0)
     )
 
 
-    data = pd.concat([encryption_gen_dataset, bit_mp_gen_dataset, data])
+    data = pd.concat([equations_cryptarithm_dataset, equations_ast_dataset, encryption_gen_dataset, bit_mp_gen_dataset, data])
 
     data = data.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
     

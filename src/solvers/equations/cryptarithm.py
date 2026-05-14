@@ -787,7 +787,7 @@ class DeductiveCryptarithmSolver:
             target_operation, _ = operation_line(target_rule, target_a, target_b)
             add(f"2. Apply operation '{operation_name(target_rule)}': {target_operation}")
             add(f"3. Apply format '{format_name(target_rule)}' and symbol mapping: {answer}")
-            add(f"Final answer: {answer}")
+            #add(f"Final answer: {answer}")
 
         text = "\n".join(lines)
         if len(text) <= self.trace_config.max_solution_chars:
@@ -816,7 +816,7 @@ class DeductiveCryptarithmSolver:
             target_operation, _ = operation_line(target_rule, target_a, target_b)
             compact.append(f"2. Apply operation '{operation_name(target_rule)}': {target_operation}")
             compact.append(f"3. Apply format '{format_name(target_rule)}' and symbol mapping: {answer}")
-            compact.append(f"Final answer: {answer}")
+            #compact.append(f"Final answer: {answer}")
         return compact
 
     def solve(self, examples_text: str, target_text: str, timeout_seconds: float = 30.0) -> Dict[str, Any]:
