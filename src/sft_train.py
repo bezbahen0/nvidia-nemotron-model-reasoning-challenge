@@ -131,7 +131,7 @@ def main():
         torch_dtype=torch.bfloat16,
         trust_remote_code=False,
         use_cache=False,
-        attn_implementation="sdpa"
+        attn_implementation="flash_attention_2"
     )
 
 
@@ -164,7 +164,7 @@ def main():
         load_best_model_at_end=True,
         
         optim="paged_adamw_8bit",
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         max_length=args.max_seq_len,
