@@ -129,7 +129,7 @@ def main():
         args.model_id,
         device_map={"": local_rank},
         torch_dtype=torch.bfloat16,
-        #trust_remote_code=True,
+        trust_remote_code=False,
         use_cache=False,
         attn_implementation="flash_attention_2"
     )
