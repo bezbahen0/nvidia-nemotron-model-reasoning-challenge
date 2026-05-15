@@ -15,8 +15,8 @@ split:
 
 train:
   lr: 2e-4
-  batch_size: 16
-  grad_accum: 2
+  batch_size: 4
+  grad_accum: 8
   epochs: 3
   seed: 31231
   eval_steps: 205

@@ -131,7 +131,7 @@ def main():
         torch_dtype=torch.bfloat16,
         trust_remote_code=False,
         use_cache=False,
-        attn_implementation="flash_attention_2"
+        attn_implementation="sdpa"
     )
 
 
@@ -164,7 +164,6 @@ def main():
         load_best_model_at_end=True,
         
         optim="paged_adamw_8bit",
-        #gradient_checkpointing=True,
         gradient_checkpointing=False,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
@@ -180,6 +179,9 @@ def main():
         report_to="wandb",
         run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
     )
+    
+    training_args.group_by_length = True
+
 
     trainer = SFTTrainer(
         model=model,
