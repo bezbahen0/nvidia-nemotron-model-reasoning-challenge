@@ -35,11 +35,13 @@ stages:
       --data_path ${data.train_prepared}
       --output_path ${data.train_generated}
       --seed ${train.seed}
+      --tokenizer_path ${model.id}
     deps:
       - ${data.train_prepared}
       - src/prepare_dataset.py
     params:
       - train.seed
+      - model.id
     outs:
       - ${data.train_generated}
 
