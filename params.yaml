@@ -17,7 +17,7 @@ train:
   lr: 2e-4
   batch_size: 8
   grad_accum: 4
-  epochs: 4
+  epochs: 3
   seed: 31231
   eval_steps: 205
   max_hours: 10.0

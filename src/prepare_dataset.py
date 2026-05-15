@@ -41,14 +41,16 @@ def main():
 
     multipliers = {
         "bit manipulation": 5.0,
-        "": 2.0,
+        "cryptarithm": 9.0,
+        "equations_numeric": 5.0,
+        "encryption": 4.0,
     }
 
     # Equations
     equations_cryptarithm_generator = CryptarithmTaskGenerator(seed=args.seed)
 
     equations_cryptarithm_dataset = equations_cryptarithm_generator.generate_dataset(
-        num_samples=int(len(data[data.label == "equations transformation"]) * 4.0),
+        num_samples=int(len(data[data.label == "equations transformation"]) * multipliers["cryptarithm"]),
         mode="random",
         nb_workers=24,
         progress_bar=False,
@@ -56,10 +58,10 @@ def main():
     logger.info("")
     logger.info(f"\nCryptarithm generator:\n{equations_cryptarithm_dataset.task_mode.value_counts()}")
 
-    equations_ast_generator = CryptarithmTaskGenerator(seed=args.seed)
+    equations_ast_generator = ASTBruteForceTaskGenerator(seed=args.seed)
 
     equations_ast_dataset = equations_ast_generator.generate_dataset(
-        num_samples=int(len(data[data.label == "equations transformation"]) * 4.0),
+        num_samples=int(len(data[data.label == "equations transformation"]) * multipliers["equations_numeric"]),
         nb_workers=24,
         progress_bar=False,
     )
@@ -90,7 +92,7 @@ def main():
     encryption_generator = EncryptionTaskGenerator(vocabulary=global_vocab, seed=args.seed)
 
     encryption_gen_dataset = encryption_generator.generate_dataset(
-        int(len(data[data.label == "encryption"]) * 3.0)
+        int(len(data[data.label == "encryption"]) *  multipliers["encryption"])
     )
 
 
