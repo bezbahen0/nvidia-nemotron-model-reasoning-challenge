@@ -23,6 +23,7 @@ train:
   max_hours: 10.0
   lora_r: 32
   lora_alpha: 64
+  max_seq_len: 8192
 
 
 evaluate:

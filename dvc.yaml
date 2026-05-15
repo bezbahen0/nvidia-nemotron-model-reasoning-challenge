@@ -64,6 +64,7 @@ stages:
       --lr ${train.lr}
       --lora_r ${train.lora_r}
       --lora_alpha ${train.lora_alpha}
+      --max_seq_len ${train.max_seq_len}
     deps:
       - ${data.train_generated}
       - ${data.val_prepared}
@@ -81,6 +82,7 @@ stages:
       - train.lr
       - train.lora_r
       - train.lora_alpha
+      - train.max_seq_len
     outs:
       - ${model.sft_output_dir}:
           persist: true
