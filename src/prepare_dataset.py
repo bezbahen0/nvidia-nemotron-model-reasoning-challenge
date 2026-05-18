@@ -40,10 +40,10 @@ def main():
     logger.info(f"Datset countes: \n{data.label.value_counts()}")
 
     multipliers = {
-        "bit manipulation": 5.0,
-        "cryptarithm": 9.0,
-        "equations_numeric": 5.0,
-        "encryption": 4.0,
+        "bit manipulation": 0.0,
+        "cryptarithm": 0.75,
+        "equations_numeric": 0.75,
+        "encryption": 1.0,
     }
 
     # Equations
@@ -74,15 +74,15 @@ def main():
     logger.info(f'Accuracy: {equations_ast_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean()}')
     
     # bit manipulation
-    bit_manipulation_generator = BitManipulationTaskGenerator(seed=args.seed)
-
-    bit_mp_gen_dataset = bit_manipulation_generator.generate_dataset(
-        int(len(data[data.label == "bit manipulation"]) * multipliers["bit manipulation"])
-    )
-    logger.info("\Bit manipulation generator:")
-    logger.info(bit_mp_gen_dataset.columns.tolist())
-    logger.info(bit_mp_gen_dataset.task_mode.value_counts(normalize=True))
-    logger.info(f'Accuracy: {bit_mp_gen_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean()}')
+    #bit_manipulation_generator = BitManipulationTaskGenerator(seed=args.seed)
+#
+    #bit_mp_gen_dataset = bit_manipulation_generator.generate_dataset(
+    #    int(len(data[data.label == "bit manipulation"]) * multipliers["bit manipulation"])
+    #)
+    #logger.info("\Bit manipulation generator:")
+    #logger.info(bit_mp_gen_dataset.columns.tolist())
+    #logger.info(bit_mp_gen_dataset.task_mode.value_counts(normalize=True))
+    #logger.info(f'Accuracy: {bit_mp_gen_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean()}')
 
     # Encryption
 
@@ -105,7 +105,8 @@ def main():
     )
 
 
-    data = pd.concat([equations_cryptarithm_dataset, equations_ast_dataset, encryption_gen_dataset, bit_mp_gen_dataset, data])
+    #data = pd.concat([equations_cryptarithm_dataset, equations_ast_dataset, encryption_gen_dataset, bit_mp_gen_dataset, data])
+    data = pd.concat([equations_cryptarithm_dataset, equations_ast_dataset, encryption_gen_dataset, data])
 
     data = data.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
     
