@@ -5,16 +5,16 @@ import torch
 import pandas as pd
 import wandb
 from datasets import Dataset
-from peft import LoraConfig
+
 from transformers import (
-    AutoModelForCausalLM, 
-    AutoTokenizer, 
     set_seed,
     TrainerCallback
 )
 from transformers.trainer_utils import get_last_checkpoint
 
 from trl import SFTTrainer, SFTConfig
+from unsloth import FastLanguageModel
+
 from src.log import logger
 
 def parse_args():
@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--max_seq_len", type=int, default=4096)
+    parser.add_argument("--attn_implementation", type=str, default="eager", choices=["eager", "flash_attention_2", "sdpa"], help="attention backend for Unsloth/Transformers model loading")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_steps", type=int, default=50)
     parser.add_argument("--max_hours", type=float, required=True)
@@ -110,37 +111,53 @@ def main():
         os.environ["WANDB_RUN_ID"] = run_id
         logger.info(f"Новый запуск W&B (Run ID: {run_id})")
 
-    logger.info(f"Загрузка токенизатора для {args.model_id}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
     logger.info("Подготовка тренировочного датасета, так же не используем для обучения промпты где solver не дал правильный ответ...")
     train_dataset = prepare_dataset(args.train_path)
     logger.info(f"train dataset final len: {len(train_dataset)}")
 
-    
     logger.info("Подготовка валидационного датасета, так же не используем для валидации промпты где solver не дал правильный ответ...")
     val_dataset = prepare_dataset(args.val_path, eval=True)
     logger.info(f"val dataset final len: {len(val_dataset)}")
 
-    logger.info("Загрузка модели в bfloat16...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        device_map={"": local_rank},
-        torch_dtype=torch.bfloat16,
+    logger.info(f"Загрузка модели и токенизатора через Unsloth FastLanguageModel: {args.model_id}...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=args.model_id,
+        max_seq_length=args.max_seq_len,
+        dtype=torch.bfloat16,
+        load_in_4bit=False,
+        load_in_8bit=False,
+        full_finetuning=False,
         trust_remote_code=True,
-        use_cache=False
+        device_map={"": local_rank},
+        use_cache=False,
+        attn_implementation=args.attn_implementation,
     )
 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    lora_config = LoraConfig(
+    logger.info("Навешиваем LoRA через Unsloth FastLanguageModel.get_peft_model...")
+    model = FastLanguageModel.get_peft_model(
+        model,
         r=args.lora_r,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "in_proj",
+            "out_proj",
+            "embed_tokens",
+            "lm_head",
+        ],
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=r".*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|in_proj|out_proj|embed_tokens|lm_head)$", 
         bias="none",
-        task_type="CAUSAL_LM",
+        use_gradient_checkpointing="unsloth",
+        random_state=args.seed,
     )
 
     training_args = SFTConfig(
@@ -163,13 +180,13 @@ def main():
         load_best_model_at_end=True,
         
         optim="paged_adamw_8bit",
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         max_length=args.max_seq_len,
         completion_only_loss=True, 
 
-        ddp_find_unused_parameters=False,
+        #ddp_find_unused_parameters=False,
 
         dataloader_num_workers=4,
         dataloader_prefetch_factor=2,
@@ -178,12 +195,15 @@ def main():
         report_to="wandb",
         run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
     )
+    
+    training_args.group_by_length = True
+
 
     trainer = SFTTrainer(
         model=model,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        peft_config=lora_config,
+        processing_class=tokenizer,
         args=training_args,
         callbacks=[TimeLimitCallback(max_hours=args.max_hours)]
     )
