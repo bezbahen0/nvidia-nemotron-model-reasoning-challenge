@@ -48,13 +48,11 @@ stages:
 
   sft_train:
     cmd: >
-      torchrun --nproc_per_node=auto -m src.sft_train 
+      python -m src.sft_train
       --wandb_run_basename ${wandb.wandb_base_run_name}
       --model_id ${model.id}
       --data ${data.dataset_name}
       --train_path ${data.train_generated}
-      --seed ${train.seed}
-      --eval_steps ${train.eval_steps}
       --val_path ${data.val_prepared}
       --output_dir ${model.sft_output_dir}
       --batch_size ${train.batch_size}
@@ -62,27 +60,55 @@ stages:
       --epochs ${train.epochs}
       --max_hours ${train.max_hours}
       --lr ${train.lr}
+      --seed ${train.seed}
+      --eval_steps ${train.eval_steps}
+      --eval_batches ${train.eval_batches}
+      --logging_steps ${train.logging_steps}
+      --save_steps ${train.save_steps}
+      --save_total_limit ${train.save_total_limit}
+      --resume_from_checkpoint ${train.resume_from_checkpoint}
       --lora_r ${train.lora_r}
       --lora_alpha ${train.lora_alpha}
+      --lora_dropout ${train.lora_dropout}
       --max_seq_len ${train.max_seq_len}
+      --optimizer ${train.optimizer}
+      --warmup_ratio ${train.warmup_ratio}
+      --weight_decay ${train.weight_decay}
+      --max_grad_norm ${train.max_grad_norm}
+      --target_modules ${train.target_modules}
+
     deps:
       - ${data.train_generated}
       - ${data.val_prepared}
       - src/sft_train.py
+
     params:
       - wandb.wandb_base_run_name
       - model.id
       - data.dataset_name
+      - model.sft_output_dir
       - train.max_hours
       - train.batch_size
       - train.grad_accum
       - train.epochs
       - train.eval_steps
+      - train.eval_batches
+      - train.logging_steps
+      - train.save_steps
+      - train.save_total_limit
+      - train.resume_from_checkpoint
       - train.seed
       - train.lr
       - train.lora_r
       - train.lora_alpha
+      - train.lora_dropout
       - train.max_seq_len
+      - train.optimizer
+      - train.warmup_ratio
+      - train.weight_decay
+      - train.max_grad_norm
+      - train.target_modules
+
     outs:
       - ${model.sft_output_dir}:
           persist: true

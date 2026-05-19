@@ -67,8 +67,8 @@ def main():
         "encryption": EncryptionSolver(vocabulary=global_vocab),
         "conversion to diff numeral system": NumeralSystemSolver(),
         "unit conversion": UnitConversionSolver(),
-        "gravitational": GravitationalSolver(),
-        "equations transformation": BaseEquationSolver()
+        "gravitational": GravitationalSolver()#,
+       # "equations transformation": BaseEquationSolver()
     }    
 
     raw_accuracy = {}
