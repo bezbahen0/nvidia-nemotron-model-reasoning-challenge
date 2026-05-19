@@ -132,7 +132,7 @@ class BitManipulationTaskGenerator:
         else:
             if mode == 'pattern': rules = self._generate_pattern_rules()
             elif mode == 'split': rules = self._generate_split_rules()
-            #elif mode == 'split_gap': rules = self._generate_split_gap_rules()
+            elif mode == 'split_gap': rules = self._generate_split_gap_rules()
             
             rules_or_macro = rules
             for ex_in in examples_inputs:

@@ -1,5 +1,4 @@
 import random
-import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from collections import Counter
@@ -219,6 +218,13 @@ def weighted_choice(rng: random.Random, counter: Counter):
 
 
 class ASTBruteForceTaskGenerator:
+    """Generate AST equation tasks from the solver rule space.
+
+    The generator does not parse or depend on CoT text. It samples operators,
+    rules, shapes, prompts, targets, and ground-truth answers directly from the
+    rule space. The solver is used only to produce optional CoT and to verify
+    that the generated answer is recoverable by the current solver.
+    """
     def __init__(self, seed: Optional[int] = None, max_task_attempts: int = 2000):
         self.seed = seed
         self.rng = random.Random(seed)
@@ -226,11 +232,7 @@ class ASTBruteForceTaskGenerator:
         self.solver = ASTBruteForceSolver()
 
         self.operation_names = list(self.solver._get_operations(12, 34, "12", "34").keys())
-        self.resolved_rule_re = re.compile(
-            r"^Rule identified for '(?P<operator>.*)': "
-            r"(?P<config>[^ ]+) -> (?P<operation>[^ ]+) -> (?P<fmt>[^ ]+)$"
-        )
-        self.fallback_re = re.compile(r"^Selected fallback operation: '(?P<operation>[^']+)'")
+        self._last_task_metadata: Dict[str, Any] = {}
 
     def _sample_operand(self) -> str:
         return f"{self.rng.randint(0, 99):02d}"
@@ -334,27 +336,10 @@ class ASTBruteForceTaskGenerator:
             "answer": result.get("answer"),
             "generated_cot": "\n".join(str(line) for line in debug_lines),
             "debug_lines": debug_lines,
+            "rule_source": result.get("rule_source"),
+            "training_category": result.get("training_category"),
+            "metadata": result.get("metadata") or {},
         }
-
-    def _resolved_rule_for_operator(self, debug_lines: Sequence[str], operator: str) -> Optional[ASTRule]:
-        for line in debug_lines:
-            match = self.resolved_rule_re.match(str(line))
-            if match and match.group("operator") == operator:
-                return ASTRule(
-                    match.group("config"),
-                    match.group("operation"),
-                    match.group("fmt"),
-                )
-
-        return None
-
-    def _fallback_operation_from_debug(self, debug_lines: Sequence[str]) -> Optional[str]:
-        for line in debug_lines:
-            match = self.fallback_re.match(str(line))
-            if match:
-                return match.group("operation")
-
-        return None
 
     def _maybe_shuffle(self, lines: List[str]) -> List[str]:
         if weighted_choice(self.rng, OPERATOR_ORDER_COUNTS) == "grouped":
@@ -379,14 +364,25 @@ class ASTBruteForceTaskGenerator:
 
             examples_text = "\n".join(example_lines)
             target_text = target_expr.as_target_text()
-            solved = self._solve(examples_text, target_text)
-
-            if solved["answer"] != answer:
-                continue
-
-            if self._resolved_rule_for_operator(solved["debug_lines"], operator) != rule:
-                continue
-
+            self._last_task_metadata = {
+                "generation_mode": "known_operator",
+                "target_operator": operator,
+                "target_operator_seen_in_examples": True,
+                "uses_fallback_inference": False,
+                "target_rule": {
+                    "config": rule.config,
+                    "operation": rule.operation,
+                    "output_format": rule.output_format,
+                },
+                "example_rules": {
+                    operator: {
+                        "config": rule.config,
+                        "operation": rule.operation,
+                        "output_format": rule.output_format,
+                    }
+                },
+                "example_shape": shape,
+            }
             return examples_text, answer, target_text, "known_operator"
 
         raise RuntimeError("Failed to generate known_operator task")
@@ -448,14 +444,27 @@ class ASTBruteForceTaskGenerator:
 
             examples_text = "\n".join(example_lines)
             target_text = target_expr.as_target_text()
-            solved = self._solve(examples_text, target_text)
-
-            if solved["answer"] != answer:
-                continue
-
-            if self._resolved_rule_for_operator(solved["debug_lines"], target_operator) != target_rule:
-                continue
-
+            self._last_task_metadata = {
+                "generation_mode": "multi_operator",
+                "target_operator": target_operator,
+                "target_operator_seen_in_examples": True,
+                "uses_fallback_inference": False,
+                "target_rule": {
+                    "config": target_rule.config,
+                    "operation": target_rule.operation,
+                    "output_format": target_rule.output_format,
+                },
+                "example_rules": {
+                    op: {
+                        "config": rule.config,
+                        "operation": rule.operation,
+                        "output_format": rule.output_format,
+                    }
+                    for op, rule in rules.items()
+                },
+                "example_shape": shape,
+                "target_example_count": target_count,
+            }
             return examples_text, answer, target_text, "multi_operator"
 
         raise RuntimeError("Failed to generate multi_operator task")
@@ -542,14 +551,29 @@ class ASTBruteForceTaskGenerator:
 
             examples_text = "\n".join(example_lines)
             target_text = target_expr.as_target_text()
-            solved = self._solve(examples_text, target_text)
-
-            if solved["answer"] != answer:
-                continue
-
-            if self._fallback_operation_from_debug(solved["debug_lines"]) != selected_operation:
-                continue
-
+            self._last_task_metadata = {
+                "generation_mode": "fallback",
+                "target_operator": target_operator,
+                "target_operator_seen_in_examples": False,
+                "uses_fallback_inference": True,
+                "fallback_operation": selected_operation,
+                "target_rule": {
+                    "config": fallback_rule.config,
+                    "operation": fallback_rule.operation,
+                    "output_format": fallback_rule.output_format,
+                },
+                "example_rules": {
+                    op: {
+                        "config": rule.config,
+                        "operation": rule.operation,
+                        "output_format": rule.output_format,
+                    }
+                    for op, rule in rules.items()
+                },
+                "example_shape": shape,
+                "strict_pool": strict_pool,
+                "required_operations": required_operations,
+            }
             return examples_text, answer, target_text, "fallback"
 
         raise RuntimeError("Failed to generate fallback task")
@@ -587,6 +611,9 @@ class ASTBruteForceTaskGenerator:
                 if computed_answer != answer:
                     continue
 
+                solver_metadata = solved.get("metadata") or {}
+                generation_metadata = dict(self._last_task_metadata)
+
                 return {
                     "prompt": prompt,
                     "answer": answer,
@@ -594,6 +621,15 @@ class ASTBruteForceTaskGenerator:
                     "computed_answer": computed_answer,
                     "task_mode": task_mode,
                     "label": label,
+                    "target_operator": generation_metadata.get("target_operator"),
+                    "target_operator_seen_in_examples": generation_metadata.get("target_operator_seen_in_examples"),
+                    "uses_fallback_inference": generation_metadata.get("uses_fallback_inference"),
+                    "target_rule": generation_metadata.get("target_rule"),
+                    "example_rules": generation_metadata.get("example_rules"),
+                    "generation_metadata": generation_metadata,
+                    "solver_rule_source": solved.get("rule_source"),
+                    "solver_training_category": solved.get("training_category"),
+                    "solver_metadata": solver_metadata,
                 }
 
             except Exception as exc:
