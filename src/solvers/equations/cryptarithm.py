@@ -607,7 +607,7 @@ class DeductiveCryptarithmSolver:
         derivation_trace: Sequence[str],
         candidates: Dict[str, List[Rule]],
     ) -> List[str]:
-        """Return a compact training trace in the same style as operator-transformation tasks."""
+        """Return a compact training trace rather than a raw CSP/debug log."""
         lines: List[str] = []
         add = lines.append
 
@@ -615,9 +615,11 @@ class DeductiveCryptarithmSolver:
             return "little_endian" if rule.reverse else "standard"
 
         def format_name(rule: Rule) -> str:
-            sign = "sign_pref_" if rule.signed else ""
-            body = "symbol_rev" if rule.reverse else "symbol_raw"
-            return sign + body
+            if rule.signed and rule.reverse:
+                return "symbol_reverse_order_with_operator_sign_if_negative"
+            if rule.signed:
+                return "symbol_left_to_right_with_operator_sign_if_negative"
+            return "symbol_reverse_order" if rule.reverse else "symbol_left_to_right"
 
         def operation_name(rule: Rule) -> str:
             names = {
@@ -636,14 +638,33 @@ class DeductiveCryptarithmSolver:
         def rule_signature(rule: Rule) -> str:
             return f"{config_name(rule)} -> {operation_name(rule)} -> {format_name(rule)}"
 
+        def rule_meaning(rule: Rule) -> str:
+            orientation = "read symbols left-to-right" if not rule.reverse else "read symbols right-to-left"
+            if rule.name == "add":
+                op_text = "A + B"
+            elif rule.name == "add_p1":
+                op_text = "A + B + 1"
+            elif rule.name == "add_m1":
+                op_text = "A + B - 1"
+            elif rule.name == "mul":
+                op_text = "A * B"
+            elif rule.name == "mul_p1":
+                op_text = "A * B + 1"
+            elif rule.name == "mul_m1":
+                op_text = "A * B - 1"
+            elif rule.name == "absdiff":
+                op_text = "abs(A - B)"
+            elif rule.name == "sub_signed":
+                op_text = "A - B; if negative, prefix the operator symbol as the sign"
+            elif rule.name == "concat_fwd":
+                op_text = "concat(A, B)"
+            else:
+                op_text = rule.name
+            fmt_text = "encode result symbols in reverse order" if rule.reverse else "encode result symbols left-to-right"
+            return f"{orientation}; compute {op_text}; {fmt_text}"
+
         def mapping_text() -> str:
             return ", ".join(f"{self._literal(ch)}={assignment[ch]}" for ch in sorted(assignment))
-
-        def group_candidates(rules: Sequence[Rule]) -> Dict[str, List[Rule]]:
-            grouped: Dict[str, List[Rule]] = {}
-            for rule in rules:
-                grouped.setdefault(config_name(rule), []).append(rule)
-            return grouped
 
         def expected_rhs(eq: Equation) -> str:
             return f"{eq.op}{eq.result}" if eq.has_sign else eq.result
@@ -681,88 +702,50 @@ class DeductiveCryptarithmSolver:
                 return f"concat({a}, {b}) = {value}", value
             return f"{operation_name(rule)}({a}, {b}) = {value}", value
 
-        def compress_domain_trace(raw_steps: Sequence[str], limit: int = 24) -> List[str]:
-            cleaned: List[str] = []
-            seen: Set[str] = set()
-            banned = (
-                "Contradiction",
-                "Trace budget",
-                "internal step",
-                "debug",
-                "omitted",
-                "no supported assignment",
-            )
-            for raw in raw_steps:
-                step = raw.strip()
-                if not step or any(token in step for token in banned):
-                    continue
-                if step.startswith("For operator"):
-                    continue
-                step = step.replace("\\operatorname{AllDifferent}", "AllDifferent")
-                step = step.replace("\\mathcal{H}: ", "hypothesis ")
-                step = step.replace("\\;", "; ")
-                step = step.replace("\\mapsto", "->")
-                step = step.replace("\\leftarrow", "->")
-                step = re.sub(r"\$D_\{([^}]+)\}\s*->\s*\\\{([^}]*)\\\}", r"\1 -> {\2}", step)
-                step = re.sub(r"D_\{([^}]+)\}\s*->\s*\\\{([^}]*)\\\}", r"\1 -> {\2}", step)
-                step = step.replace("$", "")
-                step = step.replace(",;", ";")
-                step = re.sub(r",\s*;", ";", step)
-                step = re.sub(r"\s+", " ", step).strip()
-                if step in seen:
-                    continue
-                if len(step) > 220:
-                    step = step[:217].rstrip() + "..."
-                cleaned.append(step)
-                seen.add(step)
-                if len(cleaned) >= limit:
-                    break
-            return cleaned
-
-        add("--- Решение ---")
-        add("We model this as a cryptarithm: every visible non-operator symbol is one unique decimal digit, and multi-digit values cannot start with zero.")
-        add(f"Parsed examples: {', '.join(self._literal(eq.display()) for eq in equations)}")
-        add(f"Target expression: {self._literal(clean_target)}")
-        add(f"Symbols to decode: {', '.join(self._literal(ch) for ch in sorted(assignment))}")
-
         by_op: Dict[str, List[Equation]] = {}
         for eq in equations:
             by_op.setdefault(eq.op, []).append(eq)
+
+        add("Task type: cryptarithm")
+        add("Model: every visible non-operator symbol is one unique decimal digit; multi-digit values cannot start with zero.")
+        add(f"Parsed examples: {', '.join(self._literal(eq.display()) for eq in equations)}")
+        add(f"Target expression: {self._literal(clean_target)}")
+        add(f"Symbols to decode: {', '.join(self._literal(ch) for ch in sorted(assignment))}")
 
         add("")
         add("Rule search")
         for op in sorted(combo):
             selected = combo[op]
             op_examples = by_op.get(op, [])
-            add(f"Evaluating operator {self._literal(op)}")
+            candidate_count = len(candidates.get(op, []))
+            add(f"Operator {self._literal(op)}")
             if op_examples:
                 add("Examples: " + ", ".join(eq.display() for eq in op_examples))
-            add("Testing structurally possible combinations:")
-            for cfg, rules in group_candidates(candidates.get(op, [])).items():
-                add(f" Config: {cfg}")
-                for rule in rules:
-                    marker = " [MATCH]" if rule == selected else ""
-                    add(f"  - {operation_name(rule)} -> format ({format_name(rule)}){marker}")
-            add(f"Rule identified for {self._literal(op)}: {rule_signature(selected)}")
-            add("Verifying examples for this operator:")
+            add(f"Selected rule: {rule_signature(selected)}")
+            add(f"Meaning: {rule_meaning(selected)}.")
+            if candidate_count <= 1:
+                add("Why this rule: it is the only compact rule that satisfies the equation structure and verifies all examples after digit assignment.")
+            else:
+                add(
+                    "Why this rule: several compact rules are structurally possible, but this one is selected because "
+                    "it satisfies all equations after digit assignment and preserves a consistent reading/encoding style."
+                )
+            add("Verification for this operator:")
             for eq in op_examples:
                 a = decoded_number(eq.left, selected)
                 b = decoded_number(eq.right, selected)
                 op_text, value = operation_line(selected, a, b)
                 encoded = encoded_value(value, eq, selected)
                 status = "OK" if encoded == expected_rhs(eq) else "MISMATCH"
-                add(f"  {eq.left} {eq.op} {eq.right} -> inputs A={a}, B={b} -> {op_text} -> encode {encoded} [{status}]")
+                add(f"  {eq.left} {eq.op} {eq.right} -> A={a}, B={b}; {op_text}; encode -> {encoded} [{status}]")
             add("")
 
         add("Solving digit assignment")
-        add("Initial domains: each symbol is in {0,1,2,3,4,5,6,7,8,9}; all symbols must be different.")
-        domain_steps = compress_domain_trace(derivation_trace)
-        if domain_steps:
-            add("Key constraint reductions:")
-            for idx, step in enumerate(domain_steps, 1):
-                add(f" {idx}. {step}")
-        else:
-            add("Constraint propagation plus backtracking leaves a single consistent assignment.")
+        add("Constraints used:")
+        add("  1. Each symbol maps to exactly one digit, and all symbols use different digits.")
+        add("  2. Leading symbols of multi-digit numbers cannot be zero.")
+        add("  3. Every parsed equation must hold under the selected operator rules.")
+        add("  4. Any remaining ambiguity is resolved only by assignments that keep all equations valid.")
         add(f"Digit assignment identified: {mapping_text()}")
 
         add("")
@@ -779,15 +762,16 @@ class DeductiveCryptarithmSolver:
         add("")
         add(f"Target calculation: {target_left} {target_op} {target_right}")
         target_rule = combo[target_op]
-        add(f"1. Apply config '{config_name(target_rule)}': A = {target_a}, B = {target_b}")
+        add(f"1. Use rule for operator {self._literal(target_op)}: {rule_signature(target_rule)}")
+        add(f"2. Decode operands: A={target_a}, B={target_b}")
         if target_error or answer is None or target_value is None:
-            add(f"2. Apply operation '{operation_name(target_rule)}': {target_error}")
-            add("Final answer: <no valid answer>")
+            add(f"3. Apply operation: {target_error}")
+            add("Computed output: <no valid answer>")
         else:
             target_operation, _ = operation_line(target_rule, target_a, target_b)
-            add(f"2. Apply operation '{operation_name(target_rule)}': {target_operation}")
-            add(f"3. Apply format '{format_name(target_rule)}' and symbol mapping: {answer}")
-            #add(f"Final answer: {answer}")
+            add(f"3. Apply operation: {target_operation}")
+            add(f"4. Encode using {format_name(target_rule)} and the symbol mapping: {answer}")
+            add(f"Computed output: {answer}")
 
         text = "\n".join(lines)
         if len(text) <= self.trace_config.max_solution_chars:
@@ -795,10 +779,11 @@ class DeductiveCryptarithmSolver:
 
         compact: List[str] = []
         compact.append("--- Решение ---")
+        compact.append("Task type: equations_transformation")
         compact.append("Cryptarithm model: unique digit per visible symbol; no leading zero in multi-digit values.")
         compact.append("Rules:")
         for op in sorted(combo):
-            compact.append(f"  {self._literal(op)}: {rule_signature(combo[op])}")
+            compact.append(f"  {self._literal(op)}: {rule_signature(combo[op])}; {rule_meaning(combo[op])}")
         compact.append(f"Digit assignment identified: {mapping_text()}")
         compact.append("Verification:")
         for eq in equations:
@@ -809,14 +794,15 @@ class DeductiveCryptarithmSolver:
             compact.append(f"  {eq.display()}: A={a}, B={b}; {op_text}; encoded={encoded_value(value, eq, rule)}")
         if target_error or answer is None or target_value is None:
             compact.append(f"Target {clean_target}: {target_error}")
-            compact.append("Final answer: <no valid answer>")
+            compact.append("Computed output: <no valid answer>")
         else:
             compact.append(f"Target calculation: {target_left} {target_op} {target_right}")
-            compact.append(f"1. Apply config '{config_name(target_rule)}': A = {target_a}, B = {target_b}")
+            compact.append(f"1. Use rule for operator {self._literal(target_op)}: {rule_signature(target_rule)}")
+            compact.append(f"2. Decode operands: A={target_a}, B={target_b}")
             target_operation, _ = operation_line(target_rule, target_a, target_b)
-            compact.append(f"2. Apply operation '{operation_name(target_rule)}': {target_operation}")
-            compact.append(f"3. Apply format '{format_name(target_rule)}' and symbol mapping: {answer}")
-            #compact.append(f"Final answer: {answer}")
+            compact.append(f"3. Apply operation: {target_operation}")
+            compact.append(f"4. Encode using {format_name(target_rule)} and the symbol mapping: {answer}")
+            compact.append(f"Computed output: {answer}")
         return compact
 
     def solve(self, examples_text: str, target_text: str, timeout_seconds: float = 30.0) -> Dict[str, Any]:
@@ -868,6 +854,14 @@ class DeductiveCryptarithmSolver:
                 "solution": "\n".join(solution),
                 "mapping": assignment,
                 "rules": {op: r.desc for op, r in combo.items()},
+                "rule_source": "direct_operator_rule_with_csp_assignment",
+                "training_category": "equations_transformation.cryptarithm_direct_operator",
+                "metadata": {
+                    "target_operator_seen_in_examples": True,
+                    "uses_fallback_inference": False,
+                    "target_operator": target_op,
+                    "symbols_count": len(symbols),
+                },
                 "stats": self.stats.__dict__,
                 "elapsed_seconds": elapsed,
             }

@@ -20,8 +20,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--tokenizer_path", type=str, required=True)
     
-
-    
     return parser.parse_args()
 
 
@@ -40,10 +38,10 @@ def main():
     logger.info(f"Datset countes: \n{data.label.value_counts()}")
 
     multipliers = {
-        "bit manipulation": 3.0,
-        "cryptarithm": 2.00,
-        "equations_numeric": 2.00,
-        "encryption": 3.0,
+        "bit manipulation": 2.0,
+        "cryptarithm": 1.5,
+        "equations_numeric": 1.5,
+        "encryption": 2.0,
     }
 
     # Equations
