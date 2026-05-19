@@ -5,14 +5,11 @@ data:
   train_generated: data/generated/train_with_syntetic.csv
   val_prepared: data/prepared/val_stratified.csv
   dataset_name: algorithmic_cot
-
 model:
-  id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  id: /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
   sft_output_dir: models/sft_v0.0.12
-
 split:
   val_size: 0.1
-
 train:
   lr: 2e-4
   batch_size: 4
@@ -24,8 +21,6 @@ train:
   lora_r: 32
   lora_alpha: 64
   max_seq_len: 8192
-
-
 evaluate:
   scores_file: data/scores/validation_scores.json
 wandb:

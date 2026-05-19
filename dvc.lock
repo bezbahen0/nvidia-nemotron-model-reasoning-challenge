@@ -14,14 +14,14 @@ stages:
       size: 5362
     - path: src/solvers
       hash: md5
-      md5: a3bc33db884524c2f3916b130aaa5b8d.dir
-      size: 239005
-      nfiles: 23
+      md5: 32ecde1559e1b8d03d1a69e149e66adf.dir
+      size: 268090
+      nfiles: 22
     outs:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: 70ce6f56cd58eed7d021a1aca3ea4c95
-      size: 24009422
+      md5: 96ea98152ed21ab4f9dccbcb790425e7
+      size: 16964500
   split_data:
     cmd: "python -m src.split_data --data_path data/solved/train-cot.csv --train_path
       data/prepared/train_stratified.csv --seed 31231 --val_path data/prepared/val_stratified.csv
@@ -29,8 +29,8 @@ stages:
     deps:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: 70ce6f56cd58eed7d021a1aca3ea4c95
-      size: 24009422
+      md5: 96ea98152ed21ab4f9dccbcb790425e7
+      size: 16964500
     - path: src/split_data.py
       hash: md5
       md5: c13aae0165db013d5df032bed463e111
@@ -42,31 +42,73 @@ stages:
     outs:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: d8111a3560ae472f6309e734369c2f9a
-      size: 21601971
+      md5: 390276673dab2f1187f22f8f13fa0cd2
+      size: 15262824
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: f9850c1ea8068a1b87f7a14733ee99f1
-      size: 2406174
+      md5: 122379f82d178e3169accd623897938a
+      size: 1700399
   prepare_data:
     cmd: "python -m src.prepare_dataset --data_path data/prepared/train_stratified.csv
       --output_path data/generated/train_with_syntetic.csv --seed 31231 --tokenizer_path
-      nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16\n"
+      /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1\n"
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: d8111a3560ae472f6309e734369c2f9a
-      size: 21601971
+      md5: 390276673dab2f1187f22f8f13fa0cd2
+      size: 15262824
     - path: src/prepare_dataset.py
       hash: md5
-      md5: df8c43d9ac1fb143970f4aa139e25f1b
-      size: 5008
+      md5: b4d1707251f6721d0d18abd78fa43413
+      size: 5004
     params:
       params.yaml:
-        model.id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+        model.id: 
+          /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
         train.seed: 31231
     outs:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 2c3957f911d7bcea5caf0a2376933e9c
-      size: 112673769
+      md5: 20ad09d2bad222f82da6d2764c34879b
+      size: 20871765
+  sft_train:
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.12 --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
+      --data algorithmic_cot --train_path data/generated/train_with_syntetic.csv --seed
+      31231 --eval_steps 400 --val_path data/prepared/val_stratified.csv --output_dir
+      models/sft_v0.0.12 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours 10.0
+      --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192\n"
+    deps:
+    - path: data/generated/train_with_syntetic.csv
+      hash: md5
+      md5: 20ad09d2bad222f82da6d2764c34879b
+      size: 20871765
+    - path: data/prepared/val_stratified.csv
+      hash: md5
+      md5: 122379f82d178e3169accd623897938a
+      size: 1700399
+    - path: src/sft_train.py
+      hash: md5
+      md5: 64ab3117c6613257c21da0713ce576b5
+      size: 7488
+    params:
+      params.yaml:
+        data.dataset_name: algorithmic_cot
+        model.id: 
+          /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
+        train.batch_size: 4
+        train.epochs: 1
+        train.eval_steps: 400
+        train.grad_accum: 8
+        train.lora_alpha: 64
+        train.lora_r: 32
+        train.lr: 0.0002
+        train.max_hours: 10.0
+        train.max_seq_len: 8192
+        train.seed: 31231
+        wandb.wandb_base_run_name: sft_v0.0.12
+    outs:
+    - path: models/sft_v0.0.12
+      hash: md5
+      md5: 7ac557f5e3b9252cf9a7c37221c06597.dir
+      size: 8907888767
+      nfiles: 19
