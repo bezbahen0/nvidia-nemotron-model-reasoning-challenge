@@ -48,7 +48,7 @@ stages:
 
   sft_train:
     cmd: >
-      torchrun --nproc_per_node=auto -m src.sft_train 
+      python -m src.sft_train 
       --wandb_run_basename ${wandb.wandb_base_run_name}
       --model_id ${model.id}
       --data ${data.dataset_name}
@@ -65,6 +65,7 @@ stages:
       --lora_r ${train.lora_r}
       --lora_alpha ${train.lora_alpha}
       --max_seq_len ${train.max_seq_len}
+      --use_cce
     deps:
       - ${data.train_generated}
       - ${data.val_prepared}
