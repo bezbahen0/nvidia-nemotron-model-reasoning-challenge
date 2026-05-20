@@ -155,7 +155,7 @@ def main():
             "in_proj",
             "out_proj",
             #"embed_tokens",
-            "lm_head",
+            #"lm_head",
         ],
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
