@@ -148,13 +148,12 @@ def main():
             "k_proj",
             "v_proj",
             "o_proj",
-            "gate_proj",
-            "up_proj",
+            "gate_up_proj",
             "down_proj",
             "in_proj",
             "out_proj",
-            "embed_tokens",
-            "lm_head",
+            #"embed_tokens",
+            #"lm_head",
         ],
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
@@ -162,6 +161,23 @@ def main():
         use_gradient_checkpointing="unsloth",
         random_state=args.seed,
     )
+
+    trainable = 0
+    total = 0
+
+    for name, param in model.named_parameters():
+        total += param.numel()
+        if param.requires_grad:
+            trainable += param.numel()
+
+    logger.info(f"trainable params: {trainable:,}")
+    logger.info(f"total params:     {total:,}")
+    logger.info(f"trainable %:      {100 * trainable / total:.6f}%")
+
+    logger.info("\nTrainable names:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            logger.info(name, tuple(param.shape), param.numel())
 
     FastLanguageModel.for_training(model)
 
