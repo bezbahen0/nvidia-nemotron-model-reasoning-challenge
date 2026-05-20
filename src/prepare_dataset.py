@@ -51,7 +51,7 @@ def main():
         num_samples=int(len(data[data.label == "equations transformation"]) * multipliers["cryptarithm"]),
         mode="random",
         nb_workers=24,
-        progress_bar=True,
+        progress_bar=False,
     )
     logger.info("\nCryptarithm generator:")
     logger.info(equations_cryptarithm_dataset.columns.tolist())
@@ -63,7 +63,7 @@ def main():
     equations_ast_dataset = equations_ast_generator.generate_dataset(
         num_samples=int(len(data[data.label == "equations transformation"]) * multipliers["equations_numeric"]),
         nb_workers=24,
-        progress_bar=True,
+        progress_bar=False,
         label="equations transformation"
     )
     logger.info("\nNumeric equations generator:")
