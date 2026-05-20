@@ -129,7 +129,6 @@ def main():
         full_finetuning=False,
         trust_remote_code=True,
         device_map={"": local_rank},
-        use_cache=False,
         attn_implementation=args.attn_implementation,
     )
 
