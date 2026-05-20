@@ -128,7 +128,7 @@ def main():
         load_in_8bit=False,
         full_finetuning=False,
         trust_remote_code=True,
-        device_map={"": local_rank},
+        unsloth_force_compile=True,
         attn_implementation=args.attn_implementation,
     )
 
@@ -158,6 +158,9 @@ def main():
         use_gradient_checkpointing="unsloth",
         random_state=args.seed,
     )
+
+    FastLanguageModel.for_training(model)
+
 
     training_args = SFTConfig(
         output_dir=args.output_dir,
