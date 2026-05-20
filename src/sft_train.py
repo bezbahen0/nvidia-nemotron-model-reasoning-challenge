@@ -41,7 +41,7 @@ def parse_args():
     # LoRA
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_dropout", type=float, default=0.00)
     
     return parser.parse_args()
 
@@ -66,26 +66,28 @@ def prepare_dataset(csv_path, eval=False):
     df = pd.read_csv(csv_path)
 
     instruction_suffix = "\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`"
-    
-    formatted_data = []
-    for _, row in df.iterrows():
-        user_text = str(row['prompt']) + instruction_suffix
 
-        # Use computed answer, reduce noice, we compare results on previosue stage
-        computed_answer = str(row['computed_answer']).strip()
-        
+    formatted_data = []
+
+    for _, row in df.iterrows():
+        user_text = str(row["prompt"]) + instruction_suffix
+
+        computed_answer = str(row["computed_answer"]).strip()
+
         assistant_text = (
             f"<think>\n{row['generated_cot']}\n</think>\n"
             f"Final Answer: \\boxed{{{computed_answer}}}"
         )
-        
+
         formatted_data.append({
-            "messages": [
-                {"role": "user", "content": user_text},
+            "prompt": [
+                {"role": "user", "content": user_text}
+            ],
+            "completion": [
                 {"role": "assistant", "content": assistant_text}
-            ]
+            ],
         })
-        
+
     return Dataset.from_list(formatted_data)
 
 def main():
@@ -168,9 +170,9 @@ def main():
         warmup_ratio=0.1,
         max_length=args.max_seq_len,
         completion_only_loss=True, 
+        assistant_only_loss=False,
 
-        ddp_find_unused_parameters=False,
-
+        
         dataloader_num_workers=4,
         dataloader_prefetch_factor=2,
         dataset_num_proc=8,
