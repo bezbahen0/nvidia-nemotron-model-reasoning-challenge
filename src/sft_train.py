@@ -45,7 +45,7 @@ def parse_args():
     # LoRA
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_dropout", type=float, default=0.0)
     
     return parser.parse_args()
 
@@ -190,7 +190,8 @@ def main():
         max_length=args.max_seq_len,
         completion_only_loss=True, 
 
-        #ddp_find_unused_parameters=False,
+        packing=False,
+        padding_free=False,
 
         dataloader_num_workers=4,
         dataloader_prefetch_factor=2,
