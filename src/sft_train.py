@@ -65,31 +65,32 @@ class TimeLimitCallback(TrainerCallback):
 
 
 
-
 def prepare_dataset(csv_path, eval=False):
     df = pd.read_csv(csv_path)
 
     instruction_suffix = "\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`"
-    
-    formatted_data = []
-    for _, row in df.iterrows():
-        user_text = str(row['prompt']) + instruction_suffix
 
-        # Use computed answer, reduce noice, we compare results on previosue stage
-        computed_answer = str(row['computed_answer']).strip()
-        
+    formatted_data = []
+
+    for _, row in df.iterrows():
+        user_text = str(row["prompt"]) + instruction_suffix
+
+        computed_answer = str(row["computed_answer"]).strip()
+
         assistant_text = (
             f"<think>\n{row['generated_cot']}\n</think>\n"
             f"Final Answer: \\boxed{{{computed_answer}}}"
         )
-        
+
         formatted_data.append({
-            "messages": [
-                {"role": "user", "content": user_text},
+            "prompt": [
+                {"role": "user", "content": user_text}
+            ],
+            "completion": [
                 {"role": "assistant", "content": assistant_text}
-            ]
+            ],
         })
-        
+
     return Dataset.from_list(formatted_data)
 
 def main():
@@ -189,6 +190,7 @@ def main():
         warmup_ratio=0.1,
         max_length=args.max_seq_len,
         completion_only_loss=True, 
+        assistant_only_loss=False,
 
         packing=False,
         padding_free=False,
@@ -202,7 +204,6 @@ def main():
     )
     
     training_args.group_by_length = True
-
 
     trainer = SFTTrainer(
         model=model,
