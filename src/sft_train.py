@@ -6,6 +6,7 @@ import pandas as pd
 import wandb
 from datasets import Dataset
 
+from unsloth import FastLanguageModel
 from transformers import (
     set_seed,
     TrainerCallback
@@ -13,7 +14,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 from trl import SFTTrainer, SFTConfig
-from unsloth import FastLanguageModel
+
 
 from src.log import logger
 
@@ -160,7 +161,6 @@ def main():
     )
 
     FastLanguageModel.for_training(model)
-
 
     training_args = SFTConfig(
         output_dir=args.output_dir,
