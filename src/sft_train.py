@@ -384,6 +384,8 @@ def main():
         telemetry_enabled=args.train_telemetry,
     )
 
+    logger.info(f"[train telemetry] train_dataset columns after trainer init: {trainer.train_dataset.column_names}")
+
     last_checkpoint = None
     if os.path.isdir(args.output_dir) and len(os.listdir(args.output_dir)) > 0:
         last_checkpoint = get_last_checkpoint(args.output_dir)
