@@ -131,6 +131,10 @@ class TelemetrySFTTrainer(SFTTrainer):
             os.makedirs(self.telemetry_output_dir, exist_ok=True)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        logger.info(f"[train telemetry] input keys before pop: {list(inputs.keys())}")
+        logger.info(f"[train telemetry] has source_row_index: {'source_row_index' in inputs}")
+        logger.info(f"[train telemetry] has labels: {'labels' in inputs}")
+        logger.info(f"[train telemetry] has input_ids: {'input_ids' in inputs}")
         source_row_index = inputs.pop("source_row_index", None)
 
         try:
@@ -267,6 +271,7 @@ class TelemetrySFTTrainer(SFTTrainer):
 
                 records.append(record)
 
+        logger.info(f"writing {len(records)} records to {path}")
         with open(path, "a", encoding="utf-8") as file:
             for record in records:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
