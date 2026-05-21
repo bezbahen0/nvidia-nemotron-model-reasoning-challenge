@@ -129,6 +129,32 @@ class TelemetrySFTTrainer(SFTTrainer):
 
         if self.telemetry_output_dir is not None:
             os.makedirs(self.telemetry_output_dir, exist_ok=True)
+        
+        base_data_collator = self.data_collator
+
+        def telemetry_data_collator(features):
+            source_row_indexes = []
+            cleaned_features = []
+
+            for feature in features:
+                feature = dict(feature)
+
+                source_row_indexes.append(int(feature.pop("source_row_index", -1)))
+
+                # Эти поля нам не нужны в collator/model.forward.
+                # Они есть в telemetry_metadata.
+                feature.pop("id", None)
+                feature.pop("source", None)
+                feature.pop("label", None)
+
+                cleaned_features.append(feature)
+
+            batch = base_data_collator(cleaned_features)
+            batch["source_row_index"] = torch.tensor(source_row_indexes, dtype=torch.long)
+
+            return batch
+
+        self.data_collator = telemetry_data_collator
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         logger.info(f"[train telemetry] input keys before pop: {list(inputs.keys())}")
@@ -270,6 +296,7 @@ class TelemetrySFTTrainer(SFTTrainer):
                     }
 
                 records.append(record)
+
 
         logger.info(f"writing {len(records)} records to {path}")
         with open(path, "a", encoding="utf-8") as file:
