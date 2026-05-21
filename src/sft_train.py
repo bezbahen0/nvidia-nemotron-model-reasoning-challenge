@@ -69,7 +69,7 @@ def prepare_dataset(csv_path, eval=False):
 
     formatted_data = []
 
-    for _, row in df.iterrows():
+    for source_row_index, row in df.iterrows():
         user_text = str(row["prompt"]) + instruction_suffix
 
         computed_answer = str(row["computed_answer"]).strip()
@@ -80,6 +80,11 @@ def prepare_dataset(csv_path, eval=False):
         )
 
         formatted_data.append({
+            "source_row_index": int(source_row_index),
+            "id": str(row["id"]),
+            "source": str(row["source"]),
+            "label": str(row["label"]),
+
             "prompt": [
                 {"role": "user", "content": user_text}
             ],
@@ -87,7 +92,6 @@ def prepare_dataset(csv_path, eval=False):
                 {"role": "assistant", "content": assistant_text}
             ],
         })
-
     return Dataset.from_list(formatted_data)
 
 def main():
