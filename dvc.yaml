@@ -35,11 +35,13 @@ stages:
       --data_path ${data.train_prepared}
       --output_path ${data.train_generated}
       --seed ${train.seed}
+      --tokenizer_path ${model.id}
     deps:
       - ${data.train_prepared}
       - src/prepare_dataset.py
     params:
       - train.seed
+      - model.id
     outs:
       - ${data.train_generated}
 
@@ -60,6 +62,9 @@ stages:
       --epochs ${train.epochs}
       --max_hours ${train.max_hours}
       --lr ${train.lr}
+      --lora_r ${train.lora_r}
+      --lora_alpha ${train.lora_alpha}
+      --max_seq_len ${train.max_seq_len}
     deps:
       - ${data.train_generated}
       - ${data.val_prepared}
@@ -75,6 +80,9 @@ stages:
       - train.eval_steps
       - train.seed
       - train.lr
+      - train.lora_r
+      - train.lora_alpha
+      - train.max_seq_len
     outs:
       - ${model.sft_output_dir}:
           persist: true

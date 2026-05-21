@@ -41,7 +41,7 @@ def parse_args():
     # LoRA
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_dropout", type=float, default=0.00)
     
     return parser.parse_args()
 
@@ -66,46 +66,35 @@ def prepare_dataset(csv_path, eval=False):
     df = pd.read_csv(csv_path)
 
     instruction_suffix = "\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`"
-    
-    formatted_data = []
-    for _, row in df.iterrows():
-        user_text = str(row['prompt']) + instruction_suffix
 
-        # Use computed answer, reduce noice, we compare results on previosue stage
-        computed_answer = str(row['computed_answer']).strip()
-        
-        # } break compputed metric provided by orgs, reg search only to first }
-        # matches = re.findall(r'\\boxed\{([^}]*)(?:\}|$)', text)
-        if '}' in computed_answer:
-            meta_reasoning = (
-                "\n\nWait, the calculated answer contains a closing curly brace '}'. "
-                "Wrapping it in a standard LaTeX \\boxed{} tag would create malformed syntax and ambiguity "
-                "where the bounding box terminates prematurely. To avoid formatting errors and preserve the exact answer, "
-                "I will use the plain text format instead."
-            )
-            
-            assistant_text = (
-                f"<think>\n{row['generated_cot']}{meta_reasoning}\n</think>\n"
-                f"The final answer is: {computed_answer}"
-            )
-        else:
-            assistant_text = (
-                f"<think>\n{row['generated_cot']}\n</think>\n"
-                f"Final Answer: \\boxed{{{computed_answer}}}"
-            )
-        
+    formatted_data = []
+
+    for _, row in df.iterrows():
+        user_text = str(row["prompt"]) + instruction_suffix
+
+        computed_answer = str(row["computed_answer"]).strip()
+
+        assistant_text = (
+            f"<think>\n{row['generated_cot']}\n</think>\n"
+            f"Final Answer: \\boxed{{{computed_answer}}}"
+        )
+
         formatted_data.append({
-            "messages": [
-                {"role": "user", "content": user_text},
+            "prompt": [
+                {"role": "user", "content": user_text}
+            ],
+            "completion": [
                 {"role": "assistant", "content": assistant_text}
-            ]
+            ],
         })
-        
+
     return Dataset.from_list(formatted_data)
 
 def main():
     args = parse_args()
     set_seed(args.seed)
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     os.makedirs(args.output_dir, exist_ok=True)
     run_id_file = os.path.join(args.output_dir, "wandb_run_id.txt")
@@ -140,7 +129,7 @@ def main():
     logger.info("Загрузка модели в bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        device_map="auto",
+        device_map={"": local_rank},
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         use_cache=False
@@ -151,7 +140,7 @@ def main():
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=r".*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|in_proj|out_proj|embed_tokens|lm_head)$", 
+        target_modules=r".*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|gate_up_proj|down_proj|in_proj|out_proj|embed_tokens|lm_head)$", 
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -181,7 +170,9 @@ def main():
         warmup_ratio=0.1,
         max_length=args.max_seq_len,
         completion_only_loss=True, 
+        assistant_only_loss=False,
 
+        
         dataloader_num_workers=4,
         dataloader_prefetch_factor=2,
         dataset_num_proc=8,
