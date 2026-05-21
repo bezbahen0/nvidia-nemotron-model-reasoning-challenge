@@ -65,6 +65,7 @@ stages:
       --lora_r ${train.lora_r}
       --lora_alpha ${train.lora_alpha}
       --max_seq_len ${train.max_seq_len}
+      --train_telemetry
     deps:
       - ${data.train_generated}
       - ${data.val_prepared}

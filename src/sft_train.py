@@ -46,6 +46,7 @@ def parse_args():
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.00)
+    parser.add_argument("--train_telemetry", action="store_true")
     
     return parser.parse_args()
 
@@ -97,10 +98,6 @@ def prepare_dataset(csv_path, eval=False):
 
         formatted_data.append({
             "source_row_index": int(source_row_index),
-            "id": str(row["id"]),
-            "source": str(row["source"]),
-            "label": str(row["label"]),
-
             "prompt": [
                 {"role": "user", "content": user_text}
             ],
@@ -379,7 +376,7 @@ def main():
         telemetry_metadata=train_metadata,
         telemetry_output_dir=telemetry_output_dir,
         telemetry_save_steps=args.eval_steps,
-        telemetry_enabled=True,
+        telemetry_enabled=args.train_telemetry,
     )
 
     last_checkpoint = None

@@ -16,7 +16,7 @@ train:
   grad_accum: 8
   epochs: 1
   seed: 31231
-  eval_steps: 400
+  eval_steps: 50
   max_hours: 10.0
   lora_r: 32
   lora_alpha: 64
