@@ -4,6 +4,10 @@ import argparse
 import torch
 import pandas as pd
 import wandb
+
+import json
+import torch.nn.functional as F
+
 from datasets import Dataset
 from peft import LoraConfig
 from transformers import (
@@ -58,7 +62,19 @@ class TimeLimitCallback(TrainerCallback):
             control.should_save = True
 
 
+def load_train_metadata(train_path):
+    df = pd.read_csv(train_path)
 
+    metadata = {}
+
+    for source_row_index, row in df.iterrows():
+        metadata[int(source_row_index)] = {
+            "id": str(row["id"]),
+            "source": str(row["source"]),
+            "label": str(row["label"]),
+        }
+
+    return metadata
 
 
 
@@ -94,6 +110,171 @@ def prepare_dataset(csv_path, eval=False):
         })
     return Dataset.from_list(formatted_data)
 
+
+class TelemetrySFTTrainer(SFTTrainer):
+    def __init__(
+        self,
+        *args,
+        telemetry_metadata=None,
+        telemetry_output_dir=None,
+        telemetry_save_steps=50,
+        telemetry_enabled=True,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.telemetry_metadata = telemetry_metadata or {}
+        self.telemetry_output_dir = telemetry_output_dir
+        self.telemetry_save_steps = int(telemetry_save_steps)
+        self.telemetry_enabled = bool(telemetry_enabled)
+
+        self.telemetry_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+
+        if self.telemetry_output_dir is not None:
+            os.makedirs(self.telemetry_output_dir, exist_ok=True)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        source_row_index = inputs.pop("source_row_index", None)
+
+        try:
+            loss, outputs = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+                num_items_in_batch=num_items_in_batch,
+            )
+        except TypeError:
+            loss, outputs = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+            )
+
+        if self.telemetry_enabled and model.training and source_row_index is not None:
+            self._write_train_batch_telemetry(
+                outputs=outputs,
+                labels=inputs.get("labels"),
+                source_row_index=source_row_index,
+            )
+
+        if return_outputs:
+            return loss, outputs
+
+        return loss
+
+    def _write_train_batch_telemetry(self, outputs, labels, source_row_index):
+        if self.telemetry_output_dir is None:
+            return
+
+        if labels is None:
+            return
+
+        if not hasattr(outputs, "logits"):
+            return
+
+        if self.telemetry_save_steps <= 0:
+            checkpoint_bucket = int(self.state.global_step)
+        else:
+            checkpoint_bucket = (
+                (int(self.state.global_step) // self.telemetry_save_steps) + 1
+            ) * self.telemetry_save_steps
+
+        path = os.path.join(
+            self.telemetry_output_dir,
+            f"train_until_checkpoint-{checkpoint_bucket}_rank-{self.telemetry_rank}.jsonl",
+        )
+
+        with torch.no_grad():
+            logits = outputs.logits.detach().float()
+            labels = labels.detach()
+
+            shift_logits = logits[:, :-1, :]
+            shift_labels = labels[:, 1:]
+
+            token_nll = F.cross_entropy(
+                shift_logits.transpose(1, 2),
+                shift_labels,
+                reduction="none",
+                ignore_index=-100,
+            )
+
+            token_log_probs = -token_nll
+            valid_mask = shift_labels.ne(-100)
+
+            if isinstance(source_row_index, torch.Tensor):
+                source_row_indexes = source_row_index.detach().cpu().tolist()
+            else:
+                source_row_indexes = list(source_row_index)
+
+            records = []
+
+            batch_size = shift_labels.shape[0]
+
+            for batch_index in range(batch_size):
+                valid_values = token_log_probs[batch_index][valid_mask[batch_index]]
+
+                row_index = int(source_row_indexes[batch_index])
+                metadata = self.telemetry_metadata.get(
+                    row_index,
+                    {
+                        "id": str(row_index),
+                        "source": "unknown",
+                        "label": "unknown",
+                    },
+                )
+
+                if valid_values.numel() == 0:
+                    record = {
+                        "step": int(self.state.global_step),
+                        "epoch": None if self.state.epoch is None else float(self.state.epoch),
+                        "checkpoint_bucket": int(checkpoint_bucket),
+                        "source_row_index": row_index,
+                        "id": metadata["id"],
+                        "source": metadata["source"],
+                        "label": metadata["label"],
+                        "num_loss_tokens": 0,
+                        "total_loss": None,
+                        "mean_nll": None,
+                        "min_logprob": None,
+                        "p05_logprob": None,
+                        "hard_token_ratio": None,
+                        "near_zero_token_ratio": None,
+                    }
+                else:
+                    values = valid_values.detach().cpu()
+
+                    num_loss_tokens = int(values.numel())
+                    total_loss = float((-values).sum().item())
+                    mean_nll = float((-values).mean().item())
+                    min_logprob = float(values.min().item())
+                    p05_logprob = float(torch.quantile(values, 0.05).item())
+                    hard_token_ratio = float((values < -1.0).float().mean().item())
+                    near_zero_token_ratio = float((values > -0.05).float().mean().item())
+
+                    record = {
+                        "step": int(self.state.global_step),
+                        "epoch": None if self.state.epoch is None else float(self.state.epoch),
+                        "checkpoint_bucket": int(checkpoint_bucket),
+                        "source_row_index": row_index,
+                        "id": metadata["id"],
+                        "source": metadata["source"],
+                        "label": metadata["label"],
+                        "num_loss_tokens": num_loss_tokens,
+                        "total_loss": total_loss,
+                        "mean_nll": mean_nll,
+                        "min_logprob": min_logprob,
+                        "p05_logprob": p05_logprob,
+                        "hard_token_ratio": hard_token_ratio,
+                        "near_zero_token_ratio": near_zero_token_ratio,
+                    }
+
+                records.append(record)
+
+        with open(path, "a", encoding="utf-8") as file:
+            for record in records:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -124,6 +305,7 @@ def main():
     logger.info("Подготовка тренировочного датасета, так же не используем для обучения промпты где solver не дал правильный ответ...")
     train_dataset = prepare_dataset(args.train_path)
     logger.info(f"train dataset final len: {len(train_dataset)}")
+    train_metadata = load_train_metadata(args.train_path)
 
     
     logger.info("Подготовка валидационного датасета, так же не используем для валидации промпты где solver не дал правильный ответ...")
@@ -176,22 +358,28 @@ def main():
         completion_only_loss=True, 
         assistant_only_loss=False,
 
-        
         dataloader_num_workers=4,
         dataloader_prefetch_factor=2,
         dataset_num_proc=8,
+        remove_unused_columns=False,
 
         report_to="wandb",
         run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
     )
 
-    trainer = SFTTrainer(
+    telemetry_output_dir = os.path.join(args.output_dir, "train_telemetry")
+
+    trainer = TelemetrySFTTrainer(
         model=model,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         peft_config=lora_config,
         args=training_args,
-        callbacks=[TimeLimitCallback(max_hours=args.max_hours)]
+        callbacks=[TimeLimitCallback(max_hours=args.max_hours)],
+        telemetry_metadata=train_metadata,
+        telemetry_output_dir=telemetry_output_dir,
+        telemetry_save_steps=args.eval_steps,
+        telemetry_enabled=True,
     )
 
     last_checkpoint = None
