@@ -157,10 +157,6 @@ class TelemetrySFTTrainer(SFTTrainer):
         self.data_collator = telemetry_data_collator
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        logger.info(f"[train telemetry] input keys before pop: {list(inputs.keys())}")
-        logger.info(f"[train telemetry] has source_row_index: {'source_row_index' in inputs}")
-        logger.info(f"[train telemetry] has labels: {'labels' in inputs}")
-        logger.info(f"[train telemetry] has input_ids: {'input_ids' in inputs}")
         source_row_index = inputs.pop("source_row_index", None)
 
         try:
@@ -298,7 +294,6 @@ class TelemetrySFTTrainer(SFTTrainer):
                 records.append(record)
 
 
-        logger.info(f"writing {len(records)} records to {path}")
         with open(path, "a", encoding="utf-8") as file:
             for record in records:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -410,8 +405,6 @@ def main():
         telemetry_save_steps=args.eval_steps,
         telemetry_enabled=args.train_telemetry,
     )
-
-    logger.info(f"[train telemetry] train_dataset columns after trainer init: {trainer.train_dataset.column_names}")
 
     last_checkpoint = None
     if os.path.isdir(args.output_dir) and len(os.listdir(args.output_dir)) > 0:
