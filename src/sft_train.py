@@ -46,6 +46,8 @@ def parse_args():
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.00)
+
+    # telemetry
     parser.add_argument("--train_telemetry", action="store_true")
     
     return parser.parse_args()
@@ -76,7 +78,6 @@ def load_train_metadata(train_path):
         }
 
     return metadata
-
 
 
 def prepare_dataset(csv_path, eval=False):
@@ -116,6 +117,7 @@ class TelemetrySFTTrainer(SFTTrainer):
         telemetry_output_dir=None,
         telemetry_save_steps=50,
         telemetry_enabled=True,
+        telemetry_tokenizer=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -124,6 +126,9 @@ class TelemetrySFTTrainer(SFTTrainer):
         self.telemetry_output_dir = telemetry_output_dir
         self.telemetry_save_steps = int(telemetry_save_steps)
         self.telemetry_enabled = bool(telemetry_enabled)
+        self.telemetry_tokenizer = telemetry_tokenizer
+        self.telemetry_top_bad_tokens_count = 5
+        self.telemetry_context_window_tokens = 8
 
         self.telemetry_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
 
@@ -141,8 +146,6 @@ class TelemetrySFTTrainer(SFTTrainer):
 
                 source_row_indexes.append(int(feature.pop("source_row_index", -1)))
 
-                # Эти поля нам не нужны в collator/model.forward.
-                # Они есть в telemetry_metadata.
                 feature.pop("id", None)
                 feature.pop("source", None)
                 feature.pop("label", None)
@@ -177,6 +180,7 @@ class TelemetrySFTTrainer(SFTTrainer):
             self._write_train_batch_telemetry(
                 outputs=outputs,
                 labels=inputs.get("labels"),
+                input_ids=inputs.get("input_ids"),
                 source_row_index=source_row_index,
             )
 
@@ -185,11 +189,164 @@ class TelemetrySFTTrainer(SFTTrainer):
 
         return loss
 
-    def _write_train_batch_telemetry(self, outputs, labels, source_row_index):
+    def _get_token_texts(self, token_ids):
+        if self.telemetry_tokenizer is None:
+            return [str(int(token_id)) for token_id in token_ids]
+
+        return [
+            self.telemetry_tokenizer.decode(
+                [int(token_id)],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            for token_id in token_ids
+        ]
+
+    def _get_token_sections(self, token_texts):
+        full_text = "".join(token_texts)
+
+        think_start = full_text.find("<think>")
+        think_content_start = full_text.find("\n", think_start)
+        think_end = full_text.find("</think>")
+        final_start = full_text.find("Final Answer:")
+        boxed_start = full_text.find("\\boxed{")
+
+        boxed_content_start = -1
+        boxed_content_end = -1
+
+        if boxed_start != -1:
+            boxed_content_start = boxed_start + len("\\boxed{")
+            boxed_content_end = full_text.find("}", boxed_content_start)
+
+        sections = []
+
+        char_pos = 0
+
+        for token_text in token_texts:
+            token_start = char_pos
+            token_end = char_pos + len(token_text)
+            token_mid = token_start if token_end == token_start else token_start + (token_end - token_start) // 2
+
+            section = "format"
+
+            if boxed_content_start != -1 and token_mid >= boxed_content_start:
+                if boxed_content_end == -1 or token_mid < boxed_content_end:
+                    section = "boxed_answer"
+                elif final_start != -1 and token_mid >= final_start:
+                    section = "final_answer"
+            elif final_start != -1 and token_mid >= final_start:
+                section = "final_answer"
+            elif think_end != -1:
+                if think_content_start != -1 and token_mid > think_content_start and token_mid < think_end:
+                    section = "cot"
+            elif think_start != -1:
+                if think_content_start != -1 and token_mid > think_content_start:
+                    section = "cot"
+
+            sections.append(section)
+            char_pos = token_end
+
+        return sections
+
+    def _build_section_metrics(self, values, sections):
+        result = {}
+
+        section_names = [
+            "cot",
+            "final_answer",
+            "boxed_answer",
+            "format",
+        ]
+
+        for section_name in section_names:
+            section_indexes = [
+                index
+                for index, section in enumerate(sections)
+                if section == section_name
+            ]
+
+            if len(section_indexes) == 0:
+                result[f"{section_name}_num_tokens"] = 0
+                result[f"{section_name}_mean_nll"] = None
+                result[f"{section_name}_min_logprob"] = None
+                result[f"{section_name}_p05_logprob"] = None
+                result[f"{section_name}_hard_token_ratio"] = None
+                result[f"{section_name}_near_zero_token_ratio"] = None
+                continue
+
+            section_values = values[section_indexes]
+
+            result[f"{section_name}_num_tokens"] = int(section_values.numel())
+            result[f"{section_name}_mean_nll"] = float((-section_values).mean().item())
+            result[f"{section_name}_min_logprob"] = float(section_values.min().item())
+            result[f"{section_name}_p05_logprob"] = float(torch.quantile(section_values, 0.05).item())
+            result[f"{section_name}_hard_token_ratio"] = float((section_values < -1.0).float().mean().item())
+            result[f"{section_name}_near_zero_token_ratio"] = float((section_values > -0.05).float().mean().item())
+
+        return result
+
+    def _empty_section_metrics(self):
+        result = {}
+
+        section_names = [
+            "cot",
+            "final_answer",
+            "boxed_answer",
+            "format",
+        ]
+
+        for section_name in section_names:
+            result[f"{section_name}_num_tokens"] = 0
+            result[f"{section_name}_mean_nll"] = None
+            result[f"{section_name}_min_logprob"] = None
+            result[f"{section_name}_p05_logprob"] = None
+            result[f"{section_name}_hard_token_ratio"] = None
+            result[f"{section_name}_near_zero_token_ratio"] = None
+
+        return result
+
+    def _build_top_bad_tokens(self, values, token_ids, token_texts, sections):
+        top_bad_tokens = []
+
+        if values.numel() == 0:
+            return top_bad_tokens
+
+        top_count = min(self.telemetry_top_bad_tokens_count, int(values.numel()))
+
+        _, top_indexes = torch.topk(
+            -values,
+            k=top_count,
+            largest=True,
+        )
+
+        top_indexes = top_indexes.detach().cpu().tolist()
+
+        for token_index in top_indexes:
+            context_start = max(0, int(token_index) - self.telemetry_context_window_tokens)
+            context_end = min(len(token_texts), int(token_index) + self.telemetry_context_window_tokens + 1)
+
+            context = "".join(token_texts[context_start:context_end])
+
+            top_bad_tokens.append({
+                "completion_token_pos": int(token_index),
+                "token_id": int(token_ids[token_index]),
+                "token_text": token_texts[token_index],
+                "logprob": float(values[token_index].item()),
+                "nll": float((-values[token_index]).item()),
+                "section": sections[token_index],
+                "context": context,
+            })
+
+        return top_bad_tokens
+
+    def _write_train_batch_telemetry(self, outputs, labels, input_ids, source_row_index):
         if self.telemetry_output_dir is None:
             return
 
         if labels is None:
+            return
+
+        if input_ids is None:
             return
 
         if not hasattr(outputs, "logits"):
@@ -210,9 +367,11 @@ class TelemetrySFTTrainer(SFTTrainer):
         with torch.no_grad():
             logits = outputs.logits.detach().float()
             labels = labels.detach()
+            input_ids = input_ids.detach()
 
             shift_logits = logits[:, :-1, :]
             shift_labels = labels[:, 1:]
+            shift_input_ids = input_ids[:, 1:]
 
             token_nll = F.cross_entropy(
                 shift_logits.transpose(1, 2),
@@ -234,7 +393,9 @@ class TelemetrySFTTrainer(SFTTrainer):
             batch_size = shift_labels.shape[0]
 
             for batch_index in range(batch_size):
-                valid_values = token_log_probs[batch_index][valid_mask[batch_index]]
+                current_valid_mask = valid_mask[batch_index]
+                valid_values = token_log_probs[batch_index][current_valid_mask]
+                valid_token_ids = shift_input_ids[batch_index][current_valid_mask].detach().cpu().tolist()
 
                 row_index = int(source_row_indexes[batch_index])
                 metadata = self.telemetry_metadata.get(
@@ -262,9 +423,20 @@ class TelemetrySFTTrainer(SFTTrainer):
                         "p05_logprob": None,
                         "hard_token_ratio": None,
                         "near_zero_token_ratio": None,
+                        **self._empty_section_metrics(),
+                        "top_bad_tokens": [],
                     }
                 else:
                     values = valid_values.detach().cpu()
+                    token_texts = self._get_token_texts(valid_token_ids)
+                    sections = self._get_token_sections(token_texts)
+                    section_metrics = self._build_section_metrics(values, sections)
+                    top_bad_tokens = self._build_top_bad_tokens(
+                        values=values,
+                        token_ids=valid_token_ids,
+                        token_texts=token_texts,
+                        sections=sections,
+                    )
 
                     num_loss_tokens = int(values.numel())
                     total_loss = float((-values).sum().item())
@@ -289,10 +461,11 @@ class TelemetrySFTTrainer(SFTTrainer):
                         "p05_logprob": p05_logprob,
                         "hard_token_ratio": hard_token_ratio,
                         "near_zero_token_ratio": near_zero_token_ratio,
+                        **section_metrics,
+                        "top_bad_tokens": top_bad_tokens,
                     }
 
                 records.append(record)
-
 
         with open(path, "a", encoding="utf-8") as file:
             for record in records:
@@ -404,6 +577,7 @@ def main():
         telemetry_output_dir=telemetry_output_dir,
         telemetry_save_steps=args.eval_steps,
         telemetry_enabled=args.train_telemetry,
+        telemetry_tokenizer=tokenizer,
     )
 
     last_checkpoint = None
