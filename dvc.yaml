@@ -49,7 +49,7 @@ stages:
   sft_train:
     cmd: >
       python -m src.sft_train 
-      --wandb_run_basename ${wandb.wandb_base_run_name}
+      --wandb_run_basename ${wandb.wandb_base_run_name}_base_sft_train
       --model_id ${model.id}
       --data ${data.dataset_name}
       --train_path ${data.train_generated}
@@ -87,4 +87,18 @@ stages:
     outs:
       - ${model.sft_output_dir}:
           persist: true
+  
+  analyze_sft_telemetry:
+    cmd: >
+      python -m src.analyze_sft_telemetry 
+      --telemetry_dir ${model.sft_output_dir}/train_telemetry
+      --train_path ${data.train_generated}
+      --output_dir ${model.sft_output_dir}_telemetry_analysis
+      --use_all_records
+    deps:
+      - ${data.train_generated}
+      - ${model.sft_output_dir}
+    outs:
+      - ${model.sft_output_dir}_telemetry_analysis
+      - src/analyze_sft_telemetry.py
     
