@@ -98,7 +98,8 @@ stages:
     deps:
       - ${data.train_generated}
       - ${model.sft_output_dir}
+      - src/analyze_sft_telemetry.py
     outs:
       - ${model.sft_output_dir}_telemetry_analysis
-      - src/analyze_sft_telemetry.py
+      
     
