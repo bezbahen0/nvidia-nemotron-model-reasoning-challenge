@@ -168,7 +168,7 @@ stages:
       --data ${data.dataset_name}_dense
       --train_path ${data.train_dense}
       --seed ${train.seed}
-      --eval_steps ${train.eval_steps}
+      --eval_steps ${train.dense_eval_steps}
       --val_path ${data.val_prepared}
       --output_dir ${model.dense_sft_output_dir}
       --batch_size ${train.batch_size}
@@ -192,7 +192,7 @@ stages:
       - train.batch_size
       - train.grad_accum
       - train.epochs
-      - train.eval_steps
+      - train.dense_eval_steps
       - train.seed
       - train.lr
       - train.lora_r

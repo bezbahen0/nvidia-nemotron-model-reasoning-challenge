@@ -22,6 +22,7 @@ train:
   epochs: 1
   seed: 31231
   eval_steps: 50
+  dense_eval_steps: 150
   max_hours: 10.0
   lora_r: 32
   lora_alpha: 64
