@@ -154,3 +154,45 @@ stages:
       - train.seed
     outs:
       - ${data.train_dense}
+
+  dense_sft_train:
+    cmd: >
+      python -m src.sft_train 
+      --wandb_run_basename ${wandb.wandb_base_run_name}_dense_sft_train
+      --model_id ${model.id}
+      --data ${data.dataset_name}_dense
+      --train_path ${data.train_dense}
+      --seed ${train.seed}
+      --eval_steps ${train.eval_steps}
+      --val_path ${data.val_prepared}
+      --output_dir ${model.dense_sft_output_dir}
+      --batch_size ${train.batch_size}
+      --grad_accum ${train.grad_accum}
+      --epochs ${train.epochs}
+      --max_hours ${train.max_hours}
+      --lr ${train.lr}
+      --lora_r ${train.lora_r}
+      --lora_alpha ${train.lora_alpha}
+      --max_seq_len ${train.max_seq_len}
+    deps:
+      - ${data.train_dense}
+      - ${data.val_prepared}
+      - src/sft_train.py
+    params:
+      - wandb.wandb_base_run_name
+      - model.id
+      - data.dataset_name
+      - model.dense_sft_output_dir
+      - train.max_hours
+      - train.batch_size
+      - train.grad_accum
+      - train.epochs
+      - train.eval_steps
+      - train.seed
+      - train.lr
+      - train.lora_r
+      - train.lora_alpha
+      - train.max_seq_len
+    outs:
+      - ${model.dense_sft_output_dir}:
+          persist: true
