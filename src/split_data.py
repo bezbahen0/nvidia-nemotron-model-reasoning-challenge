@@ -44,6 +44,7 @@ def main():
     train_df.to_csv(args.train_path, index=False)
     
     logger.info(f"Save val в {args.val_path} ({len(val_df)} строк)")
+    val_df["source"] = len(val_df) * ['solver']
     val_df.to_csv(args.val_path, index=False)
 
     train_dist = train_df['label'].value_counts(normalize=True) * 100
