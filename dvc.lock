@@ -71,47 +71,6 @@ stages:
       hash: md5
       md5: 33973c1dd3e67de978ad8b318b9e7746
       size: 22894589
-  sft_train:
-    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.13 --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
-      --data algorithmic_cot --train_path data/generated/train_with_syntetic.csv --seed
-      31231 --eval_steps 50 --val_path data/prepared/val_stratified.csv --output_dir
-      models/sft_v0.0.13 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours 10.0
-      --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192 --train_telemetry\n"
-    deps:
-    - path: data/generated/train_with_syntetic.csv
-      hash: md5
-      md5: 8185540a63e4538210ee18c1e73e0a1b
-      size: 20367200
-    - path: data/prepared/val_stratified.csv
-      hash: md5
-      md5: ca5c1c32b85da196ed3cac8fb5512798
-      size: 1700395
-    - path: src/sft_train.py
-      hash: md5
-      md5: 5e6249f4e3f5ececaa18ef6d1c15d50e
-      size: 15328
-    params:
-      params.yaml:
-        data.dataset_name: algorithmic_cot
-        model.id: 
-          /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
-        train.batch_size: 4
-        train.epochs: 1
-        train.eval_steps: 50
-        train.grad_accum: 8
-        train.lora_alpha: 64
-        train.lora_r: 32
-        train.lr: 0.0002
-        train.max_hours: 10.0
-        train.max_seq_len: 8192
-        train.seed: 31231
-        wandb.wandb_base_run_name: sft_v0.0.13
-    outs:
-    - path: models/sft_v0.0.13
-      hash: md5
-      md5: f4137497ea03e821c6234cfa68c2cc1f.dir
-      size: 14265627484
-      nfiles: 37
   base_sft_train:
     cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.13_base_sft_train
       --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
@@ -155,3 +114,51 @@ stages:
       md5: 9d9e635be1fdbd0e05f07325af7748c2.dir
       size: 14300700429
       nfiles: 43
+  analyze_sft_train_telemetry:
+    cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.13/train_telemetry
+      --train_path data/generated/train_with_syntetic.csv --output_dir models/sft_v0.0.13_train_telemetry_analysis
+      --use_all_records\n"
+    deps:
+    - path: data/generated/train_with_syntetic.csv
+      hash: md5
+      md5: 33973c1dd3e67de978ad8b318b9e7746
+      size: 22894589
+    - path: models/sft_v0.0.13
+      hash: md5
+      md5: 9d9e635be1fdbd0e05f07325af7748c2.dir
+      size: 14300700429
+      nfiles: 43
+    - path: src/analyze_sft_telemetry.py
+      hash: md5
+      md5: d59e3a69f64f557825d28e467692c994
+      size: 15187
+    outs:
+    - path: models/sft_v0.0.13_train_telemetry_analysis
+      hash: md5
+      md5: e4f18caa13651a87c19d67507a3e43e3.dir
+      size: 1628512
+      nfiles: 5
+  analyze_sft_eval_telemetry:
+    cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.13/eval_telemetry
+      --train_path data/prepared/val_stratified.csv --output_dir models/sft_v0.0.13_eval_telemetry_analysis
+      --use_all_records\n"
+    deps:
+    - path: data/prepared/val_stratified.csv
+      hash: md5
+      md5: 7891e94d9a995f2de1efa9e24127698c
+      size: 1700551
+    - path: models/sft_v0.0.13
+      hash: md5
+      md5: 9d9e635be1fdbd0e05f07325af7748c2.dir
+      size: 14300700429
+      nfiles: 43
+    - path: src/analyze_sft_telemetry.py
+      hash: md5
+      md5: d59e3a69f64f557825d28e467692c994
+      size: 15187
+    outs:
+    - path: models/sft_v0.0.13_eval_telemetry_analysis
+      hash: md5
+      md5: 96efb0beb50c3ee98510d425ff10626f.dir
+      size: 982963
+      nfiles: 5
