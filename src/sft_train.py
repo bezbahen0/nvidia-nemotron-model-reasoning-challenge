@@ -19,6 +19,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 from trl import SFTTrainer, SFTConfig
+from src.metric import verify
 from src.log import logger
 
 def parse_args():
@@ -83,6 +84,17 @@ def load_metadata(data_path):
 
 def prepare_dataset(csv_path, eval=False):
     df = pd.read_csv(csv_path)
+
+    if eval:
+        before_len = len(df)
+        
+        df = df[df.computed_answer.notna()]
+        df = df[df.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1)]
+
+
+        logger.info(
+            f"Eval dataset filtered by is_correct=True: {before_len} -> {len(df)}"
+        )
 
     instruction_suffix = "\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`"
 
@@ -395,7 +407,7 @@ class TelemetrySFTTrainer(SFTTrainer):
             file_name = f"train_until_checkpoint-{checkpoint_bucket}_rank-{self.telemetry_rank}.jsonl"
         else:
             file_name = f"eval_at_checkpoint-{checkpoint_bucket}_rank-{self.telemetry_rank}.jsonl"
-        
+
         path = os.path.join(output_dir, file_name)
 
         with torch.no_grad():
@@ -535,13 +547,11 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    logger.info("Подготовка тренировочного датасета, так же не используем для обучения промпты где solver не дал правильный ответ...")
     train_dataset = prepare_dataset(args.train_path)
     logger.info(f"train dataset final len: {len(train_dataset)}")
     train_metadata = load_metadata(args.train_path)
 
     
-    logger.info("Подготовка валидационного датасета, так же не используем для валидации промпты где solver не дал правильный ответ...")
     val_dataset = prepare_dataset(args.val_path, eval=True)
     logger.info(f"val dataset final len: {len(val_dataset)}")
     eval_metadata = load_metadata(args.val_path)
