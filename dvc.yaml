@@ -132,7 +132,9 @@ stages:
       --eval_very_hard_multiplier ${dense.eval_very_hard_multiplier}
       --eval_easy_multiplier ${dense.eval_easy_multiplier}
       --max_repeat ${dense.max_repeat}
-      --drop_incorrect
+      --hard_boxed_answer_total_nll ${dense.hard_boxed_answer_total_nll}
+      --very_hard_boxed_answer_total_nll ${dense.very_hard_boxed_answer_total_nll}
+      --easy_boxed_answer_total_nll ${dense.easy_boxed_answer_total_nll}
       --shuffle
       --seed ${train.seed}
     deps:
@@ -143,6 +145,9 @@ stages:
       - ${model.sft_output_dir}/eval_telemetry
       - src/build_dense_dataset.py
     params:
+      - dense.hard_boxed_answer_total_nll
+      - dense.very_hard_boxed_answer_total_nll
+      - dense.easy_boxed_answer_total_nll
       - dense.label_weights
       - dense.train_hard_multiplier
       - dense.train_very_hard_multiplier

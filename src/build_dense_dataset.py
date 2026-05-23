@@ -6,8 +6,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.log import logger
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -38,16 +36,19 @@ def parse_args():
     parser.add_argument("--hard_p05_logprob", type=float, default=-0.50)
     parser.add_argument("--hard_token_ratio", type=float, default=0.02)
     parser.add_argument("--hard_boxed_answer_mean_nll", type=float, default=0.08)
+    parser.add_argument("--hard_boxed_answer_total_nll", type=float, default=0.80)
 
     parser.add_argument("--very_hard_mean_nll", type=float, default=0.18)
     parser.add_argument("--very_hard_p05_logprob", type=float, default=-1.00)
     parser.add_argument("--very_hard_token_ratio", type=float, default=0.08)
     parser.add_argument("--very_hard_boxed_answer_mean_nll", type=float, default=0.15)
+    parser.add_argument("--very_hard_boxed_answer_total_nll", type=float, default=1.60)
 
     parser.add_argument("--easy_mean_nll", type=float, default=0.02)
     parser.add_argument("--easy_near_zero_token_ratio", type=float, default=0.97)
     parser.add_argument("--easy_hard_token_ratio", type=float, default=0.01)
     parser.add_argument("--easy_boxed_answer_mean_nll", type=float, default=0.02)
+    parser.add_argument("--easy_boxed_answer_total_nll", type=float, default=0.20)
 
     parser.add_argument("--drop_incorrect", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -137,8 +138,12 @@ def load_telemetry(telemetry_dir, prefix):
         "p05_logprob",
         "hard_token_ratio",
         "near_zero_token_ratio",
+        "boxed_answer_num_tokens",
         "boxed_answer_mean_nll",
+        "boxed_answer_min_logprob",
+        "boxed_answer_p05_logprob",
         "boxed_answer_hard_token_ratio",
+        "boxed_answer_near_zero_token_ratio",
         "cot_mean_nll",
         "cot_hard_token_ratio",
         "format_mean_nll",
@@ -162,16 +167,30 @@ def load_telemetry(telemetry_dir, prefix):
 
     df = df.drop_duplicates(subset=["id"], keep="last").copy()
 
+    df["boxed_answer_total_nll"] = (
+        df["boxed_answer_mean_nll"].fillna(0)
+        * df["boxed_answer_num_tokens"].fillna(0)
+    )
+
+    df["boxed_answer_total_nll_norm"] = (df["boxed_answer_total_nll"] / 8.0).clip(lower=0, upper=1)
+
+    df["boxed_answer_sequence_prob_est"] = np.exp(
+        -df["boxed_answer_total_nll"].clip(lower=0, upper=50)
+    )
+
+    # mean_nll is auxiliary here. Answer/sequence-level signals matter more for exact-match tasks.
     df[f"{prefix}_difficulty_score"] = (
-        0.50 * df["mean_nll"].fillna(0)
-        + 0.30 * (-df["p05_logprob"]).clip(lower=0).fillna(0)
+        0.20 * df["mean_nll"].fillna(0)
+        + 0.20 * (-df["p05_logprob"]).clip(lower=0).fillna(0)
         + 0.20 * df["hard_token_ratio"].fillna(0)
-        + 0.20 * df["boxed_answer_mean_nll"].fillna(0)
+        + 0.25 * df["boxed_answer_mean_nll"].fillna(0)
+        + 0.15 * df["boxed_answer_total_nll_norm"].fillna(0)
     )
 
     df[f"{prefix}_answer_score"] = (
         df["boxed_answer_mean_nll"].fillna(0)
         + df["boxed_answer_hard_token_ratio"].fillna(0)
+        + df["boxed_answer_total_nll_norm"].fillna(0)
     )
 
     df[f"{prefix}_cot_score"] = (
@@ -191,7 +210,14 @@ def load_telemetry(telemetry_dir, prefix):
         "p05_logprob": f"{prefix}_p05_logprob",
         "hard_token_ratio": f"{prefix}_hard_token_ratio",
         "near_zero_token_ratio": f"{prefix}_near_zero_token_ratio",
+        "boxed_answer_num_tokens": f"{prefix}_boxed_answer_num_tokens",
         "boxed_answer_mean_nll": f"{prefix}_boxed_answer_mean_nll",
+        "boxed_answer_min_logprob": f"{prefix}_boxed_answer_min_logprob",
+        "boxed_answer_p05_logprob": f"{prefix}_boxed_answer_p05_logprob",
+        "boxed_answer_hard_token_ratio": f"{prefix}_boxed_answer_hard_token_ratio",
+        "boxed_answer_total_nll": f"{prefix}_boxed_answer_total_nll",
+        "boxed_answer_total_nll_norm": f"{prefix}_boxed_answer_total_nll_norm",
+        "boxed_answer_sequence_prob_est": f"{prefix}_boxed_answer_sequence_prob_est",
         "cot_mean_nll": f"{prefix}_cot_mean_nll",
         "format_mean_nll": f"{prefix}_format_mean_nll",
     }
@@ -214,27 +240,43 @@ def add_hard_flags(df, prefix, args):
     hard_token_ratio = df[f"{prefix}_hard_token_ratio"]
     near_zero_token_ratio = df[f"{prefix}_near_zero_token_ratio"]
     boxed_answer_mean_nll = df[f"{prefix}_boxed_answer_mean_nll"]
+    boxed_answer_total_nll = df[f"{prefix}_boxed_answer_total_nll"]
+
+    answer_hard = (
+        (boxed_answer_mean_nll >= args.hard_boxed_answer_mean_nll)
+        | (boxed_answer_total_nll >= args.hard_boxed_answer_total_nll)
+    )
+
+    answer_very_hard = (
+        (boxed_answer_mean_nll >= args.very_hard_boxed_answer_mean_nll)
+        | (boxed_answer_total_nll >= args.very_hard_boxed_answer_total_nll)
+    )
+
+    general_hard = (
+        (mean_nll >= args.hard_mean_nll)
+        | (p05_logprob < args.hard_p05_logprob)
+        | (hard_token_ratio >= args.hard_token_ratio)
+    )
+
+    general_very_hard = (
+        (mean_nll >= args.very_hard_mean_nll)
+        | (p05_logprob < args.very_hard_p05_logprob)
+        | (hard_token_ratio >= args.very_hard_token_ratio)
+    )
 
     df[f"{prefix}_is_easy"] = (
         (mean_nll < args.easy_mean_nll)
         & (near_zero_token_ratio > args.easy_near_zero_token_ratio)
         & (hard_token_ratio < args.easy_hard_token_ratio)
         & (boxed_answer_mean_nll.isna() | (boxed_answer_mean_nll < args.easy_boxed_answer_mean_nll))
+        & (boxed_answer_total_nll.isna() | (boxed_answer_total_nll < args.easy_boxed_answer_total_nll))
     )
 
-    df[f"{prefix}_is_hard"] = (
-        (mean_nll >= args.hard_mean_nll)
-        | (p05_logprob < args.hard_p05_logprob)
-        | (hard_token_ratio >= args.hard_token_ratio)
-        | (boxed_answer_mean_nll >= args.hard_boxed_answer_mean_nll)
-    )
-
-    df[f"{prefix}_is_very_hard"] = (
-        (mean_nll >= args.very_hard_mean_nll)
-        | (p05_logprob < args.very_hard_p05_logprob)
-        | (hard_token_ratio >= args.very_hard_token_ratio)
-        | (boxed_answer_mean_nll >= args.very_hard_boxed_answer_mean_nll)
-    )
+    # mean_nll contributes via general_hard, but answer_hard can independently trigger repeats.
+    df[f"{prefix}_is_hard"] = general_hard | answer_hard
+    df[f"{prefix}_is_very_hard"] = general_very_hard | answer_very_hard
+    df[f"{prefix}_is_answer_hard"] = answer_hard
+    df[f"{prefix}_is_answer_very_hard"] = answer_very_hard
 
     return df
 
@@ -252,8 +294,14 @@ def label_weight(row, label_weights, source_weights, source_label_weights):
 
 
 def apply_telemetry_multiplier(row, prefix, hard_multiplier, very_hard_multiplier, easy_multiplier):
+    if f"{prefix}_is_answer_very_hard" in row and bool(row[f"{prefix}_is_answer_very_hard"]):
+        return very_hard_multiplier
+
     if f"{prefix}_is_very_hard" in row and bool(row[f"{prefix}_is_very_hard"]):
         return very_hard_multiplier
+
+    if f"{prefix}_is_answer_hard" in row and bool(row[f"{prefix}_is_answer_hard"]):
+        return hard_multiplier
 
     if f"{prefix}_is_hard" in row and bool(row[f"{prefix}_is_hard"]):
         return hard_multiplier
@@ -311,11 +359,13 @@ def build_report(df, dense_df, args):
         report["train_hard_rows"] = int(df["train_is_hard"].fillna(False).sum())
         report["train_very_hard_rows"] = int(df["train_is_very_hard"].fillna(False).sum())
         report["train_easy_rows"] = int(df["train_is_easy"].fillna(False).sum())
+        report["train_answer_hard_rows"] = int(df["train_is_answer_hard"].fillna(False).sum())
 
     if "eval_is_hard" in df.columns:
         report["eval_hard_rows"] = int(df["eval_is_hard"].fillna(False).sum())
         report["eval_very_hard_rows"] = int(df["eval_is_very_hard"].fillna(False).sum())
         report["eval_easy_rows"] = int(df["eval_is_easy"].fillna(False).sum())
+        report["eval_answer_hard_rows"] = int(df["eval_is_answer_hard"].fillna(False).sum())
 
     return report
 
@@ -440,9 +490,9 @@ def main():
 
     examples_report.to_csv(examples_report_path, index=False)
 
-    logger.info(f"Saved dense dataset: {args.output_path}")
-    logger.info(f"Saved report: {report_path}")
-    logger.info(f"Saved examples report: {examples_report_path}")
+    print(f"Saved dense dataset: {args.output_path}")
+    print(f"Saved report: {report_path}")
+    print(f"Saved examples report: {examples_report_path}")
 
 
 if __name__ == "__main__":

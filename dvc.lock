@@ -162,3 +162,64 @@ stages:
       md5: 96efb0beb50c3ee98510d425ff10626f.dir
       size: 982963
       nfiles: 5
+  build_dense_dataset:
+    cmd: "python -m src.build_dense_dataset --input_path data/generated/train_with_syntetic.csv
+      --output_path data/densed/train_densed.csv --train_telemetry_dir models/sft_v0.0.13/train_telemetry
+      --eval_telemetry_dir models/sft_v0.0.13/eval_telemetry --label_weights '{\"\
+      cryptarithm\": 5.0, \"bit manipulation\": 4.0, \"numeral equations\": 3.0, \"\
+      encryption\": 1.3, \"string\": 0.5, \"unit conversion\": 0.5, \"gravitational\"\
+      : 0.5, \"conversion to diff numeral system\": 0.5}' --train_hard_multiplier
+      1.0 --train_very_hard_multiplier 1.1 --train_easy_multiplier 0.75 --eval_hard_multiplier
+      1.0 --eval_very_hard_multiplier 1.0 --eval_easy_multiplier 1.0 --max_repeat
+      6 --hard_boxed_answer_total_nll 0.8 --very_hard_boxed_answer_total_nll 1.6 --easy_boxed_answer_total_nll
+      0.2 --shuffle --seed 31231\n"
+    deps:
+    - path: data/generated/train_with_syntetic.csv
+      hash: md5
+      md5: 33973c1dd3e67de978ad8b318b9e7746
+      size: 22894589
+    - path: models/sft_v0.0.13/eval_telemetry
+      hash: md5
+      md5: ba5135204f0802bbf94ede8ea6cdb87a.dir
+      size: 12336544
+      nfiles: 6
+    - path: models/sft_v0.0.13/train_telemetry
+      hash: md5
+      md5: 453ac74cc82812c130be90ccc94bd4c3.dir
+      size: 26977140
+      nfiles: 7
+    - path: models/sft_v0.0.13_eval_telemetry_analysis
+      hash: md5
+      md5: 96efb0beb50c3ee98510d425ff10626f.dir
+      size: 982963
+      nfiles: 5
+    - path: models/sft_v0.0.13_train_telemetry_analysis
+      hash: md5
+      md5: e4f18caa13651a87c19d67507a3e43e3.dir
+      size: 1628512
+      nfiles: 5
+    - path: src/build_dense_dataset.py
+      hash: md5
+      md5: 0e540dd753d1d50bed7bde1eb8e864ec
+      size: 17305
+    params:
+      params.yaml:
+        dense.easy_boxed_answer_total_nll: 0.2
+        dense.eval_easy_multiplier: 1.0
+        dense.eval_hard_multiplier: 1.0
+        dense.eval_very_hard_multiplier: 1.0
+        dense.hard_boxed_answer_total_nll: 0.8
+        dense.label_weights: '{"cryptarithm": 5.0, "bit manipulation": 4.0, "numeral
+          equations": 3.0, "encryption": 1.3, "string": 0.5, "unit conversion": 0.5,
+          "gravitational": 0.5, "conversion to diff numeral system": 0.5}'
+        dense.max_repeat: 6
+        dense.train_easy_multiplier: 0.75
+        dense.train_hard_multiplier: 1.0
+        dense.train_very_hard_multiplier: 1.1
+        dense.very_hard_boxed_answer_total_nll: 1.6
+        train.seed: 31231
+    outs:
+    - path: data/densed/train_densed.csv
+      hash: md5
+      md5: 9e313210b9c37a374e4ff22d6f9952ca
+      size: 53803674
