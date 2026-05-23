@@ -58,8 +58,8 @@ def main():
 
     multipliers = {
         "bit manipulation": 0.5,
-        "cryptarithm": 0.7,
-        "equations_numeric": 0.7,
+        "cryptarithm": 3.5,
+        "numeral equations": 2.0,
         "encryption": 0.5,
     }
 
@@ -67,7 +67,7 @@ def main():
     equations_cryptarithm_generator = CryptarithmTaskGenerator(seed=args.seed)
 
     equations_cryptarithm_dataset = equations_cryptarithm_generator.generate_dataset(
-        num_samples=int(len(data[data.label == "equations transformation"]) * multipliers["cryptarithm"]),
+        num_samples=int(len(data[data.label == "cryptarithm"]) * multipliers["cryptarithm"]),
         mode="random",
         nb_workers=24,
         progress_bar=False,
@@ -80,10 +80,10 @@ def main():
     equations_ast_generator = ASTBruteForceTaskGenerator(seed=args.seed)
 
     equations_ast_dataset = equations_ast_generator.generate_dataset(
-        num_samples=int(len(data[data.label == "equations transformation"]) * multipliers["equations_numeric"]),
+        num_samples=int(len(data[data.label == "numeral equations"]) * multipliers["numeral equations"]),
         nb_workers=24,
         progress_bar=False,
-        label="equations transformation"
+        label="numeral equations"
     )
     logger.info("\nNumeric equations generator:")
     logger.info(equations_ast_dataset.columns.tolist())

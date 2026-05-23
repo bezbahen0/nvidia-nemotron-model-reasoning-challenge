@@ -650,7 +650,7 @@ class CryptarithmTaskGenerator:
             "solver_timeout_seconds": solver_timeout_seconds,
             "max_attempts_per_sample": max_attempts_per_sample,
             "require_solver_success": require_solver_success,
-            "label": "equations transformation",
+            "label": "cryptarithm",
         }
 
         if use_parallel and nb_workers != 1 and pandarallel is not None:

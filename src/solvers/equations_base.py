@@ -55,7 +55,7 @@ class BaseEquationSolver:
                             cot.append("Let's analyze the examples with this operator.")
             
                             cot.append(f"Example '{line}' is a string concatenation: left '{left}' + right '{right}' = '{rhs_clean}'.")
-                            return "Pseudo-Math (Format/String)", cot
+                            return "string", cot
 
                         # Reverse concatenation of operands (A + B = BA)
                         if rhs_clean == "".join(reversed(operands)):
@@ -63,7 +63,7 @@ class BaseEquationSolver:
                             cot.append("Let's analyze the examples with this operator.")
             
                             cot.append(f"Example '{line}' is a reversed string concatenation: right '{right}' + left '{left}' = '{rhs_clean}'.")
-                            return "Pseudo-Math (Format/String)", cot
+                            return "string", cot
 
                         # Full character-by-character reverse of direct concatenation (rare, but happens: AB -> BA)
                         if rhs_clean == "".join(operands)[::-1]:
@@ -71,17 +71,17 @@ class BaseEquationSolver:
                             cot.append("Let's analyze the examples with this operator.")
             
                             cot.append(f"Example '{line}' is a fully reversed string concatenation: ('{left}' + '{right}') reversed = '{rhs_clean}'.")
-                            return "Pseudo-Math (Format/String)", cot
+                            return "string", cot
 
         # If there are no digits at all and it's not string concatenation, route to cryptarithm
         if not re.search(r'\d', examples):
             #cot.append("There are no digits in the examples. This implies it is a cryptarithm; we need to decode the encrypted operations and values to calculate the result.")
-            return "Cryptarithm (CSP)", []
+            return "cryptarithm", []
         
         #cot.append("The examples contain digits, suggesting we simply need to deduce the hidden mathematical operations encoded by the operators.")
         
         # 3. Everything else
-        return "AST Brute-force", []
+        return "numeral equations", []
 
     def solve(self, prompt: str) -> Optional[str]:
         examples, target = self._extract_sections(prompt)
@@ -91,11 +91,11 @@ class BaseEquationSolver:
         task_type, _ = self._classify_task(examples, target)
         
         # Delegate to the specific solver depending on the task class
-        if task_type == "AST Brute-force":
+        if task_type == "numeral equations":
             return self.ast_solver.solve(examples, target)
-        elif task_type == "Cryptarithm (CSP)":
+        elif task_type == "cryptarithm":
             return self.csp_solver.solve(examples, target)
-        elif task_type == "Pseudo-Math (Format/String)":
+        elif task_type == "string":
             return self.string_solver.solve(examples, target)
             
         return None
@@ -106,8 +106,13 @@ class BaseEquationSolver:
         
         matches = re.findall(r"(?i)final\s+answer:\s*(.+)", cot_text)
         return matches[-1].strip() if matches else "nan"
+    
+    def classify(self, prompt):
+        examples, target = self._extract_sections(prompt)
+        task_type, _ = self._classify_task(examples, target)
+        return task_type
 
-    def generate_cot(self, prompt: str) -> str:
+    def generate_cot(self, prompt: str, return_class=False) -> str:
         examples, target = self._extract_sections(prompt)
         #cot = [f"Based on the examples, we need to determine the result for: {target}."]
         cot = []
@@ -117,11 +122,11 @@ class BaseEquationSolver:
         task_type, class_cot = self._classify_task(examples, target)
         cot.extend(class_cot)
         
-        if task_type == "AST Brute-force":
+        if task_type == "numeral equations":
             result = self.ast_solver.solve(examples, target)
-        elif task_type == "Cryptarithm (CSP)":
+        elif task_type == "cryptarithm":
             result = self.csp_solver.solve(examples, target)
-        elif task_type == "Pseudo-Math (Format/String)":
+        elif task_type == "string":
             result = self.string_solver.solve(examples, target)
         else:
             cot += ["I can't solve this type of problem"]
@@ -130,4 +135,5 @@ class BaseEquationSolver:
         
         cot += result["debug"]
         cot.append(f"\nFinal answer: {result['answer']}")
+
         return "\n".join(cot)

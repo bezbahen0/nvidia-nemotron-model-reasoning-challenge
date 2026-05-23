@@ -3,6 +3,7 @@ data:
   raw_working: data/solved/train-cot.csv
   train_prepared: data/prepared/train_stratified.csv
   train_generated: data/generated/train_with_syntetic.csv
+  train_dense: data/densed/train_densed.csv
   val_prepared: data/prepared/val_stratified.csv
   dataset_name: algorithmic_cot
   
@@ -28,3 +29,35 @@ train:
 
 wandb:
   wandb_base_run_name: sft_v0.0.13
+
+dense:
+  label_weights: '{"encryption": 1.5, "bit manipulation": 4.0, "gravitational": 0.3, "unit conversion": 0.3, "numeral equations": 4.0, "conversion to diff numeral system": 0.2, "cryptarithm": 6.0, "string": 2.0}'
+  source_weights: '{"generated": 1.0, "solver": 1.0}'
+  source_label_weights: '{}'
+
+  base_weight: 1.0
+  max_repeat: 8
+  min_repeat: 0
+
+  train_hard_multiplier: 1.5
+  train_very_hard_multiplier: 2.0
+  train_easy_multiplier: 0.5
+
+  eval_hard_multiplier: 2.0
+  eval_very_hard_multiplier: 3.0
+  eval_easy_multiplier: 0.7
+
+  hard_mean_nll: 0.08
+  hard_p05_logprob: -0.50
+  hard_token_ratio: 0.02
+  hard_boxed_answer_mean_nll: 0.08
+
+  very_hard_mean_nll: 0.18
+  very_hard_p05_logprob: -1.00
+  very_hard_token_ratio: 0.08
+  very_hard_boxed_answer_mean_nll: 0.15
+
+  easy_mean_nll: 0.02
+  easy_near_zero_token_ratio: 0.97
+  easy_hard_token_ratio: 0.01
+  easy_boxed_answer_mean_nll: 0.02

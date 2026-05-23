@@ -49,6 +49,7 @@ def parse_args():
 
     # telemetry
     parser.add_argument("--train_telemetry", action="store_true")
+    parser.add_argument("--eval_telemetry", action="store_true")
     
     return parser.parse_args()
 
@@ -65,8 +66,8 @@ class TimeLimitCallback(TrainerCallback):
             control.should_save = True
 
 
-def load_train_metadata(train_path):
-    df = pd.read_csv(train_path)
+def load_metadata(data_path):
+    df = pd.read_csv(data_path)
 
     metadata = {}
 
@@ -113,28 +114,40 @@ class TelemetrySFTTrainer(SFTTrainer):
     def __init__(
         self,
         *args,
-        telemetry_metadata=None,
-        telemetry_output_dir=None,
+        train_telemetry_metadata=None,
+        eval_telemetry_metadata=None,
+        train_telemetry_output_dir=None,
+        eval_telemetry_output_dir=None,
         telemetry_save_steps=50,
-        telemetry_enabled=True,
+        train_telemetry_enabled=True,
+        eval_telemetry_enabled=True,
         telemetry_tokenizer=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
 
-        self.telemetry_metadata = telemetry_metadata or {}
-        self.telemetry_output_dir = telemetry_output_dir
+        self.train_telemetry_metadata = train_telemetry_metadata or {}
+        self.eval_telemetry_metadata = eval_telemetry_metadata or {}
+        
+        self.train_telemetry_output_dir = train_telemetry_output_dir
+        self.eval_telemetry_output_dir = eval_telemetry_output_dir
+        
         self.telemetry_save_steps = int(telemetry_save_steps)
-        self.telemetry_enabled = bool(telemetry_enabled)
+        self.train_telemetry_enabled = bool(train_telemetry_enabled)
+        self.eval_telemetry_enabled = bool(eval_telemetry_enabled)
+        
         self.telemetry_tokenizer = telemetry_tokenizer
         self.telemetry_top_bad_tokens_count = 5
         self.telemetry_context_window_tokens = 8
-
-        self.telemetry_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-
-        if self.telemetry_output_dir is not None:
-            os.makedirs(self.telemetry_output_dir, exist_ok=True)
         
+        self.telemetry_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        
+        if self.train_telemetry_output_dir is not None:
+            os.makedirs(self.train_telemetry_output_dir, exist_ok=True)
+        
+        if self.eval_telemetry_output_dir is not None:
+            os.makedirs(self.eval_telemetry_output_dir, exist_ok=True)
+                
         base_data_collator = self.data_collator
 
         def telemetry_data_collator(features):
@@ -176,12 +189,28 @@ class TelemetrySFTTrainer(SFTTrainer):
                 return_outputs=True,
             )
 
-        if self.telemetry_enabled and model.training and source_row_index is not None:
-            self._write_train_batch_telemetry(
+        is_train = bool(model.training)
+
+        if is_train:
+            telemetry_enabled = self.train_telemetry_enabled
+            telemetry_split = "train"
+            telemetry_metadata = self.train_telemetry_metadata
+            telemetry_output_dir = self.train_telemetry_output_dir
+        else:
+            telemetry_enabled = self.eval_telemetry_enabled
+            telemetry_split = "eval"
+            telemetry_metadata = self.eval_telemetry_metadata
+            telemetry_output_dir = self.eval_telemetry_output_dir
+
+        if telemetry_enabled and source_row_index is not None:
+            self._write_batch_telemetry(
                 outputs=outputs,
                 labels=inputs.get("labels"),
                 input_ids=inputs.get("input_ids"),
                 source_row_index=source_row_index,
+                split=telemetry_split,
+                metadata=telemetry_metadata,
+                output_dir=telemetry_output_dir,
             )
 
         if return_outputs:
@@ -339,8 +368,8 @@ class TelemetrySFTTrainer(SFTTrainer):
 
         return top_bad_tokens
 
-    def _write_train_batch_telemetry(self, outputs, labels, input_ids, source_row_index):
-        if self.telemetry_output_dir is None:
+    def _write_batch_telemetry(self, outputs, labels, input_ids, source_row_index, split, metadata, output_dir):
+        if output_dir is None:
             return
 
         if labels is None:
@@ -352,17 +381,22 @@ class TelemetrySFTTrainer(SFTTrainer):
         if not hasattr(outputs, "logits"):
             return
 
-        if self.telemetry_save_steps <= 0:
-            checkpoint_bucket = int(self.state.global_step)
-        else:
-            checkpoint_bucket = (
-                (int(self.state.global_step) // self.telemetry_save_steps) + 1
-            ) * self.telemetry_save_steps
+        global_step = int(self.state.global_step)
 
-        path = os.path.join(
-            self.telemetry_output_dir,
-            f"train_until_checkpoint-{checkpoint_bucket}_rank-{self.telemetry_rank}.jsonl",
-        )
+        if split == "train":
+            if self.telemetry_save_steps <= 0:
+                checkpoint_bucket = global_step
+            else:
+                checkpoint_bucket = ((global_step // self.telemetry_save_steps) + 1) * self.telemetry_save_steps
+        else:
+            checkpoint_bucket = global_step
+
+        if split == "train":
+            file_name = f"train_until_checkpoint-{checkpoint_bucket}_rank-{self.telemetry_rank}.jsonl"
+        else:
+            file_name = f"eval_at_checkpoint-{checkpoint_bucket}_rank-{self.telemetry_rank}.jsonl"
+        
+        path = os.path.join(output_dir, file_name)
 
         with torch.no_grad():
             logits = outputs.logits.detach().float()
@@ -398,7 +432,7 @@ class TelemetrySFTTrainer(SFTTrainer):
                 valid_token_ids = shift_input_ids[batch_index][current_valid_mask].detach().cpu().tolist()
 
                 row_index = int(source_row_indexes[batch_index])
-                metadata = self.telemetry_metadata.get(
+                metadata_item = metadata.get(
                     row_index,
                     {
                         "id": str(row_index),
@@ -412,10 +446,11 @@ class TelemetrySFTTrainer(SFTTrainer):
                         "step": int(self.state.global_step),
                         "epoch": None if self.state.epoch is None else float(self.state.epoch),
                         "checkpoint_bucket": int(checkpoint_bucket),
+                        "split": split,
                         "source_row_index": row_index,
-                        "id": metadata["id"],
-                        "source": metadata["source"],
-                        "label": metadata["label"],
+                        "id": metadata_item["id"],
+                        "source": metadata_item["source"],
+                        "label": metadata_item["label"],
                         "num_loss_tokens": 0,
                         "total_loss": None,
                         "mean_nll": None,
@@ -450,10 +485,11 @@ class TelemetrySFTTrainer(SFTTrainer):
                         "step": int(self.state.global_step),
                         "epoch": None if self.state.epoch is None else float(self.state.epoch),
                         "checkpoint_bucket": int(checkpoint_bucket),
+                        "split": split,
                         "source_row_index": row_index,
-                        "id": metadata["id"],
-                        "source": metadata["source"],
-                        "label": metadata["label"],
+                        "id": metadata_item["id"],
+                        "source": metadata_item["source"],
+                        "label": metadata_item["label"],
                         "num_loss_tokens": num_loss_tokens,
                         "total_loss": total_loss,
                         "mean_nll": mean_nll,
@@ -502,12 +538,13 @@ def main():
     logger.info("Подготовка тренировочного датасета, так же не используем для обучения промпты где solver не дал правильный ответ...")
     train_dataset = prepare_dataset(args.train_path)
     logger.info(f"train dataset final len: {len(train_dataset)}")
-    train_metadata = load_train_metadata(args.train_path)
+    train_metadata = load_metadata(args.train_path)
 
     
     logger.info("Подготовка валидационного датасета, так же не используем для валидации промпты где solver не дал правильный ответ...")
     val_dataset = prepare_dataset(args.val_path, eval=True)
     logger.info(f"val dataset final len: {len(val_dataset)}")
+    eval_metadata = load_metadata(args.val_path)
 
     logger.info("Загрузка модели в bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -564,7 +601,8 @@ def main():
         run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
     )
 
-    telemetry_output_dir = os.path.join(args.output_dir, "train_telemetry")
+    train_telemetry_output_dir = os.path.join(args.output_dir, "train_telemetry")
+    eval_telemetry_output_dir = os.path.join(args.output_dir, "eval_telemetry")
 
     trainer = TelemetrySFTTrainer(
         model=model,
@@ -573,10 +611,13 @@ def main():
         peft_config=lora_config,
         args=training_args,
         callbacks=[TimeLimitCallback(max_hours=args.max_hours)],
-        telemetry_metadata=train_metadata,
-        telemetry_output_dir=telemetry_output_dir,
+        train_telemetry_metadata=train_metadata,
+        eval_telemetry_metadata=eval_metadata,
+        train_telemetry_output_dir=train_telemetry_output_dir,
+        eval_telemetry_output_dir=eval_telemetry_output_dir,
         telemetry_save_steps=args.eval_steps,
-        telemetry_enabled=args.train_telemetry,
+        train_telemetry_enabled=args.train_telemetry,
+        eval_telemetry_enabled=args.eval_telemetry,
         telemetry_tokenizer=tokenizer,
     )
 
