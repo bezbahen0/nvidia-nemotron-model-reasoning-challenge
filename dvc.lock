@@ -10,18 +10,18 @@ stages:
       size: 3069304
     - path: src/generate_cot.py
       hash: md5
-      md5: fc2b5071d17a62e3a41054b289d36b79
-      size: 5362
+      md5: 5993f6e8d3759b07e8792ad5272930b3
+      size: 5634
     - path: src/solvers
       hash: md5
-      md5: 2e5a56f03721d87b0068827b69f60c1e.dir
-      size: 268090
+      md5: a17003d82a97f228e30c446b6ee12867.dir
+      size: 268435
       nfiles: 22
     outs:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: eb9ae7b9e51cebe22ec5cb6bedc1c78a
-      size: 16964497
+      md5: 8b5f1a9fa5f067525df912ce695f671c
+      size: 16996305
   split_data:
     cmd: "python -m src.split_data --data_path data/solved/train-cot.csv --train_path
       data/prepared/train_stratified.csv --seed 31231 --val_path data/prepared/val_stratified.csv
@@ -29,12 +29,12 @@ stages:
     deps:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: eb9ae7b9e51cebe22ec5cb6bedc1c78a
-      size: 16964497
+      md5: 8b5f1a9fa5f067525df912ce695f671c
+      size: 16996305
     - path: src/split_data.py
       hash: md5
-      md5: c13aae0165db013d5df032bed463e111
-      size: 2420
+      md5: 76996cca37670c38647a078f69767e18
+      size: 2468
     params:
       params.yaml:
         split.val_size: 0.1
@@ -42,12 +42,12 @@ stages:
     outs:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 9b05b21babdce5af4c1e03dfd9b3ab1a
-      size: 15262825
+      md5: 3026ce9140869cce486b0c11696f9218
+      size: 15301153
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: ca5c1c32b85da196ed3cac8fb5512798
-      size: 1700395
+      md5: 7891e94d9a995f2de1efa9e24127698c
+      size: 1700551
   prepare_data:
     cmd: "python -m src.prepare_dataset --data_path data/prepared/train_stratified.csv
       --output_path data/generated/train_with_syntetic.csv --seed 31231 --tokenizer_path
@@ -55,12 +55,12 @@ stages:
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 9b05b21babdce5af4c1e03dfd9b3ab1a
-      size: 15262825
+      md5: 3026ce9140869cce486b0c11696f9218
+      size: 15301153
     - path: src/prepare_dataset.py
       hash: md5
-      md5: 0472a10e18fe8610049451fa03f8ead2
-      size: 5698
+      md5: 88b14a204347710cfde0b1c6fbc5bcc7
+      size: 5671
     params:
       params.yaml:
         model.id: 
@@ -69,8 +69,8 @@ stages:
     outs:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 8185540a63e4538210ee18c1e73e0a1b
-      size: 20367200
+      md5: 33973c1dd3e67de978ad8b318b9e7746
+      size: 22894589
   sft_train:
     cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.13 --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
       --data algorithmic_cot --train_path data/generated/train_with_syntetic.csv --seed
@@ -112,3 +112,46 @@ stages:
       md5: f4137497ea03e821c6234cfa68c2cc1f.dir
       size: 14265627484
       nfiles: 37
+  base_sft_train:
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.13_base_sft_train
+      --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
+      --data algorithmic_cot --train_path data/generated/train_with_syntetic.csv --seed
+      31231 --eval_steps 50 --val_path data/prepared/val_stratified.csv --output_dir
+      models/sft_v0.0.13 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours 10.0
+      --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192 --train_telemetry
+      --eval_telemetry\n"
+    deps:
+    - path: data/generated/train_with_syntetic.csv
+      hash: md5
+      md5: 33973c1dd3e67de978ad8b318b9e7746
+      size: 22894589
+    - path: data/prepared/val_stratified.csv
+      hash: md5
+      md5: 7891e94d9a995f2de1efa9e24127698c
+      size: 1700551
+    - path: src/sft_train.py
+      hash: md5
+      md5: 12817f9e842ac307247613c1916bd3fe
+      size: 23787
+    params:
+      params.yaml:
+        data.dataset_name: algorithmic_cot
+        model.id: 
+          /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
+        train.batch_size: 4
+        train.epochs: 1
+        train.eval_steps: 50
+        train.grad_accum: 8
+        train.lora_alpha: 64
+        train.lora_r: 32
+        train.lr: 0.0002
+        train.max_hours: 10.0
+        train.max_seq_len: 8192
+        train.seed: 31231
+        wandb.wandb_base_run_name: sft_v0.0.13
+    outs:
+    - path: models/sft_v0.0.13
+      hash: md5
+      md5: 9d9e635be1fdbd0e05f07325af7748c2.dir
+      size: 14300700429
+      nfiles: 43
