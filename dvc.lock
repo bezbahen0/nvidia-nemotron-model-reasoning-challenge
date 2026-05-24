@@ -223,3 +223,46 @@ stages:
       hash: md5
       md5: 9e313210b9c37a374e4ff22d6f9952ca
       size: 53803674
+  dense_sft_train:
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.13_dense_sft_train
+      --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
+      --data algorithmic_cot_dense --train_path data/densed/train_densed.csv --seed
+      31231 --eval_steps 150 --val_path data/prepared/val_stratified.csv --output_dir
+      models/dense_sft_v0.0.13 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours
+      10.0 --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192\n"
+    deps:
+    - path: data/densed/train_densed.csv
+      hash: md5
+      md5: 9e313210b9c37a374e4ff22d6f9952ca
+      size: 53803674
+    - path: data/prepared/val_stratified.csv
+      hash: md5
+      md5: 7891e94d9a995f2de1efa9e24127698c
+      size: 1700551
+    - path: src/sft_train.py
+      hash: md5
+      md5: 12817f9e842ac307247613c1916bd3fe
+      size: 23787
+    params:
+      params.yaml:
+        data.dataset_name: algorithmic_cot
+        model.dense_sft_output_dir: models/dense_sft_v0.0.13
+        model.id: 
+          /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
+        train.batch_size: 4
+        train.dense_eval_steps: 150
+        train.epochs: 1
+        train.grad_accum: 8
+        train.lora_alpha: 64
+        train.lora_r: 32
+        train.lr: 0.0002
+        train.max_hours: 10.0
+        train.max_seq_len: 8192
+        train.seed: 31231
+        wandb.wandb_base_run_name: sft_v0.0.13
+    outs:
+    - path: models/dense_sft_v0.0.13
+      hash: md5
+      md5: 6dd48dc708d3230521c224f3ad21caf4.dir
+      size: 14261404318
+      nfiles: 30
