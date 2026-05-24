@@ -3,25 +3,65 @@ data:
   raw_working: data/solved/train-cot.csv
   train_prepared: data/prepared/train_stratified.csv
   train_generated: data/generated/train_with_syntetic.csv
+  train_dense: data/densed/train_densed.csv
   val_prepared: data/prepared/val_stratified.csv
   dataset_name: algorithmic_cot
+  
 model:
-  id: /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
-  sft_output_dir: models/sft_v0.0.12
+  id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  sft_output_dir: models/sft_v0.0.13
+  dense_sft_output_dir: models/dense_sft_v0.0.13
+
 split:
   val_size: 0.1
+
 train:
   lr: 2e-4
   batch_size: 4
   grad_accum: 8
   epochs: 1
   seed: 31231
-  eval_steps: 400
+  eval_steps: 50
+  dense_eval_steps: 150
   max_hours: 10.0
   lora_r: 32
   lora_alpha: 64
   max_seq_len: 8192
-evaluate:
-  scores_file: data/scores/validation_scores.json
+
 wandb:
-  wandb_base_run_name: sft_v0.0.12
+  wandb_base_run_name: sft_v0.0.13
+
+dense:
+  label_weights: '{"cryptarithm": 5.0, "bit manipulation": 4.0, "numeral equations": 3.0, "encryption": 1.3, "string": 0.5, "unit conversion": 0.5, "gravitational": 0.5, "conversion to diff numeral system": 0.5}'
+  source_weights: '{"generated": 1.0, "solver": 1.0}'
+  source_label_weights: '{}'
+
+  base_weight: 1.0
+  max_repeat: 6
+  min_repeat: 0
+
+  train_hard_multiplier: 1.0
+  train_very_hard_multiplier: 1.1
+  train_easy_multiplier: 0.75
+
+  eval_hard_multiplier: 1.0
+  eval_very_hard_multiplier: 1.0
+  eval_easy_multiplier: 1.0
+
+  hard_mean_nll: 0.08
+  hard_p05_logprob: -0.50
+  hard_token_ratio: 0.02
+  hard_boxed_answer_mean_nll: 0.08
+  hard_boxed_answer_total_nll: 0.8
+
+  very_hard_mean_nll: 0.18
+  very_hard_p05_logprob: -1.00
+  very_hard_token_ratio: 0.08
+  very_hard_boxed_answer_mean_nll: 0.15
+  very_hard_boxed_answer_total_nll: 1.6
+
+  easy_mean_nll: 0.02
+  easy_near_zero_token_ratio: 0.97
+  easy_hard_token_ratio: 0.01
+  easy_boxed_answer_mean_nll: 0.02
+  easy_boxed_answer_total_nll: 0.2

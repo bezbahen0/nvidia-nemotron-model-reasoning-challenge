@@ -10,18 +10,18 @@ stages:
       size: 3069304
     - path: src/generate_cot.py
       hash: md5
-      md5: fc2b5071d17a62e3a41054b289d36b79
-      size: 5362
+      md5: 5993f6e8d3759b07e8792ad5272930b3
+      size: 5634
     - path: src/solvers
       hash: md5
-      md5: d2b226fc55fbecb87e0aae2f1317d082.dir
-      size: 268090
+      md5: a17003d82a97f228e30c446b6ee12867.dir
+      size: 268435
       nfiles: 22
     outs:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: 8face0b3f80d16df80461cffb2de94a9
-      size: 16964511
+      md5: 8b5f1a9fa5f067525df912ce695f671c
+      size: 16996305
   split_data:
     cmd: "python -m src.split_data --data_path data/solved/train-cot.csv --train_path
       data/prepared/train_stratified.csv --seed 31231 --val_path data/prepared/val_stratified.csv
@@ -29,12 +29,12 @@ stages:
     deps:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: 8face0b3f80d16df80461cffb2de94a9
-      size: 16964511
+      md5: 8b5f1a9fa5f067525df912ce695f671c
+      size: 16996305
     - path: src/split_data.py
       hash: md5
-      md5: c13aae0165db013d5df032bed463e111
-      size: 2420
+      md5: 76996cca37670c38647a078f69767e18
+      size: 2468
     params:
       params.yaml:
         split.val_size: 0.1
@@ -42,12 +42,12 @@ stages:
     outs:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 9767a366c2d60d9840feb27886aae580
-      size: 15262834
+      md5: 3026ce9140869cce486b0c11696f9218
+      size: 15301153
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 33a85d93bc0ec5df65f4c1a6ed78e012
-      size: 1700400
+      md5: 7891e94d9a995f2de1efa9e24127698c
+      size: 1700551
   prepare_data:
     cmd: "python -m src.prepare_dataset --data_path data/prepared/train_stratified.csv
       --output_path data/generated/train_with_syntetic.csv --seed 31231 --tokenizer_path
@@ -55,12 +55,12 @@ stages:
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 9767a366c2d60d9840feb27886aae580
-      size: 15262834
+      md5: 3026ce9140869cce486b0c11696f9218
+      size: 15301153
     - path: src/prepare_dataset.py
       hash: md5
-      md5: b4d1707251f6721d0d18abd78fa43413
-      size: 5004
+      md5: 88b14a204347710cfde0b1c6fbc5bcc7
+      size: 5671
     params:
       params.yaml:
         model.id: 
@@ -69,27 +69,29 @@ stages:
     outs:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 3ed5eb5c7977cc3e6617dab5eaeafabb
-      size: 20849628
-  sft_train:
-    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.12 --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
+      md5: 33973c1dd3e67de978ad8b318b9e7746
+      size: 22894589
+  base_sft_train:
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.13_base_sft_train
+      --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
       --data algorithmic_cot --train_path data/generated/train_with_syntetic.csv --seed
-      31231 --eval_steps 400 --val_path data/prepared/val_stratified.csv --output_dir
-      models/sft_v0.0.12 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours 10.0
-      --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192\n"
+      31231 --eval_steps 50 --val_path data/prepared/val_stratified.csv --output_dir
+      models/sft_v0.0.13 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours 10.0
+      --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192 --train_telemetry
+      --eval_telemetry\n"
     deps:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 3ed5eb5c7977cc3e6617dab5eaeafabb
-      size: 20849628
+      md5: 33973c1dd3e67de978ad8b318b9e7746
+      size: 22894589
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 33a85d93bc0ec5df65f4c1a6ed78e012
-      size: 1700400
+      md5: 7891e94d9a995f2de1efa9e24127698c
+      size: 1700551
     - path: src/sft_train.py
       hash: md5
-      md5: a9f679874ff2afa0e9554fdc4ee554f8
-      size: 7433
+      md5: 12817f9e842ac307247613c1916bd3fe
+      size: 23787
     params:
       params.yaml:
         data.dataset_name: algorithmic_cot
@@ -97,7 +99,7 @@ stages:
           /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
         train.batch_size: 4
         train.epochs: 1
-        train.eval_steps: 400
+        train.eval_steps: 50
         train.grad_accum: 8
         train.lora_alpha: 64
         train.lora_r: 32
@@ -105,10 +107,162 @@ stages:
         train.max_hours: 10.0
         train.max_seq_len: 8192
         train.seed: 31231
-        wandb.wandb_base_run_name: sft_v0.0.12
+        wandb.wandb_base_run_name: sft_v0.0.13
     outs:
-    - path: models/sft_v0.0.12
+    - path: models/sft_v0.0.13
       hash: md5
-      md5: 73d911628a75fc9a21bece6688eb7313.dir
-      size: 8907888851
-      nfiles: 19
+      md5: 9d9e635be1fdbd0e05f07325af7748c2.dir
+      size: 14300700429
+      nfiles: 43
+  analyze_sft_train_telemetry:
+    cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.13/train_telemetry
+      --train_path data/generated/train_with_syntetic.csv --output_dir models/sft_v0.0.13_train_telemetry_analysis
+      --use_all_records\n"
+    deps:
+    - path: data/generated/train_with_syntetic.csv
+      hash: md5
+      md5: 33973c1dd3e67de978ad8b318b9e7746
+      size: 22894589
+    - path: models/sft_v0.0.13
+      hash: md5
+      md5: 9d9e635be1fdbd0e05f07325af7748c2.dir
+      size: 14300700429
+      nfiles: 43
+    - path: src/analyze_sft_telemetry.py
+      hash: md5
+      md5: d59e3a69f64f557825d28e467692c994
+      size: 15187
+    outs:
+    - path: models/sft_v0.0.13_train_telemetry_analysis
+      hash: md5
+      md5: e4f18caa13651a87c19d67507a3e43e3.dir
+      size: 1628512
+      nfiles: 5
+  analyze_sft_eval_telemetry:
+    cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.13/eval_telemetry
+      --train_path data/prepared/val_stratified.csv --output_dir models/sft_v0.0.13_eval_telemetry_analysis
+      --use_all_records\n"
+    deps:
+    - path: data/prepared/val_stratified.csv
+      hash: md5
+      md5: 7891e94d9a995f2de1efa9e24127698c
+      size: 1700551
+    - path: models/sft_v0.0.13
+      hash: md5
+      md5: 9d9e635be1fdbd0e05f07325af7748c2.dir
+      size: 14300700429
+      nfiles: 43
+    - path: src/analyze_sft_telemetry.py
+      hash: md5
+      md5: d59e3a69f64f557825d28e467692c994
+      size: 15187
+    outs:
+    - path: models/sft_v0.0.13_eval_telemetry_analysis
+      hash: md5
+      md5: 96efb0beb50c3ee98510d425ff10626f.dir
+      size: 982963
+      nfiles: 5
+  build_dense_dataset:
+    cmd: "python -m src.build_dense_dataset --input_path data/generated/train_with_syntetic.csv
+      --output_path data/densed/train_densed.csv --train_telemetry_dir models/sft_v0.0.13/train_telemetry
+      --eval_telemetry_dir models/sft_v0.0.13/eval_telemetry --label_weights '{\"\
+      cryptarithm\": 5.0, \"bit manipulation\": 4.0, \"numeral equations\": 3.0, \"\
+      encryption\": 1.3, \"string\": 0.5, \"unit conversion\": 0.5, \"gravitational\"\
+      : 0.5, \"conversion to diff numeral system\": 0.5}' --train_hard_multiplier
+      1.0 --train_very_hard_multiplier 1.1 --train_easy_multiplier 0.75 --eval_hard_multiplier
+      1.0 --eval_very_hard_multiplier 1.0 --eval_easy_multiplier 1.0 --max_repeat
+      6 --hard_boxed_answer_total_nll 0.8 --very_hard_boxed_answer_total_nll 1.6 --easy_boxed_answer_total_nll
+      0.2 --shuffle --seed 31231\n"
+    deps:
+    - path: data/generated/train_with_syntetic.csv
+      hash: md5
+      md5: 33973c1dd3e67de978ad8b318b9e7746
+      size: 22894589
+    - path: models/sft_v0.0.13/eval_telemetry
+      hash: md5
+      md5: ba5135204f0802bbf94ede8ea6cdb87a.dir
+      size: 12336544
+      nfiles: 6
+    - path: models/sft_v0.0.13/train_telemetry
+      hash: md5
+      md5: 453ac74cc82812c130be90ccc94bd4c3.dir
+      size: 26977140
+      nfiles: 7
+    - path: models/sft_v0.0.13_eval_telemetry_analysis
+      hash: md5
+      md5: 96efb0beb50c3ee98510d425ff10626f.dir
+      size: 982963
+      nfiles: 5
+    - path: models/sft_v0.0.13_train_telemetry_analysis
+      hash: md5
+      md5: e4f18caa13651a87c19d67507a3e43e3.dir
+      size: 1628512
+      nfiles: 5
+    - path: src/build_dense_dataset.py
+      hash: md5
+      md5: 0e540dd753d1d50bed7bde1eb8e864ec
+      size: 17305
+    params:
+      params.yaml:
+        dense.easy_boxed_answer_total_nll: 0.2
+        dense.eval_easy_multiplier: 1.0
+        dense.eval_hard_multiplier: 1.0
+        dense.eval_very_hard_multiplier: 1.0
+        dense.hard_boxed_answer_total_nll: 0.8
+        dense.label_weights: '{"cryptarithm": 5.0, "bit manipulation": 4.0, "numeral
+          equations": 3.0, "encryption": 1.3, "string": 0.5, "unit conversion": 0.5,
+          "gravitational": 0.5, "conversion to diff numeral system": 0.5}'
+        dense.max_repeat: 6
+        dense.train_easy_multiplier: 0.75
+        dense.train_hard_multiplier: 1.0
+        dense.train_very_hard_multiplier: 1.1
+        dense.very_hard_boxed_answer_total_nll: 1.6
+        train.seed: 31231
+    outs:
+    - path: data/densed/train_densed.csv
+      hash: md5
+      md5: 9e313210b9c37a374e4ff22d6f9952ca
+      size: 53803674
+  dense_sft_train:
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.13_dense_sft_train
+      --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
+      --data algorithmic_cot_dense --train_path data/densed/train_densed.csv --seed
+      31231 --eval_steps 150 --val_path data/prepared/val_stratified.csv --output_dir
+      models/dense_sft_v0.0.13 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours
+      10.0 --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192\n"
+    deps:
+    - path: data/densed/train_densed.csv
+      hash: md5
+      md5: 9e313210b9c37a374e4ff22d6f9952ca
+      size: 53803674
+    - path: data/prepared/val_stratified.csv
+      hash: md5
+      md5: 7891e94d9a995f2de1efa9e24127698c
+      size: 1700551
+    - path: src/sft_train.py
+      hash: md5
+      md5: 12817f9e842ac307247613c1916bd3fe
+      size: 23787
+    params:
+      params.yaml:
+        data.dataset_name: algorithmic_cot
+        model.dense_sft_output_dir: models/dense_sft_v0.0.13
+        model.id: 
+          /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
+        train.batch_size: 4
+        train.dense_eval_steps: 150
+        train.epochs: 1
+        train.grad_accum: 8
+        train.lora_alpha: 64
+        train.lora_r: 32
+        train.lr: 0.0002
+        train.max_hours: 10.0
+        train.max_seq_len: 8192
+        train.seed: 31231
+        wandb.wandb_base_run_name: sft_v0.0.13
+    outs:
+    - path: models/dense_sft_v0.0.13
+      hash: md5
+      md5: 6dd48dc708d3230521c224f3ad21caf4.dir
+      size: 14261404318
+      nfiles: 30

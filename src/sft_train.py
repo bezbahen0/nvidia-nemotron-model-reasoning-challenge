@@ -4,6 +4,10 @@ import argparse
 import torch
 import pandas as pd
 import wandb
+
+import json
+import torch.nn.functional as F
+
 from datasets import Dataset
 from peft import LoraConfig
 from transformers import (
@@ -15,6 +19,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 from trl import SFTTrainer, SFTConfig
+from src.metric import verify
 from src.log import logger
 
 def parse_args():
@@ -42,6 +47,10 @@ def parse_args():
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.00)
+
+    # telemetry
+    parser.add_argument("--train_telemetry", action="store_true")
+    parser.add_argument("--eval_telemetry", action="store_true")
     
     return parser.parse_args()
 
@@ -58,18 +67,40 @@ class TimeLimitCallback(TrainerCallback):
             control.should_save = True
 
 
+def load_metadata(data_path):
+    df = pd.read_csv(data_path)
 
+    metadata = {}
 
+    for source_row_index, row in df.iterrows():
+        metadata[int(source_row_index)] = {
+            "id": str(row["id"]),
+            "source": str(row["source"]),
+            "label": str(row["label"]),
+        }
+
+    return metadata
 
 
 def prepare_dataset(csv_path, eval=False):
     df = pd.read_csv(csv_path)
 
+    if eval:
+        before_len = len(df)
+        
+        df = df[df.computed_answer.notna()]
+        df = df[df.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1)]
+
+
+        logger.info(
+            f"Eval dataset filtered by is_correct=True: {before_len} -> {len(df)}"
+        )
+
     instruction_suffix = "\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`"
 
     formatted_data = []
 
-    for _, row in df.iterrows():
+    for source_row_index, row in df.iterrows():
         user_text = str(row["prompt"]) + instruction_suffix
 
         computed_answer = str(row["computed_answer"]).strip()
@@ -80,6 +111,7 @@ def prepare_dataset(csv_path, eval=False):
         )
 
         formatted_data.append({
+            "source_row_index": int(source_row_index),
             "prompt": [
                 {"role": "user", "content": user_text}
             ],
@@ -87,8 +119,406 @@ def prepare_dataset(csv_path, eval=False):
                 {"role": "assistant", "content": assistant_text}
             ],
         })
-
     return Dataset.from_list(formatted_data)
+
+
+class TelemetrySFTTrainer(SFTTrainer):
+    def __init__(
+        self,
+        *args,
+        train_telemetry_metadata=None,
+        eval_telemetry_metadata=None,
+        train_telemetry_output_dir=None,
+        eval_telemetry_output_dir=None,
+        telemetry_save_steps=50,
+        train_telemetry_enabled=True,
+        eval_telemetry_enabled=True,
+        telemetry_tokenizer=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.train_telemetry_metadata = train_telemetry_metadata or {}
+        self.eval_telemetry_metadata = eval_telemetry_metadata or {}
+        
+        self.train_telemetry_output_dir = train_telemetry_output_dir
+        self.eval_telemetry_output_dir = eval_telemetry_output_dir
+        
+        self.telemetry_save_steps = int(telemetry_save_steps)
+        self.train_telemetry_enabled = bool(train_telemetry_enabled)
+        self.eval_telemetry_enabled = bool(eval_telemetry_enabled)
+        
+        self.telemetry_tokenizer = telemetry_tokenizer
+        self.telemetry_top_bad_tokens_count = 5
+        self.telemetry_context_window_tokens = 8
+        
+        self.telemetry_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        
+        if self.train_telemetry_output_dir is not None:
+            os.makedirs(self.train_telemetry_output_dir, exist_ok=True)
+        
+        if self.eval_telemetry_output_dir is not None:
+            os.makedirs(self.eval_telemetry_output_dir, exist_ok=True)
+                
+        base_data_collator = self.data_collator
+
+        def telemetry_data_collator(features):
+            source_row_indexes = []
+            cleaned_features = []
+
+            for feature in features:
+                feature = dict(feature)
+
+                source_row_indexes.append(int(feature.pop("source_row_index", -1)))
+
+                feature.pop("id", None)
+                feature.pop("source", None)
+                feature.pop("label", None)
+
+                cleaned_features.append(feature)
+
+            batch = base_data_collator(cleaned_features)
+            batch["source_row_index"] = torch.tensor(source_row_indexes, dtype=torch.long)
+
+            return batch
+
+        self.data_collator = telemetry_data_collator
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        source_row_index = inputs.pop("source_row_index", None)
+
+        try:
+            loss, outputs = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+                num_items_in_batch=num_items_in_batch,
+            )
+        except TypeError:
+            loss, outputs = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+            )
+
+        is_train = bool(model.training)
+
+        if is_train:
+            telemetry_enabled = self.train_telemetry_enabled
+            telemetry_split = "train"
+            telemetry_metadata = self.train_telemetry_metadata
+            telemetry_output_dir = self.train_telemetry_output_dir
+        else:
+            telemetry_enabled = self.eval_telemetry_enabled
+            telemetry_split = "eval"
+            telemetry_metadata = self.eval_telemetry_metadata
+            telemetry_output_dir = self.eval_telemetry_output_dir
+
+        if telemetry_enabled and source_row_index is not None:
+            self._write_batch_telemetry(
+                outputs=outputs,
+                labels=inputs.get("labels"),
+                input_ids=inputs.get("input_ids"),
+                source_row_index=source_row_index,
+                split=telemetry_split,
+                metadata=telemetry_metadata,
+                output_dir=telemetry_output_dir,
+            )
+
+        if return_outputs:
+            return loss, outputs
+
+        return loss
+
+    def _get_token_texts(self, token_ids):
+        if self.telemetry_tokenizer is None:
+            return [str(int(token_id)) for token_id in token_ids]
+
+        return [
+            self.telemetry_tokenizer.decode(
+                [int(token_id)],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            for token_id in token_ids
+        ]
+
+    def _get_token_sections(self, token_texts):
+        full_text = "".join(token_texts)
+
+        think_start = full_text.find("<think>")
+        think_content_start = full_text.find("\n", think_start)
+        think_end = full_text.find("</think>")
+        final_start = full_text.find("Final Answer:")
+        boxed_start = full_text.find("\\boxed{")
+
+        boxed_content_start = -1
+        boxed_content_end = -1
+
+        if boxed_start != -1:
+            boxed_content_start = boxed_start + len("\\boxed{")
+            boxed_content_end = full_text.find("}", boxed_content_start)
+
+        sections = []
+
+        char_pos = 0
+
+        for token_text in token_texts:
+            token_start = char_pos
+            token_end = char_pos + len(token_text)
+            token_mid = token_start if token_end == token_start else token_start + (token_end - token_start) // 2
+
+            section = "format"
+
+            if boxed_content_start != -1 and token_mid >= boxed_content_start:
+                if boxed_content_end == -1 or token_mid < boxed_content_end:
+                    section = "boxed_answer"
+                elif final_start != -1 and token_mid >= final_start:
+                    section = "final_answer"
+            elif final_start != -1 and token_mid >= final_start:
+                section = "final_answer"
+            elif think_end != -1:
+                if think_content_start != -1 and token_mid > think_content_start and token_mid < think_end:
+                    section = "cot"
+            elif think_start != -1:
+                if think_content_start != -1 and token_mid > think_content_start:
+                    section = "cot"
+
+            sections.append(section)
+            char_pos = token_end
+
+        return sections
+
+    def _build_section_metrics(self, values, sections):
+        result = {}
+
+        section_names = [
+            "cot",
+            "final_answer",
+            "boxed_answer",
+            "format",
+        ]
+
+        for section_name in section_names:
+            section_indexes = [
+                index
+                for index, section in enumerate(sections)
+                if section == section_name
+            ]
+
+            if len(section_indexes) == 0:
+                result[f"{section_name}_num_tokens"] = 0
+                result[f"{section_name}_mean_nll"] = None
+                result[f"{section_name}_min_logprob"] = None
+                result[f"{section_name}_p05_logprob"] = None
+                result[f"{section_name}_hard_token_ratio"] = None
+                result[f"{section_name}_near_zero_token_ratio"] = None
+                continue
+
+            section_values = values[section_indexes]
+
+            result[f"{section_name}_num_tokens"] = int(section_values.numel())
+            result[f"{section_name}_mean_nll"] = float((-section_values).mean().item())
+            result[f"{section_name}_min_logprob"] = float(section_values.min().item())
+            result[f"{section_name}_p05_logprob"] = float(torch.quantile(section_values, 0.05).item())
+            result[f"{section_name}_hard_token_ratio"] = float((section_values < -1.0).float().mean().item())
+            result[f"{section_name}_near_zero_token_ratio"] = float((section_values > -0.05).float().mean().item())
+
+        return result
+
+    def _empty_section_metrics(self):
+        result = {}
+
+        section_names = [
+            "cot",
+            "final_answer",
+            "boxed_answer",
+            "format",
+        ]
+
+        for section_name in section_names:
+            result[f"{section_name}_num_tokens"] = 0
+            result[f"{section_name}_mean_nll"] = None
+            result[f"{section_name}_min_logprob"] = None
+            result[f"{section_name}_p05_logprob"] = None
+            result[f"{section_name}_hard_token_ratio"] = None
+            result[f"{section_name}_near_zero_token_ratio"] = None
+
+        return result
+
+    def _build_top_bad_tokens(self, values, token_ids, token_texts, sections):
+        top_bad_tokens = []
+
+        if values.numel() == 0:
+            return top_bad_tokens
+
+        top_count = min(self.telemetry_top_bad_tokens_count, int(values.numel()))
+
+        _, top_indexes = torch.topk(
+            -values,
+            k=top_count,
+            largest=True,
+        )
+
+        top_indexes = top_indexes.detach().cpu().tolist()
+
+        for token_index in top_indexes:
+            context_start = max(0, int(token_index) - self.telemetry_context_window_tokens)
+            context_end = min(len(token_texts), int(token_index) + self.telemetry_context_window_tokens + 1)
+
+            context = "".join(token_texts[context_start:context_end])
+
+            top_bad_tokens.append({
+                "completion_token_pos": int(token_index),
+                "token_id": int(token_ids[token_index]),
+                "token_text": token_texts[token_index],
+                "logprob": float(values[token_index].item()),
+                "nll": float((-values[token_index]).item()),
+                "section": sections[token_index],
+                "context": context,
+            })
+
+        return top_bad_tokens
+
+    def _write_batch_telemetry(self, outputs, labels, input_ids, source_row_index, split, metadata, output_dir):
+        if output_dir is None:
+            return
+
+        if labels is None:
+            return
+
+        if input_ids is None:
+            return
+
+        if not hasattr(outputs, "logits"):
+            return
+
+        global_step = int(self.state.global_step)
+
+        if split == "train":
+            if self.telemetry_save_steps <= 0:
+                checkpoint_bucket = global_step
+            else:
+                checkpoint_bucket = ((global_step // self.telemetry_save_steps) + 1) * self.telemetry_save_steps
+        else:
+            checkpoint_bucket = global_step
+
+        if split == "train":
+            file_name = f"train_until_checkpoint-{checkpoint_bucket}_rank-{self.telemetry_rank}.jsonl"
+        else:
+            file_name = f"eval_at_checkpoint-{checkpoint_bucket}_rank-{self.telemetry_rank}.jsonl"
+
+        path = os.path.join(output_dir, file_name)
+
+        with torch.no_grad():
+            logits = outputs.logits.detach().float()
+            labels = labels.detach()
+            input_ids = input_ids.detach()
+
+            shift_logits = logits[:, :-1, :]
+            shift_labels = labels[:, 1:]
+            shift_input_ids = input_ids[:, 1:]
+
+            token_nll = F.cross_entropy(
+                shift_logits.transpose(1, 2),
+                shift_labels,
+                reduction="none",
+                ignore_index=-100,
+            )
+
+            token_log_probs = -token_nll
+            valid_mask = shift_labels.ne(-100)
+
+            if isinstance(source_row_index, torch.Tensor):
+                source_row_indexes = source_row_index.detach().cpu().tolist()
+            else:
+                source_row_indexes = list(source_row_index)
+
+            records = []
+
+            batch_size = shift_labels.shape[0]
+
+            for batch_index in range(batch_size):
+                current_valid_mask = valid_mask[batch_index]
+                valid_values = token_log_probs[batch_index][current_valid_mask]
+                valid_token_ids = shift_input_ids[batch_index][current_valid_mask].detach().cpu().tolist()
+
+                row_index = int(source_row_indexes[batch_index])
+                metadata_item = metadata.get(
+                    row_index,
+                    {
+                        "id": str(row_index),
+                        "source": "unknown",
+                        "label": "unknown",
+                    },
+                )
+
+                if valid_values.numel() == 0:
+                    record = {
+                        "step": int(self.state.global_step),
+                        "epoch": None if self.state.epoch is None else float(self.state.epoch),
+                        "checkpoint_bucket": int(checkpoint_bucket),
+                        "split": split,
+                        "source_row_index": row_index,
+                        "id": metadata_item["id"],
+                        "source": metadata_item["source"],
+                        "label": metadata_item["label"],
+                        "num_loss_tokens": 0,
+                        "total_loss": None,
+                        "mean_nll": None,
+                        "min_logprob": None,
+                        "p05_logprob": None,
+                        "hard_token_ratio": None,
+                        "near_zero_token_ratio": None,
+                        **self._empty_section_metrics(),
+                        "top_bad_tokens": [],
+                    }
+                else:
+                    values = valid_values.detach().cpu()
+                    token_texts = self._get_token_texts(valid_token_ids)
+                    sections = self._get_token_sections(token_texts)
+                    section_metrics = self._build_section_metrics(values, sections)
+                    top_bad_tokens = self._build_top_bad_tokens(
+                        values=values,
+                        token_ids=valid_token_ids,
+                        token_texts=token_texts,
+                        sections=sections,
+                    )
+
+                    num_loss_tokens = int(values.numel())
+                    total_loss = float((-values).sum().item())
+                    mean_nll = float((-values).mean().item())
+                    min_logprob = float(values.min().item())
+                    p05_logprob = float(torch.quantile(values, 0.05).item())
+                    hard_token_ratio = float((values < -1.0).float().mean().item())
+                    near_zero_token_ratio = float((values > -0.05).float().mean().item())
+
+                    record = {
+                        "step": int(self.state.global_step),
+                        "epoch": None if self.state.epoch is None else float(self.state.epoch),
+                        "checkpoint_bucket": int(checkpoint_bucket),
+                        "split": split,
+                        "source_row_index": row_index,
+                        "id": metadata_item["id"],
+                        "source": metadata_item["source"],
+                        "label": metadata_item["label"],
+                        "num_loss_tokens": num_loss_tokens,
+                        "total_loss": total_loss,
+                        "mean_nll": mean_nll,
+                        "min_logprob": min_logprob,
+                        "p05_logprob": p05_logprob,
+                        "hard_token_ratio": hard_token_ratio,
+                        "near_zero_token_ratio": near_zero_token_ratio,
+                        **section_metrics,
+                        "top_bad_tokens": top_bad_tokens,
+                    }
+
+                records.append(record)
+
+        with open(path, "a", encoding="utf-8") as file:
+            for record in records:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
 
 def main():
     args = parse_args()
@@ -117,14 +547,14 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    logger.info("Подготовка тренировочного датасета, так же не используем для обучения промпты где solver не дал правильный ответ...")
     train_dataset = prepare_dataset(args.train_path)
     logger.info(f"train dataset final len: {len(train_dataset)}")
+    train_metadata = load_metadata(args.train_path)
 
     
-    logger.info("Подготовка валидационного датасета, так же не используем для валидации промпты где solver не дал правильный ответ...")
     val_dataset = prepare_dataset(args.val_path, eval=True)
     logger.info(f"val dataset final len: {len(val_dataset)}")
+    eval_metadata = load_metadata(args.val_path)
 
     logger.info("Загрузка модели в bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -172,22 +602,33 @@ def main():
         completion_only_loss=True, 
         assistant_only_loss=False,
 
-        
         dataloader_num_workers=4,
         dataloader_prefetch_factor=2,
         dataset_num_proc=8,
+        remove_unused_columns=False,
 
         report_to="wandb",
         run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
     )
 
-    trainer = SFTTrainer(
+    train_telemetry_output_dir = os.path.join(args.output_dir, "train_telemetry")
+    eval_telemetry_output_dir = os.path.join(args.output_dir, "eval_telemetry")
+
+    trainer = TelemetrySFTTrainer(
         model=model,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         peft_config=lora_config,
         args=training_args,
-        callbacks=[TimeLimitCallback(max_hours=args.max_hours)]
+        callbacks=[TimeLimitCallback(max_hours=args.max_hours)],
+        train_telemetry_metadata=train_metadata,
+        eval_telemetry_metadata=eval_metadata,
+        train_telemetry_output_dir=train_telemetry_output_dir,
+        eval_telemetry_output_dir=eval_telemetry_output_dir,
+        telemetry_save_steps=args.eval_steps,
+        train_telemetry_enabled=args.train_telemetry,
+        eval_telemetry_enabled=args.eval_telemetry,
+        telemetry_tokenizer=tokenizer,
     )
 
     last_checkpoint = None

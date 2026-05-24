@@ -1,5 +1,6 @@
 import re
 import argparse
+import hashlib
 import pandas as pd
 
 from transformers import AutoTokenizer
@@ -22,6 +23,23 @@ def parse_args():
     
     return parser.parse_args()
 
+def make_generated_id(row: pd.Series) -> str:
+    raw = "\n".join([
+        str(row["source"]),
+        str(row["label"]),
+        str(row["prompt"]),
+        str(row["answer"]),
+        str(row["computed_answer"]),
+        str(row["generated_cot"]),
+    ])
+
+    digest = hashlib.blake2b(
+        raw.encode("utf-8"),
+        digest_size=12,
+    ).hexdigest()
+
+    return f"gen_{digest}"
+
 
 def main():
     args = parse_args()
@@ -31,6 +49,7 @@ def main():
 
     # Remove all nan
     data = data[~data.computed_answer.isna()]
+    data["source"] = len(data) * ["solver"]
 
     # skip all answer that not verified
     data = data[data.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1)]
@@ -39,8 +58,8 @@ def main():
 
     multipliers = {
         "bit manipulation": 0.5,
-        "cryptarithm": 0.7,
-        "equations_numeric": 0.7,
+        "cryptarithm": 3.5,
+        "numeral equations": 2.0,
         "encryption": 0.5,
     }
 
@@ -48,10 +67,10 @@ def main():
     equations_cryptarithm_generator = CryptarithmTaskGenerator(seed=args.seed)
 
     equations_cryptarithm_dataset = equations_cryptarithm_generator.generate_dataset(
-        num_samples=int(len(data[data.label == "equations transformation"]) * multipliers["cryptarithm"]),
+        num_samples=int(len(data[data.label == "cryptarithm"]) * multipliers["cryptarithm"]),
         mode="random",
         nb_workers=24,
-        progress_bar=True,
+        progress_bar=False,
     )
     logger.info("\nCryptarithm generator:")
     logger.info(equations_cryptarithm_dataset.columns.tolist())
@@ -61,10 +80,10 @@ def main():
     equations_ast_generator = ASTBruteForceTaskGenerator(seed=args.seed)
 
     equations_ast_dataset = equations_ast_generator.generate_dataset(
-        num_samples=int(len(data[data.label == "equations transformation"]) * multipliers["equations_numeric"]),
+        num_samples=int(len(data[data.label == "numeral equations"]) * multipliers["numeral equations"]),
         nb_workers=24,
-        progress_bar=True,
-        label="equations transformation"
+        progress_bar=False,
+        label="numeral equations"
     )
     logger.info("\nNumeric equations generator:")
     logger.info(equations_ast_dataset.columns.tolist())
@@ -103,8 +122,13 @@ def main():
     )
 
 
-    data = pd.concat([equations_cryptarithm_dataset, equations_ast_dataset, encryption_gen_dataset, bit_mp_gen_dataset, data])
-    
+    data_gen = pd.concat([equations_cryptarithm_dataset, equations_ast_dataset, encryption_gen_dataset, bit_mp_gen_dataset])
+    data_gen = data_gen[["prompt","answer","label","generated_cot","computed_answer"]]
+    data_gen["source"] = len(data_gen) * ["generated"]
+    data_gen["id"] = data_gen.apply(make_generated_id, axis=1)
+
+    data = pd.concat([data_gen, data])
+     
     data = data.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
     
 
