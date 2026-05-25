@@ -53,6 +53,11 @@ class TraceConfig:
     max_examples_per_step: int = 0
     include_rejected_hypotheses: bool = False
     include_search_branches: bool = True
+    # Training CoT controls: keep the trace token-dense, but show real domain narrowing.
+    max_domain_events: int = 80
+    max_branch_rejects: int = 3
+    include_global_support_pruning: bool = True
+    max_global_support_space: int = 2_000_000
 
 
 @dataclass
@@ -95,6 +100,18 @@ class SearchStats:
     domain_reductions: int = 0
     exact_support_checks: int = 0
     modular_support_checks: int = 0
+
+
+@dataclass
+class DomainEvent:
+    kind: str
+    label: str
+    constraint: str = ""
+    changes: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = field(default_factory=dict)
+    fixed: Dict[str, int] = field(default_factory=dict)
+    rejects: List[str] = field(default_factory=list)
+    keep: Optional[str] = None
+    contradiction: Optional[str] = None
 
 
 class DeductiveCryptarithmSolver:
@@ -590,6 +607,442 @@ class DeductiveCryptarithmSolver:
         parts = [f"${ch}={assignment[ch]}$" for ch in sorted(assignment)]
         return ", ".join(parts)
 
+    def _rule_short(self, rule: Rule) -> str:
+        names = {
+            "add": "add",
+            "add_p1": "add1",
+            "add_m1": "addm1",
+            "mul": "mul",
+            "mul_p1": "mul1",
+            "mul_m1": "mulm1",
+            "absdiff": "abs",
+            "sub_signed": "sub",
+            "concat_fwd": "cat",
+        }
+        prefix = "rev" if rule.reverse else "std"
+        return f"{prefix}/{names.get(rule.name, rule.name)}"
+
+    def _rule_action_text(self, rule: Rule) -> str:
+        read = "readR" if rule.reverse else "readL"
+        enc = "encR" if rule.reverse else "encL"
+        actions = {
+            "add": "A+B",
+            "add_p1": "A+B+1",
+            "add_m1": "A+B-1",
+            "mul": "A*B",
+            "mul_p1": "A*B+1",
+            "mul_m1": "A*B-1",
+            "absdiff": "abs(A-B)",
+            "sub_signed": "A-B, sign=op if negative",
+            "concat_fwd": "concat(A,B)",
+        }
+        return f"{read}; {actions.get(rule.name, rule.name)}; {enc}"
+
+    @staticmethod
+    def _digits_dense(values: Iterable[int]) -> str:
+        vals = sorted(set(values))
+        if vals == list(range(10)):
+            return "{0..9}"
+        return "{" + ",".join(str(v) for v in vals) + "}"
+
+    @staticmethod
+    def _snapshot(domains: Domains) -> Dict[str, Tuple[int, ...]]:
+        return {ch: tuple(sorted(values)) for ch, values in domains.items()}
+
+    @staticmethod
+    def _domain_space_upper_bound(domains: Domains, limit: int) -> int:
+        product = 1
+        for values in domains.values():
+            product *= max(1, len(values))
+            if product > limit:
+                return product
+        return product
+
+    def _structural_reject_reason(self, rule: Rule, equations: Sequence[Equation]) -> Optional[str]:
+        for eq in equations:
+            if eq.has_sign and not rule.signed:
+                return "sign"
+            possible = self._possible_lengths(rule, eq)
+            if len(eq.result) not in possible:
+                if rule.name == "concat_fwd":
+                    return "cat_len"
+                if rule.name.startswith("mul"):
+                    return "mul_len"
+                return "len"
+        return None
+
+    def _term_formula(self, term: str, rule: Rule) -> str:
+        ordered = term[::-1] if rule.reverse else term
+        coeffs: Dict[str, int] = {}
+        n = len(ordered)
+        for i, ch in enumerate(ordered):
+            coeffs[ch] = coeffs.get(ch, 0) + 10 ** (n - i - 1)
+        parts: List[str] = []
+        for ch in sorted(coeffs, key=lambda c: ordered.index(c)):
+            coeff = coeffs[ch]
+            lit = self._literal(ch)
+            if coeff == 1:
+                parts.append(lit)
+            else:
+                parts.append(f"{coeff}*{lit}")
+        return "+".join(parts) if parts else "0"
+
+    def _equation_constraint_text(self, eq: Equation, rule: Rule) -> str:
+        left = self._term_formula(eq.left, rule)
+        right = self._term_formula(eq.right, rule)
+        result = self._term_formula(eq.result, rule)
+        if rule.name == "add":
+            expr = f"{left}+{right}={result}"
+        elif rule.name == "add_p1":
+            expr = f"{left}+{right}+1={result}"
+        elif rule.name == "add_m1":
+            expr = f"{left}+{right}-1={result}"
+        elif rule.name == "mul":
+            expr = f"({left})*({right})={result}"
+        elif rule.name == "mul_p1":
+            expr = f"({left})*({right})+1={result}"
+        elif rule.name == "mul_m1":
+            expr = f"({left})*({right})-1={result}"
+        elif rule.name == "absdiff":
+            expr = f"abs(({left})-({right}))={result}"
+        elif rule.name == "sub_signed":
+            rhs = f"-({result})" if eq.has_sign else result
+            expr = f"({left})-({right})={rhs}"
+        elif rule.name == "concat_fwd":
+            expr = f"concat({left},{right})={result}"
+        else:
+            expr = f"{rule.name}({left},{right})={result}"
+        return expr
+
+    def _project_evidence(
+        self,
+        scope: Sequence[str],
+        domains: Domains,
+        predicate: Callable[[Assignment], bool],
+        kind: str,
+        label: str,
+        constraint: str,
+    ) -> Tuple[Optional[bool], Optional[DomainEvent]]:
+        ok, supported, _count, _examples = self._supports(scope, domains, predicate, 0)
+        if not ok:
+            return None, DomainEvent(kind=kind, label=label, constraint=constraint, contradiction="no_supported_assignment")
+
+        changed = False
+        changes: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
+        fixed: Dict[str, int] = {}
+        for ch, allowed in supported.items():
+            before = tuple(sorted(domains[ch]))
+            domains[ch].intersection_update(allowed)
+            after = tuple(sorted(domains[ch]))
+            if not after:
+                return None, DomainEvent(kind=kind, label=label, constraint=constraint, contradiction=f"D[{self._literal(ch)}] empty")
+            if after != before:
+                changed = True
+                changes[ch] = (before, after)
+                if len(after) == 1:
+                    fixed[ch] = after[0]
+        if not changed:
+            return False, None
+        return True, DomainEvent(kind=kind, label=label, constraint=constraint, changes=changes, fixed=fixed)
+
+    def _leading_zero_evidence(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains) -> Tuple[Optional[bool], Optional[DomainEvent]]:
+        changes: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
+        fixed: Dict[str, int] = {}
+        leads: List[str] = []
+        for eq in equations:
+            rule = combo.get(eq.op)
+            if rule is None:
+                continue
+            for term in (eq.left, eq.right, eq.result):
+                if len(term) <= 1:
+                    continue
+                lead = term[-1] if rule.reverse else term[0]
+                leads.append(lead)
+                if 0 not in domains[lead]:
+                    continue
+                before = tuple(sorted(domains[lead]))
+                domains[lead].remove(0)
+                after = tuple(sorted(domains[lead]))
+                if not after:
+                    return None, DomainEvent(kind="NO0", label="leading digits", constraint="multi-digit numbers cannot start with 0", contradiction=f"D[{self._literal(lead)}] empty")
+                changes[lead] = (before, after)
+                if len(after) == 1:
+                    fixed[lead] = after[0]
+        if not changes:
+            return False, None
+        unique_leads = ",".join(self._literal(ch) for ch in sorted(set(leads)))
+        return True, DomainEvent(kind="NO0", label="leading digits", constraint=f"{unique_leads} != 0", changes=changes, fixed=fixed)
+
+    def _alldifferent_evidence(self, domains: Domains) -> Tuple[Optional[bool], Optional[DomainEvent]]:
+        singles = [next(iter(v)) for v in domains.values() if len(v) == 1]
+        if len(singles) != len(set(singles)):
+            return None, DomainEvent(kind="ALLDIFF", label="injective digits", constraint="fixed digits must be unique", contradiction="duplicate fixed digit")
+        fixed_digits = set(singles)
+        if not fixed_digits:
+            return False, None
+        changes: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
+        fixed: Dict[str, int] = {}
+        for ch, values in domains.items():
+            if len(values) == 1:
+                continue
+            before = tuple(sorted(values))
+            values.difference_update(fixed_digits)
+            after = tuple(sorted(values))
+            if not after:
+                return None, DomainEvent(kind="ALLDIFF", label="injective digits", constraint="remove already fixed digits", contradiction=f"D[{self._literal(ch)}] empty")
+            if after != before:
+                changes[ch] = (before, after)
+                if len(after) == 1:
+                    fixed[ch] = after[0]
+        if not changes:
+            return False, None
+        return True, DomainEvent(kind="ALLDIFF", label="injective digits", constraint="remove fixed digits from open domains", changes=changes, fixed=fixed)
+
+    def _modular_evidence(self, eq: Equation, rule: Rule, domains: Domains) -> Tuple[Optional[bool], List[DomainEvent]]:
+        if rule.name not in {"add", "add_p1", "add_m1", "mul", "mul_p1", "mul_m1"}:
+            return False, []
+        events: List[DomainEvent] = []
+        changed_any = False
+        for k in range(1, max(len(eq.left), len(eq.right), len(eq.result)) + 1):
+            lp = self._suffix(eq.left, k, rule.reverse)
+            rp = self._suffix(eq.right, k, rule.reverse)
+            sp = self._suffix(eq.result, k, rule.reverse)
+            scope = list(dict.fromkeys(lp + rp + sp))
+            mod = 10**k
+
+            def pred(local: Assignment, l=lp, r=rp, s=sp, m=mod) -> bool:
+                value = rule.func(self._number(l, local, rule.reverse), self._number(r, local, rule.reverse))
+                return value is not None and value % m == self._number(s, local, rule.reverse) % m
+
+            label = eq.display()
+            constraint = f"last{k}: {self._equation_constraint_text(Equation(eq.raw, lp, rp, eq.op, sp, eq.has_sign), rule)} mod {mod}"
+            changed, event = self._project_evidence(scope, domains, pred, f"POS{k}", label, constraint)
+            if changed is None:
+                return None, [event] if event is not None else []
+            if event is not None:
+                events.append(event)
+            changed_any = changed_any or bool(changed)
+        return changed_any, events
+
+    def _exact_evidence(self, eq: Equation, rule: Rule, domains: Domains) -> Tuple[Optional[bool], Optional[DomainEvent]]:
+        scope = list(dict.fromkeys(eq.left + eq.right + eq.result))
+        constraint = self._equation_constraint_text(eq, rule)
+        return self._project_evidence(scope, domains, lambda local: self._matches(eq, rule, local), "EQ", eq.display(), constraint)
+
+    def _global_exact_evidence(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains) -> Tuple[Optional[bool], Optional[DomainEvent]]:
+        scope = list(dict.fromkeys(ch for eq in equations for ch in eq.left + eq.right + eq.result))
+        limit = self.trace_config.max_global_support_space
+        if self._domain_space_upper_bound({ch: domains[ch] for ch in scope}, limit) > limit:
+            return False, None
+
+        def pred(local: Assignment) -> bool:
+            return all(self._matches(eq, combo[eq.op], local) for eq in equations)
+
+        return self._project_evidence(scope, domains, pred, "GLOBAL", "GLOBAL all examples", "all equations together + injective digits")
+
+    def _propagate_evidence(
+        self,
+        equations: Sequence[Equation],
+        combo: Dict[str, Rule],
+        domains: Domains,
+        events: Optional[List[DomainEvent]],
+    ) -> bool:
+        while True:
+            before = self._snapshot(domains)
+            changed, event = self._leading_zero_evidence(equations, combo, domains)
+            if changed is None:
+                if events is not None and event is not None:
+                    events.append(event)
+                return False
+            if events is not None and event is not None:
+                events.append(event)
+
+            changed, event = self._alldifferent_evidence(domains)
+            if changed is None:
+                if events is not None and event is not None:
+                    events.append(event)
+                return False
+            if events is not None and event is not None:
+                events.append(event)
+
+            for eq in equations:
+                rule = combo.get(eq.op)
+                if rule is None:
+                    continue
+                changed_mod, mod_events = self._modular_evidence(eq, rule, domains)
+                if changed_mod is None:
+                    if events is not None:
+                        events.extend(mod_events)
+                    return False
+                if events is not None:
+                    events.extend(mod_events)
+
+                changed_exact, exact_event = self._exact_evidence(eq, rule, domains)
+                if changed_exact is None:
+                    if events is not None and exact_event is not None:
+                        events.append(exact_event)
+                    return False
+                if events is not None and exact_event is not None:
+                    events.append(exact_event)
+
+            after = self._snapshot(domains)
+            if before == after:
+                return True
+
+    def _has_solution_from_domains(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains) -> bool:
+        if time.time() > self._deadline:
+            raise TimeoutError("solver timeout")
+        local_domains = self._copy(domains)
+        if not self._propagate_evidence(equations, combo, local_domains, None):
+            return False
+        unresolved = [ch for ch, values in local_domains.items() if len(values) > 1]
+        if not unresolved:
+            assignment = {ch: next(iter(values)) for ch, values in local_domains.items()}
+            return self._verify(equations, combo, assignment)
+        symbol = min(unresolved, key=lambda ch: (len(local_domains[ch]), ch))
+        for digit in sorted(local_domains[symbol]):
+            next_domains = self._copy(local_domains)
+            next_domains[symbol] = {digit}
+            if self._has_solution_from_domains(equations, combo, next_domains):
+                return True
+        return False
+
+    def _build_mapping_proof(
+        self,
+        equations: Sequence[Equation],
+        combo: Dict[str, Rule],
+        symbols: Sequence[str],
+        assignment: Assignment,
+    ) -> Tuple[List[DomainEvent], Domains]:
+        domains: Domains = {ch: set(range(10)) for ch in symbols}
+        events: List[DomainEvent] = []
+
+        if not self._propagate_evidence(equations, combo, domains, events):
+            return events, domains
+
+        if self.trace_config.include_global_support_pruning:
+            changed_global, global_event = self._global_exact_evidence(equations, combo, domains)
+            if changed_global is None:
+                if global_event is not None:
+                    events.append(global_event)
+                return events, domains
+            if global_event is not None:
+                events.append(global_event)
+                if not self._propagate_evidence(equations, combo, domains, events):
+                    return events, domains
+
+        branch_rounds = 0
+        while any(len(values) > 1 for values in domains.values()) and branch_rounds < len(symbols):
+            unresolved = [ch for ch, values in domains.items() if len(values) > 1]
+            symbol = min(unresolved, key=lambda ch: (len(domains[ch]), ch))
+            final_digit = assignment[symbol]
+            before_values = tuple(sorted(domains[symbol]))
+            if final_digit not in domains[symbol]:
+                break
+
+            rejects: List[str] = []
+            for digit in before_values:
+                if digit == final_digit:
+                    continue
+                test_domains = self._copy(domains)
+                test_domains[symbol] = {digit}
+                if not self._has_solution_from_domains(equations, combo, test_domains):
+                    rejects.append(f"{self._literal(symbol)}={digit}")
+                if len(rejects) >= self.trace_config.max_branch_rejects:
+                    break
+
+            domains[symbol] = {final_digit}
+            event = DomainEvent(
+                kind="BRANCH",
+                label=f"choose {self._literal(symbol)}",
+                constraint=f"{self._literal(symbol)} in {self._digits_dense(before_values)}",
+                changes={symbol: (before_values, (final_digit,))},
+                fixed={symbol: final_digit},
+                rejects=rejects,
+                keep=f"{self._literal(symbol)}={final_digit}",
+            )
+            events.append(event)
+            if not self._propagate_evidence(equations, combo, domains, events):
+                return events, domains
+            branch_rounds += 1
+
+        return events, domains
+
+    def _format_domain_changes(self, changes: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]], fixed: Dict[str, int]) -> str:
+        parts: List[str] = []
+        for ch in sorted(changes):
+            before, after = changes[ch]
+            if ch in fixed:
+                parts.append(f"{self._literal(ch)}={fixed[ch]}")
+            else:
+                parts.append(f"{self._literal(ch)}:{self._digits_dense(before)}->{self._digits_dense(after)}")
+        return "; ".join(parts)
+
+    def _format_domain_event(self, event: DomainEvent) -> str:
+        if event.contradiction:
+            return f"{event.kind} {event.label}: reject; {event.contradiction}."
+        change_text = self._format_domain_changes(event.changes, event.fixed) if event.changes else "ok"
+        if event.kind == "BRANCH":
+            reject_text = "" if not event.rejects else "; reject " + ", ".join(event.rejects)
+            keep_text = "" if event.keep is None else f"; keep {event.keep}"
+            return f"BRANCH {event.constraint}{reject_text}{keep_text}; {change_text}."
+        if event.constraint:
+            return f"{event.kind} {event.label}: {event.constraint} => {change_text}."
+        return f"{event.kind} {event.label}: {change_text}."
+
+    def _select_domain_events(self, events: Sequence[DomainEvent], max_events: int) -> List[DomainEvent]:
+        if len(events) <= max_events:
+            return list(events)
+        selected: List[DomainEvent] = []
+        for event in events:
+            important = event.kind in {"NO0", "GLOBAL", "BRANCH"} or bool(event.fixed) or bool(event.contradiction)
+            if important:
+                selected.append(event)
+            if len(selected) >= max_events:
+                return selected
+        for event in events:
+            if event not in selected:
+                selected.append(event)
+            if len(selected) >= max_events:
+                break
+        return selected
+
+    def _operation_line_dense(self, rule: Rule, a: int, b: int) -> Tuple[str, Optional[int]]:
+        value = rule.func(a, b)
+        if value is None:
+            return f"{self._rule_short(rule)}({a},{b}) invalid", None
+        if rule.name == "add":
+            return f"{a}+{b}={value}", value
+        if rule.name == "add_p1":
+            return f"{a}+{b}+1={value}", value
+        if rule.name == "add_m1":
+            return f"{a}+{b}-1={value}", value
+        if rule.name == "mul":
+            return f"{a}*{b}={value}", value
+        if rule.name == "mul_p1":
+            return f"{a}*{b}+1={value}", value
+        if rule.name == "mul_m1":
+            return f"{a}*{b}-1={value}", value
+        if rule.name == "absdiff":
+            return f"abs({a}-{b})={value}", value
+        if rule.name == "sub_signed":
+            return f"{a}-{b}={value}", value
+        if rule.name == "concat_fwd":
+            return f"cat({a},{b})={value}", value
+        return f"{rule.name}({a},{b})={value}", value
+
+    def _rule_signature_summary(self, op: str, equations: Sequence[Equation], candidates: Sequence[Rule], selected: Rule) -> str:
+        len_sig = ",".join(f"{len(eq.left)}+{len(eq.right)}->{len(eq.result)}" for eq in equations)
+        signed = "yes" if any(eq.has_sign for eq in equations) else "no"
+        kept = ",".join(self._rule_short(rule) for rule in candidates)
+        reject_groups: Dict[str, int] = {}
+        for rule in self.rules:
+            reason = self._structural_reject_reason(rule, equations)
+            if reason is not None:
+                reject_groups[reason] = reject_groups.get(reason, 0) + 1
+        rejected = ",".join(f"{reason}:{count}" for reason, count in sorted(reject_groups.items())) or "none"
+        return f"SIG {self._literal(op)} len[{len_sig}] signed={signed}; structural_keep={kept}; structural_reject={rejected}; select={self._rule_short(selected)}"
+
     def _render_training_solution(
         self,
         equations: Sequence[Equation],
@@ -607,202 +1060,87 @@ class DeductiveCryptarithmSolver:
         derivation_trace: Sequence[str],
         candidates: Dict[str, List[Rule]],
     ) -> List[str]:
-        """Return a compact training trace rather than a raw CSP/debug log."""
+        """Return token-dense CoT: signatures -> rule -> domain narrowing -> target."""
+        del derivation_trace
         lines: List[str] = []
         add = lines.append
-
-        def config_name(rule: Rule) -> str:
-            return "little_endian" if rule.reverse else "standard"
-
-        def format_name(rule: Rule) -> str:
-            if rule.signed and rule.reverse:
-                return "symbol_reverse_order_with_operator_sign_if_negative"
-            if rule.signed:
-                return "symbol_left_to_right_with_operator_sign_if_negative"
-            return "symbol_reverse_order" if rule.reverse else "symbol_left_to_right"
-
-        def operation_name(rule: Rule) -> str:
-            names = {
-                "add": "add",
-                "add_p1": "add1",
-                "add_m1": "addm1",
-                "mul": "mul",
-                "mul_p1": "mul1",
-                "mul_m1": "mulm1",
-                "absdiff": "abs_diff",
-                "sub_signed": "sub_signed",
-                "concat_fwd": "cat",
-            }
-            return names.get(rule.name, rule.name)
-
-        def rule_signature(rule: Rule) -> str:
-            return f"{config_name(rule)} -> {operation_name(rule)} -> {format_name(rule)}"
-
-        def rule_meaning(rule: Rule) -> str:
-            orientation = "read symbols left-to-right" if not rule.reverse else "read symbols right-to-left"
-            if rule.name == "add":
-                op_text = "A + B"
-            elif rule.name == "add_p1":
-                op_text = "A + B + 1"
-            elif rule.name == "add_m1":
-                op_text = "A + B - 1"
-            elif rule.name == "mul":
-                op_text = "A * B"
-            elif rule.name == "mul_p1":
-                op_text = "A * B + 1"
-            elif rule.name == "mul_m1":
-                op_text = "A * B - 1"
-            elif rule.name == "absdiff":
-                op_text = "abs(A - B)"
-            elif rule.name == "sub_signed":
-                op_text = "A - B; if negative, prefix the operator symbol as the sign"
-            elif rule.name == "concat_fwd":
-                op_text = "concat(A, B)"
-            else:
-                op_text = rule.name
-            fmt_text = "encode result symbols in reverse order" if rule.reverse else "encode result symbols left-to-right"
-            return f"{orientation}; compute {op_text}; {fmt_text}"
-
-        def mapping_text() -> str:
-            return ", ".join(f"{self._literal(ch)}={assignment[ch]}" for ch in sorted(assignment))
-
-        def expected_rhs(eq: Equation) -> str:
-            return f"{eq.op}{eq.result}" if eq.has_sign else eq.result
-
-        def decoded_number(term: str, rule: Rule) -> int:
-            return self._number(term, assignment, rule.reverse)
-
-        def encoded_value(value: Optional[int], eq: Equation, rule: Rule) -> str:
-            if value is None:
-                return "<invalid>"
-            encoded = self._encode_value(value, eq.op, rule, assignment)
-            return "<invalid>" if encoded is None else encoded
-
-        def operation_line(rule: Rule, a: int, b: int) -> Tuple[str, Optional[int]]:
-            value = rule.func(a, b)
-            if value is None:
-                return f"{operation_name(rule)}({a}, {b}) -> invalid", None
-            if rule.name == "add":
-                return f"{a} + {b} = {value}", value
-            if rule.name == "add_p1":
-                return f"{a} + {b} + 1 = {value}", value
-            if rule.name == "add_m1":
-                return f"{a} + {b} - 1 = {value}", value
-            if rule.name == "mul":
-                return f"{a} * {b} = {value}", value
-            if rule.name == "mul_p1":
-                return f"{a} * {b} + 1 = {value}", value
-            if rule.name == "mul_m1":
-                return f"{a} * {b} - 1 = {value}", value
-            if rule.name == "absdiff":
-                return f"abs({a} - {b}) = {value}", value
-            if rule.name == "sub_signed":
-                return f"{a} - {b} = {value}", value
-            if rule.name == "concat_fwd":
-                return f"concat({a}, {b}) = {value}", value
-            return f"{operation_name(rule)}({a}, {b}) = {value}", value
 
         by_op: Dict[str, List[Equation]] = {}
         for eq in equations:
             by_op.setdefault(eq.op, []).append(eq)
 
-        add("Task type: cryptarithm")
-        add("Model: every visible non-operator symbol is one unique decimal digit; multi-digit values cannot start with zero.")
-        add(f"Parsed examples: {', '.join(self._literal(eq.display()) for eq in equations)}")
-        add(f"Target expression: {self._literal(clean_target)}")
-        add(f"Symbols to decode: {', '.join(self._literal(ch) for ch in sorted(assignment))}")
+        symbols = sorted(assignment)
+        map_events, proof_domains = self._build_mapping_proof(equations, combo, symbols, assignment)
+        selected_events = self._select_domain_events(map_events, self.trace_config.max_domain_events)
 
-        add("")
-        add("Rule search")
+        add("TYPE cryptarithm")
+        add("M sym=digit; injective; no-leading-zero.")
+        add("E " + " | ".join(self._literal(eq.display()) for eq in equations))
+        add("T " + self._literal(clean_target))
+
         for op in sorted(combo):
             selected = combo[op]
-            op_examples = by_op.get(op, [])
-            candidate_count = len(candidates.get(op, []))
-            add(f"Operator {self._literal(op)}")
-            if op_examples:
-                add("Examples: " + ", ".join(eq.display() for eq in op_examples))
-            add(f"Selected rule: {rule_signature(selected)}")
-            add(f"Meaning: {rule_meaning(selected)}.")
-            if candidate_count <= 1:
-                add("Why this rule: it is the only compact rule that satisfies the equation structure and verifies all examples after digit assignment.")
-            else:
-                add(
-                    "Why this rule: several compact rules are structurally possible, but this one is selected because "
-                    "it satisfies all equations after digit assignment and preserves a consistent reading/encoding style."
-                )
-            add("Verification for this operator:")
-            for eq in op_examples:
-                a = decoded_number(eq.left, selected)
-                b = decoded_number(eq.right, selected)
-                op_text, value = operation_line(selected, a, b)
-                encoded = encoded_value(value, eq, selected)
-                status = "OK" if encoded == expected_rhs(eq) else "MISMATCH"
-                add(f"  {eq.left} {eq.op} {eq.right} -> A={a}, B={b}; {op_text}; encode -> {encoded} [{status}]")
-            add("")
+            op_eqs = by_op.get(op, [])
+            add(self._rule_signature_summary(op, op_eqs, candidates.get(op, []), selected))
+            add(f"RULE {self._literal(op)}={self._rule_short(selected)}; {self._rule_action_text(selected)}.")
+            for eq in op_eqs[:3]:
+                add(f"C {eq.display()}: {self._equation_constraint_text(eq, selected)}.")
 
-        add("Solving digit assignment")
-        add("Constraints used:")
-        add("  1. Each symbol maps to exactly one digit, and all symbols use different digits.")
-        add("  2. Leading symbols of multi-digit numbers cannot be zero.")
-        add("  3. Every parsed equation must hold under the selected operator rules.")
-        add("  4. Any remaining ambiguity is resolved only by assignments that keep all equations valid.")
-        add(f"Digit assignment identified: {mapping_text()}")
+        add("MAP_SEARCH")
+        add("D0 " + "; ".join(f"{self._literal(ch)}={self._digits_dense(range(10))}" for ch in symbols) + ".")
+        for event in selected_events:
+            add(self._format_domain_event(event))
 
-        add("")
-        add("Final verification")
+        unresolved = [ch for ch in symbols if len(proof_domains.get(ch, set())) > 1]
+        if unresolved:
+            add("OPEN " + "; ".join(f"{self._literal(ch)}={self._digits_dense(proof_domains[ch])}" for ch in unresolved) + ".")
+        add("MAP " + "; ".join(f"{self._literal(ch)}={assignment[ch]}" for ch in symbols) + ".")
+
+        add("VERIFY")
         for eq in equations:
             rule = combo[eq.op]
-            a = decoded_number(eq.left, rule)
-            b = decoded_number(eq.right, rule)
-            op_text, value = operation_line(rule, a, b)
-            encoded = encoded_value(value, eq, rule)
-            status = "OK" if encoded == expected_rhs(eq) else "MISMATCH"
-            add(f"  {eq.display()}: {rule_signature(rule)}; A={a}, B={b}; {op_text}; encoded={encoded} [{status}]")
+            a = self._number(eq.left, assignment, rule.reverse)
+            b = self._number(eq.right, assignment, rule.reverse)
+            op_text, value = self._operation_line_dense(rule, a, b)
+            encoded = "<invalid>" if value is None else self._encode_value(value, eq.op, rule, assignment)
+            expected = f"{eq.op}{eq.result}" if eq.has_sign else eq.result
+            status = "ok" if encoded == expected else "bad"
+            add(f"V {self._literal(eq.display())}: A={a}; B={b}; {op_text}; enc={self._literal(encoded or '<invalid>')} expect={self._literal(expected)} {status}.")
 
-        add("")
-        add(f"Target calculation: {target_left} {target_op} {target_right}")
+        add("TARGET")
         target_rule = combo[target_op]
-        add(f"1. Use rule for operator {self._literal(target_op)}: {rule_signature(target_rule)}")
-        add(f"2. Decode operands: A={target_a}, B={target_b}")
         if target_error or answer is None or target_value is None:
-            add(f"3. Apply operation: {target_error}")
-            add("Computed output: <no valid answer>")
+            add(f"TGT {self._literal(clean_target)}: A={target_a}; B={target_b}; error={target_error or 'invalid'}.")
+            add("FINAL <no valid answer>")
         else:
-            target_operation, _ = operation_line(target_rule, target_a, target_b)
-            add(f"3. Apply operation: {target_operation}")
-            add(f"4. Encode using {format_name(target_rule)} and the symbol mapping: {answer}")
-            add(f"Computed output: {answer}")
+            op_text, _ = self._operation_line_dense(target_rule, target_a, target_b)
+            add(f"TGT {self._literal(clean_target)}: A={target_a}; B={target_b}; {op_text}; enc={self._literal(answer)}.")
+            add(f"FINAL {answer}")
 
         text = "\n".join(lines)
         if len(text) <= self.trace_config.max_solution_chars:
             return lines
 
         compact: List[str] = []
-        compact.append("--- Решение ---")
-        compact.append("Task type: equations_transformation")
-        compact.append("Cryptarithm model: unique digit per visible symbol; no leading zero in multi-digit values.")
-        compact.append("Rules:")
+        compact.append("TYPE cryptarithm")
+        compact.append("M sym=digit; injective; no-leading-zero.")
+        compact.append("E " + " | ".join(self._literal(eq.display()) for eq in equations))
+        compact.append("T " + self._literal(clean_target))
         for op in sorted(combo):
-            compact.append(f"  {self._literal(op)}: {rule_signature(combo[op])}; {rule_meaning(combo[op])}")
-        compact.append(f"Digit assignment identified: {mapping_text()}")
-        compact.append("Verification:")
-        for eq in equations:
-            rule = combo[eq.op]
-            a = decoded_number(eq.left, rule)
-            b = decoded_number(eq.right, rule)
-            op_text, value = operation_line(rule, a, b)
-            compact.append(f"  {eq.display()}: A={a}, B={b}; {op_text}; encoded={encoded_value(value, eq, rule)}")
+            selected = combo[op]
+            compact.append(f"RULE {self._literal(op)}={self._rule_short(selected)}; {self._rule_action_text(selected)}.")
+        compact.append("MAP_SEARCH compressed: structural signatures + domain propagation + branch rejection produced single verified map.")
+        for event in self._select_domain_events(map_events, 20):
+            compact.append(self._format_domain_event(event))
+        compact.append("MAP " + "; ".join(f"{self._literal(ch)}={assignment[ch]}" for ch in symbols) + ".")
+        compact.append("TARGET")
         if target_error or answer is None or target_value is None:
-            compact.append(f"Target {clean_target}: {target_error}")
-            compact.append("Computed output: <no valid answer>")
+            compact.append(f"TGT {self._literal(clean_target)}: A={target_a}; B={target_b}; error={target_error or 'invalid'}.")
+            compact.append("FINAL <no valid answer>")
         else:
-            compact.append(f"Target calculation: {target_left} {target_op} {target_right}")
-            compact.append(f"1. Use rule for operator {self._literal(target_op)}: {rule_signature(target_rule)}")
-            compact.append(f"2. Decode operands: A={target_a}, B={target_b}")
-            target_operation, _ = operation_line(target_rule, target_a, target_b)
-            compact.append(f"3. Apply operation: {target_operation}")
-            compact.append(f"4. Encode using {format_name(target_rule)} and the symbol mapping: {answer}")
-            compact.append(f"Computed output: {answer}")
+            op_text, _ = self._operation_line_dense(combo[target_op], target_a, target_b)
+            compact.append(f"TGT {self._literal(clean_target)}: A={target_a}; B={target_b}; {op_text}; enc={self._literal(answer)}.")
+            compact.append(f"FINAL {answer}")
         return compact
 
     def solve(self, examples_text: str, target_text: str, timeout_seconds: float = 30.0) -> Dict[str, Any]:
