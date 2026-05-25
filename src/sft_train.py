@@ -48,6 +48,33 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.00)
 
+    # loss
+    parser.add_argument(
+        "--loss_impl",
+        type=str,
+        default="default",
+        choices=["default", "cce"],
+        help="default = regular model CE loss, cce = manual Cut Cross Entropy loss with telemetry support",
+    )
+    parser.add_argument(
+        "--cce_impl",
+        type=str,
+        default="cce",
+        choices=["cce", "torch_compile"],
+        help="Cut Cross Entropy backend implementation",
+    )
+    parser.add_argument(
+        "--cce_compare_default_loss_once",
+        action="store_true",
+        help="Compare CCE loss with default logits CE loss once on the first train batch. This materializes logits once.",
+    )
+    parser.add_argument(
+        "--cce_loss_diff_warn_threshold",
+        type=float,
+        default=1e-2,
+        help="Warn if default CE and CCE loss differ by more than this value in one-batch comparison",
+    )
+
     # telemetry
     parser.add_argument("--train_telemetry", action="store_true")
     parser.add_argument("--eval_telemetry", action="store_true")
@@ -122,6 +149,19 @@ def prepare_dataset(csv_path, eval=False):
     return Dataset.from_list(formatted_data)
 
 
+def import_linear_cross_entropy():
+    try:
+        from cut_cross_entropy import linear_cross_entropy
+    except ImportError as exc:
+        raise ImportError(
+            "cut_cross_entropy is not installed. "
+            "Install it before using --loss_impl cce. "
+            "Example: pip install \"cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git\""
+        ) from exc
+
+    return linear_cross_entropy
+
+
 class TelemetrySFTTrainer(SFTTrainer):
     def __init__(
         self,
@@ -134,6 +174,10 @@ class TelemetrySFTTrainer(SFTTrainer):
         train_telemetry_enabled=True,
         eval_telemetry_enabled=True,
         telemetry_tokenizer=None,
+        loss_impl="default",
+        cce_impl="cce",
+        cce_compare_default_loss_once=False,
+        cce_loss_diff_warn_threshold=1e-2,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -151,6 +195,18 @@ class TelemetrySFTTrainer(SFTTrainer):
         self.telemetry_tokenizer = telemetry_tokenizer
         self.telemetry_top_bad_tokens_count = 5
         self.telemetry_context_window_tokens = 8
+
+        self.loss_impl = str(loss_impl)
+        self.cce_impl = str(cce_impl)
+        self.linear_cross_entropy = None
+        self.cce_compare_default_loss_once = bool(cce_compare_default_loss_once)
+        self.cce_loss_diff_warn_threshold = float(cce_loss_diff_warn_threshold)
+        self.cce_default_loss_compared = False
+        self.cce_base_model = None
+
+        if self.loss_impl == "cce":
+            self.linear_cross_entropy = import_linear_cross_entropy()
+            logger.info(f"[CCE] Cut Cross Entropy enabled, impl={self.cce_impl}")
         
         self.telemetry_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
         
@@ -187,19 +243,24 @@ class TelemetrySFTTrainer(SFTTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         source_row_index = inputs.pop("source_row_index", None)
 
-        try:
-            loss, outputs = super().compute_loss(
-                model,
-                inputs,
-                return_outputs=True,
-                num_items_in_batch=num_items_in_batch,
-            )
-        except TypeError:
-            loss, outputs = super().compute_loss(
-                model,
-                inputs,
-                return_outputs=True,
-            )
+        token_nll = None
+
+        if self.loss_impl == "cce":
+            loss, outputs, token_nll = self._compute_cce_loss(model, inputs)
+        else:
+            try:
+                loss, outputs = super().compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=True,
+                    num_items_in_batch=num_items_in_batch,
+                )
+            except TypeError:
+                loss, outputs = super().compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=True,
+                )
 
         is_train = bool(model.training)
 
@@ -223,12 +284,323 @@ class TelemetrySFTTrainer(SFTTrainer):
                 split=telemetry_split,
                 metadata=telemetry_metadata,
                 output_dir=telemetry_output_dir,
+                token_nll=token_nll,
             )
 
         if return_outputs:
             return loss, outputs
 
         return loss
+
+    def _compute_cce_loss(self, model, inputs):
+        if self.linear_cross_entropy is None:
+            raise RuntimeError("linear_cross_entropy is not initialized")
+
+        labels = inputs.get("labels")
+        input_ids = inputs.get("input_ids")
+        attention_mask = inputs.get("attention_mask")
+
+        if labels is None:
+            raise RuntimeError("CCE loss requires labels")
+
+        if input_ids is None:
+            raise RuntimeError("CCE loss requires input_ids")
+
+        base_model = self._get_cce_base_model(model)
+
+        backbone_kwargs = {}
+
+        for key in (
+            "position_ids",
+            "past_key_values",
+            "use_cache",
+            "cache_position",
+        ):
+            if key in inputs:
+                backbone_kwargs[key] = inputs[key]
+
+        backbone_out = base_model.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **backbone_kwargs,
+        )
+
+        hidden_states = backbone_out[0]
+        lm_weight, lm_bias = self._get_lm_weight_and_bias(base_model.lm_head, hidden_states)
+
+        if self.cce_compare_default_loss_once and not self.cce_default_loss_compared:
+            self._compare_default_loss_once(
+                model=model,
+                inputs=inputs,
+                cce_hidden_states=hidden_states,
+                cce_lm_weight=lm_weight,
+                cce_lm_bias=lm_bias,
+                labels=labels,
+            )
+            self.cce_default_loss_compared = True
+
+        per_token_ce = self._linear_cross_entropy(
+            hidden_states=hidden_states,
+            lm_weight=lm_weight,
+            labels=labels,
+            lm_bias=lm_bias,
+        )
+
+        shift_labels = labels[:, 1:]
+        valid_mask = shift_labels.ne(-100)
+
+        if per_token_ce.shape == labels.shape:
+            per_token_ce = per_token_ce[:, 1:]
+
+        if per_token_ce.shape != shift_labels.shape:
+            raise RuntimeError(
+                f"Unexpected CCE per_token_ce shape: {tuple(per_token_ce.shape)}, "
+                f"expected {tuple(shift_labels.shape)}"
+            )
+
+        loss = per_token_ce[valid_mask].mean()
+
+        outputs = {
+            "loss": loss,
+        }
+
+        return loss, outputs, per_token_ce
+
+    def _linear_cross_entropy(self, hidden_states, lm_weight, labels, lm_bias=None):
+        kwargs = {
+            "shift": 1,
+            "reduction": "none",
+            "ignore_index": -100,
+        }
+
+        if self.cce_impl is not None:
+            kwargs["impl"] = self.cce_impl
+
+        if lm_bias is not None:
+            kwargs["bias"] = lm_bias
+
+        try:
+            return self.linear_cross_entropy(
+                hidden_states,
+                lm_weight,
+                labels,
+                **kwargs,
+            )
+        except TypeError:
+            kwargs.pop("impl", None)
+
+            try:
+                return self.linear_cross_entropy(
+                    hidden_states,
+                    lm_weight,
+                    labels,
+                    **kwargs,
+                )
+            except TypeError:
+                kwargs.pop("bias", None)
+
+                try:
+                    return self.linear_cross_entropy(
+                        hidden_states,
+                        lm_weight,
+                        labels,
+                        **kwargs,
+                    )
+                except TypeError:
+                    shifted_hidden_states = hidden_states[:, :-1, :]
+                    shifted_labels = labels[:, 1:]
+
+                    return self.linear_cross_entropy(
+                        shifted_hidden_states,
+                        lm_weight,
+                        shifted_labels,
+                        reduction="none",
+                        ignore_index=-100,
+                    )
+
+    def _compare_default_loss_once(
+        self,
+        model,
+        inputs,
+        cce_hidden_states,
+        cce_lm_weight,
+        cce_lm_bias,
+        labels,
+    ):
+        if not bool(model.training):
+            return
+
+        was_training = model.training
+
+        with torch.no_grad():
+            shift_labels = labels[:, 1:]
+            valid_mask = shift_labels.ne(-100)
+
+            per_token_ce = self._linear_cross_entropy(
+                hidden_states=cce_hidden_states.detach(),
+                lm_weight=cce_lm_weight.detach(),
+                labels=labels,
+                lm_bias=None if cce_lm_bias is None else cce_lm_bias.detach(),
+            )
+
+            if per_token_ce.shape == labels.shape:
+                per_token_ce = per_token_ce[:, 1:]
+
+            cce_loss = per_token_ce[valid_mask].mean()
+
+            default_outputs = model(
+                input_ids=inputs.get("input_ids"),
+                attention_mask=inputs.get("attention_mask"),
+                labels=labels,
+            )
+
+            default_loss = default_outputs.loss.detach()
+            diff = float(torch.abs(default_loss.float() - cce_loss.float()).item())
+
+            logger.info(
+                f"[CCE] default_loss={float(default_loss.float().item()):.8f}, "
+                f"cce_loss={float(cce_loss.float().item()):.8f}, "
+                f"abs_diff={diff:.8f}"
+            )
+
+            if diff > self.cce_loss_diff_warn_threshold:
+                logger.warning(
+                    f"[CCE] default loss and CCE loss differ by {diff:.8f}, "
+                    f"threshold={self.cce_loss_diff_warn_threshold:.8f}. "
+                    "Check shift/masking/lm_head LoRA handling."
+                )
+
+        if was_training:
+            model.train()
+
+    def _get_cce_base_model(self, model):
+        if self.cce_base_model is not None:
+            return self.cce_base_model
+
+        current = model
+        visited = set()
+
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+
+            if hasattr(current, "backbone") and hasattr(current, "lm_head"):
+                self.cce_base_model = current
+                logger.info(f"[CCE] Found base model for CCE: {type(current)}")
+                self._validate_lm_head_for_cce(current.lm_head)
+                return current
+
+            candidates = []
+
+            for attr_name in (
+                "base_model",
+                "model",
+                "module",
+            ):
+                if hasattr(current, attr_name):
+                    next_current = getattr(current, attr_name)
+
+                    if next_current is not current and next_current is not None:
+                        candidates.append(next_current)
+
+            found = None
+
+            for candidate in candidates:
+                if hasattr(candidate, "backbone") and hasattr(candidate, "lm_head"):
+                    found = candidate
+                    break
+
+            if found is not None:
+                current = found
+            elif len(candidates) > 0:
+                current = candidates[0]
+            else:
+                break
+
+        raise RuntimeError(
+            "Could not find base model with .backbone and .lm_head for CCE. "
+            "Nemotron remote-code structure may have changed."
+        )
+
+    def _validate_lm_head_for_cce(self, lm_head):
+        if not hasattr(lm_head, "lora_dropout"):
+            return
+
+        lora_dropout = getattr(lm_head, "lora_dropout")
+
+        if not isinstance(lora_dropout, dict):
+            return
+
+        for adapter_name, dropout_module in lora_dropout.items():
+            p = getattr(dropout_module, "p", 0.0)
+
+            if float(p) != 0.0:
+                raise RuntimeError(
+                    "CCE manual lm_head weight merge is only exact when lm_head LoRA dropout is 0. "
+                    f"Found lm_head lora_dropout[{adapter_name}]={p}. "
+                    "Set --lora_dropout 0.0 or remove lm_head from LoRA target modules."
+                )
+
+    def _get_active_lora_adapter_name(self, lm_head):
+        for attr_name in ("active_adapter", "active_adapters"):
+            if hasattr(lm_head, attr_name):
+                value = getattr(lm_head, attr_name)
+
+                if isinstance(value, str):
+                    return value
+
+                if isinstance(value, (list, tuple)) and len(value) > 0:
+                    return str(value[0])
+
+        if hasattr(lm_head, "lora_A") and isinstance(lm_head.lora_A, dict):
+            if "default" in lm_head.lora_A:
+                return "default"
+
+            keys = list(lm_head.lora_A.keys())
+
+            if len(keys) > 0:
+                return str(keys[0])
+
+        return "default"
+
+    def _get_lm_weight_and_bias(self, lm_head, hidden_states):
+        if (
+            hasattr(lm_head, "base_layer")
+            and hasattr(lm_head, "lora_A")
+            and hasattr(lm_head, "lora_B")
+        ):
+            adapter_name = self._get_active_lora_adapter_name(lm_head)
+
+            if adapter_name in lm_head.lora_A and adapter_name in lm_head.lora_B:
+                base_layer = lm_head.base_layer
+                base_w = base_layer.weight
+
+                lora_A = lm_head.lora_A[adapter_name].weight
+                lora_B = lm_head.lora_B[adapter_name].weight
+                scaling = lm_head.scaling[adapter_name]
+
+                lora_delta = lora_B.to(base_w.dtype) @ lora_A.to(base_w.dtype)
+                lm_weight = base_w + scaling * lora_delta
+
+                lm_bias = getattr(base_layer, "bias", None)
+
+                if lm_bias is not None and lm_bias.dtype != hidden_states.dtype:
+                    lm_bias = lm_bias.to(hidden_states.dtype)
+
+                if lm_weight.dtype != hidden_states.dtype:
+                    lm_weight = lm_weight.to(hidden_states.dtype)
+
+                return lm_weight, lm_bias
+
+        lm_weight = lm_head.weight
+        lm_bias = getattr(lm_head, "bias", None)
+
+        if lm_weight.dtype != hidden_states.dtype:
+            lm_weight = lm_weight.to(hidden_states.dtype)
+
+        if lm_bias is not None and lm_bias.dtype != hidden_states.dtype:
+            lm_bias = lm_bias.to(hidden_states.dtype)
+
+        return lm_weight, lm_bias
 
     def _get_token_texts(self, token_ids):
         if self.telemetry_tokenizer is None:
@@ -380,7 +752,17 @@ class TelemetrySFTTrainer(SFTTrainer):
 
         return top_bad_tokens
 
-    def _write_batch_telemetry(self, outputs, labels, input_ids, source_row_index, split, metadata, output_dir):
+    def _write_batch_telemetry(
+        self,
+        outputs,
+        labels,
+        input_ids,
+        source_row_index,
+        split,
+        metadata,
+        output_dir,
+        token_nll=None,
+    ):
         if output_dir is None:
             return
 
@@ -388,9 +770,6 @@ class TelemetrySFTTrainer(SFTTrainer):
             return
 
         if input_ids is None:
-            return
-
-        if not hasattr(outputs, "logits"):
             return
 
         global_step = int(self.state.global_step)
@@ -411,23 +790,47 @@ class TelemetrySFTTrainer(SFTTrainer):
         path = os.path.join(output_dir, file_name)
 
         with torch.no_grad():
-            logits = outputs.logits.detach().float()
             labels = labels.detach()
             input_ids = input_ids.detach()
 
-            shift_logits = logits[:, :-1, :]
             shift_labels = labels[:, 1:]
             shift_input_ids = input_ids[:, 1:]
+            valid_mask = shift_labels.ne(-100)
 
-            token_nll = F.cross_entropy(
-                shift_logits.transpose(1, 2),
-                shift_labels,
-                reduction="none",
-                ignore_index=-100,
-            )
+            if token_nll is None:
+                logits = None
+
+                if isinstance(outputs, dict):
+                    logits = outputs.get("logits")
+
+                if logits is None and hasattr(outputs, "logits"):
+                    logits = outputs.logits
+
+                if logits is None:
+                    return
+
+                logits = logits.detach().float()
+                shift_logits = logits[:, :-1, :]
+
+                token_nll = F.cross_entropy(
+                    shift_logits.transpose(1, 2),
+                    shift_labels,
+                    reduction="none",
+                    ignore_index=-100,
+                )
+            else:
+                token_nll = token_nll.detach()
+
+                if token_nll.shape == labels.shape:
+                    token_nll = token_nll[:, 1:]
+
+                if token_nll.shape != shift_labels.shape:
+                    raise RuntimeError(
+                        f"Unexpected token_nll shape: {tuple(token_nll.shape)}, "
+                        f"expected {tuple(shift_labels.shape)}"
+                    )
 
             token_log_probs = -token_nll
-            valid_mask = shift_labels.ne(-100)
 
             if isinstance(source_row_index, torch.Tensor):
                 source_row_indexes = source_row_index.detach().cpu().tolist()
@@ -520,6 +923,25 @@ class TelemetrySFTTrainer(SFTTrainer):
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+class MemoryStatsCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+
+        if not torch.cuda.is_available():
+            return
+
+        device_index = torch.cuda.current_device()
+
+        logs["gpu/max_memory_allocated_gb"] = round(
+            torch.cuda.max_memory_allocated(device_index) / 1024**3,
+            4,
+        )
+        logs["gpu/max_memory_reserved_gb"] = round(
+            torch.cuda.max_memory_reserved(device_index) / 1024**3,
+            4,
+        )
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -565,6 +987,10 @@ def main():
         use_cache=False
     )
 
+    logger.info(
+        f"Training loss implementation: loss_impl={args.loss_impl}, cce_impl={args.cce_impl}"
+    )
+
 
     lora_config = LoraConfig(
         r=args.lora_r,
@@ -608,7 +1034,7 @@ def main():
         remove_unused_columns=False,
 
         report_to="wandb",
-        run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}"
+        run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}-{args.loss_impl}"
     )
 
     train_telemetry_output_dir = os.path.join(args.output_dir, "train_telemetry")
@@ -620,7 +1046,7 @@ def main():
         eval_dataset=val_dataset,
         peft_config=lora_config,
         args=training_args,
-        callbacks=[TimeLimitCallback(max_hours=args.max_hours)],
+        callbacks=[TimeLimitCallback(max_hours=args.max_hours), MemoryStatsCallback()],
         train_telemetry_metadata=train_metadata,
         eval_telemetry_metadata=eval_metadata,
         train_telemetry_output_dir=train_telemetry_output_dir,
@@ -629,6 +1055,10 @@ def main():
         train_telemetry_enabled=args.train_telemetry,
         eval_telemetry_enabled=args.eval_telemetry,
         telemetry_tokenizer=tokenizer,
+        loss_impl=args.loss_impl,
+        cce_impl=args.cce_impl,
+        cce_compare_default_loss_once=args.cce_compare_default_loss_once,
+        cce_loss_diff_warn_threshold=args.cce_loss_diff_warn_threshold,
     )
 
     last_checkpoint = None

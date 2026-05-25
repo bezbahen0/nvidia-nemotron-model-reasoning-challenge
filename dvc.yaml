@@ -67,6 +67,9 @@ stages:
       --max_seq_len ${train.max_seq_len}
       --train_telemetry
       --eval_telemetry
+      --loss_impl cce
+      --cce_impl cce
+      --cce_compare_default_loss_once
     deps:
       - ${data.train_generated}
       - ${data.val_prepared}
@@ -179,6 +182,8 @@ stages:
       --lora_r ${train.lora_r}
       --lora_alpha ${train.lora_alpha}
       --max_seq_len ${train.max_seq_len}
+      --loss_impl cce
+      --cce_impl cce
     deps:
       - ${data.train_dense}
       - ${data.val_prepared}
