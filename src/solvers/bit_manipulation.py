@@ -200,7 +200,7 @@ class BitManipulationSolver:
 
         return best_left_run, best_right_run
 
-    def _select_final_rules(self, flat_matches):
+    def _select_final_rules_with_sources(self, flat_matches):
         best_left_run, best_right_run = self._find_best_runs(flat_matches)
 
         len_l = len(best_left_run)
@@ -215,21 +215,50 @@ class BitManipulationSolver:
                 best_right_run = best_right_run[-len_r:] if len_r > 0 else []
 
         final_rules = [None] * 8
+        selection_reasons = [None] * 8
+        run_groups = []
+
+        def add_run_group(start_idx, run_rules, side):
+            if len(run_rules) <= 1:
+                return None
+
+            group_id = f'g{len(run_groups)}'
+            run_groups.append({
+                'id': group_id,
+                'start': start_idx,
+                'end': start_idx + len(run_rules) - 1,
+                'rules': list(run_rules),
+                'side': side,
+            })
+            return group_id
+
+        left_group_id = add_run_group(0, best_left_run[:len_l], 'left')
 
         for i in range(len_l):
             final_rules[i] = best_left_run[i]
+            selection_reasons[i] = left_group_id if left_group_id is not None else 'direct'
+
+        right_start_idx = 8 - len_r
+        right_group_id = add_run_group(right_start_idx, best_right_run, 'right')
 
         for i in range(len_r):
-            out_idx = 8 - len_r + i
+            out_idx = right_start_idx + i
             final_rules[out_idx] = best_right_run[i]
+            selection_reasons[out_idx] = right_group_id if right_group_id is not None else 'direct'
 
         for out_idx in range(8):
             if final_rules[out_idx] is None:
                 if flat_matches[out_idx]:
                     final_rules[out_idx] = flat_matches[out_idx][0]
+                    selection_reasons[out_idx] = 'direct'
                 else:
                     final_rules[out_idx] = ('UNKNOWN', -1, -1)
+                    selection_reasons[out_idx] = 'fallback'
 
+        return final_rules, selection_reasons, run_groups
+
+    def _select_final_rules(self, flat_matches):
+        final_rules, _, _ = self._select_final_rules_with_sources(flat_matches)
         return final_rules
 
     def _expected_column(self, examples, out_idx):
@@ -256,6 +285,24 @@ class BitManipulationSolver:
             return '?' * len(examples)
 
         return ''.join(str(self._apply_rule(rule, ex_in)) for ex_in, _ in examples)
+
+    def _op_to_cot(self, op):
+        return op.replace('-', '_')
+
+    def _rule_to_compact_text(self, rule):
+        op, in1, in2 = rule
+        op_text = self._op_to_cot(op)
+
+        if op == 'UNKNOWN':
+            return 'UNKNOWN'
+
+        if op in ['C0', 'C1']:
+            return op_text
+
+        if op in ['I', 'NOT']:
+            return f'{op_text}({in1})'
+
+        return f'{op_text}({in1},{in2})'
 
     def _rule_to_text(self, rule):
         op, in1, in2 = rule
@@ -324,6 +371,128 @@ class BitManipulationSolver:
             return f'XOR-NOT(in[{in1}], in[{in2}]) = {v1} XOR NOT({v2}) = {result}', result
 
         return f'{op}(in[{in1}], in[{in2}]) = {result}', result
+
+    def _operation_eval_compact_text(self, rule, input_bits):
+        op, in1, in2 = rule
+        op_text = self._op_to_cot(op)
+
+        if op == 'UNKNOWN':
+            return 'UNKNOWN=1', 1
+
+        if op == 'C0':
+            return 'C0=0', 0
+
+        if op == 'C1':
+            return 'C1=1', 1
+
+        if op == 'I':
+            v1 = int(input_bits[in1])
+            return f'I(b{in1}={v1})={v1}', v1
+
+        if op == 'NOT':
+            v1 = int(input_bits[in1])
+            result = self.ops[op](v1, 0)
+            return f'NOT(b{in1}={v1})={result}', result
+
+        v1 = int(input_bits[in1])
+        v2 = int(input_bits[in2])
+        result = self.ops[op](v1, v2)
+        return f'{op_text}(b{in1}={v1},b{in2}={v2})={result}', result
+
+    def _macro_rule_to_compact_text(self, macro_id):
+        if macro_id == 'NOT_ALL':
+            return 'NOT_ALL'
+
+        if macro_id.startswith('SHL_1_'):
+            return f'SHL1({macro_id.split("_")[2]})'
+
+        if macro_id.startswith('SHR_1_'):
+            return f'SHR1({macro_id.split("_")[2]})'
+
+        if macro_id.startswith('ROL_'):
+            return f'ROL({macro_id.split("_")[1]})'
+
+        if macro_id.startswith('ROR_'):
+            return f'ROR({macro_id.split("_")[1]})'
+
+        if macro_id.startswith('SHL_'):
+            return f'SHL0({macro_id.split("_")[1]})'
+
+        if macro_id.startswith('SHR_'):
+            return f'SHR0({macro_id.split("_")[1]})'
+
+        return macro_id
+
+    def _first_valid_rule_from_group(self, valid_rules, op_names, preferred_rule=None):
+        if preferred_rule is not None and preferred_rule[0] in op_names and preferred_rule in valid_rules:
+            return preferred_rule
+
+        for rule in valid_rules:
+            if rule[0] in op_names:
+                return rule
+
+        return None
+
+    def _find_trace_part(self, tag, rule, examples):
+        if rule is None:
+            return f'{tag}=no'
+
+        rule_text = self._rule_to_compact_text(rule)
+        column = self._rule_column(rule, examples)
+        return f'{tag}={rule_text}={column}'
+
+    def _find_trace_line(self, out_idx, examples, valid_rules, selected_rule):
+        expected = self._expected_column(examples, out_idx)
+        selected_op = selected_rule[0]
+
+        constant_rule = self._first_valid_rule_from_group(
+            valid_rules,
+            ['C0', 'C1'],
+            selected_rule,
+        )
+        unary_rule = self._first_valid_rule_from_group(
+            valid_rules,
+            ['I', 'NOT'],
+            selected_rule,
+        )
+        binary_rule = self._first_valid_rule_from_group(
+            valid_rules,
+            self.bin_ops_keys,
+            selected_rule,
+        )
+
+        parts = [f'o{out_idx}', f'y={expected}']
+        parts.append(self._find_trace_part('C', constant_rule, examples))
+
+        if selected_op in ['C0', 'C1']:
+            return ' '.join(parts)
+
+        parts.append(self._find_trace_part('U', unary_rule, examples))
+
+        if selected_op in ['I', 'NOT']:
+            return ' '.join(parts)
+
+        parts.append(self._find_trace_part('B', binary_rule, examples))
+
+        return ' '.join(parts)
+
+    def _run_group_to_cot(self, group):
+        group_id = group['id']
+        start = group['start']
+        end = group['end']
+        rules = group['rules']
+        first_rule = rules[0]
+        op, in1, in2 = first_rule
+        op_text = self._op_to_cot(op)
+        length = len(rules)
+
+        if op in ['C0', 'C1']:
+            return f'{group_id}=o{start}..o{end} op={op_text} len={length}'
+
+        if op in ['I', 'NOT']:
+            return f'{group_id}=o{start}..o{end} op={op_text} a={in1} step=+1 len={length}'
+
+        return f'{group_id}=o{start}..o{end} op={op_text} a={in1} b={in2} step=+1,+1 len={length}'
 
     def _rule_input_signature(self, rule):
         op, in1, in2 = rule
@@ -439,6 +608,9 @@ class BitManipulationSolver:
                 'macro_id': None,
                 'macro_desc': None,
                 'final_rules': None,
+                'flat_matches': None,
+                'selection_reasons': None,
+                'run_groups': None,
             }
 
         macro_id, macro_desc = self._detect_macro_pattern(examples)
@@ -455,10 +627,13 @@ class BitManipulationSolver:
                 'macro_id': macro_id,
                 'macro_desc': macro_desc,
                 'final_rules': None,
+                'flat_matches': None,
+                'selection_reasons': None,
+                'run_groups': None,
             }
 
         flat_matches = [self._get_valid_rules(examples, out_idx) for out_idx in range(8)]
-        final_rules = self._select_final_rules(flat_matches)
+        final_rules, selection_reasons, run_groups = self._select_final_rules_with_sources(flat_matches)
 
         target_output = ''.join(str(self._apply_rule(rule, target_input)) for rule in final_rules)
 
@@ -471,6 +646,9 @@ class BitManipulationSolver:
             'macro_id': None,
             'macro_desc': None,
             'final_rules': final_rules,
+            'flat_matches': flat_matches,
+            'selection_reasons': selection_reasons,
+            'run_groups': run_groups,
         }
 
     def _render_macro_cot(self, solution):
@@ -478,39 +656,37 @@ class BitManipulationSolver:
         target_input = solution['target_input']
         target_output = solution['target_output']
         macro_id = solution['macro_id']
-        macro_desc = solution['macro_desc']
 
+        macro_rule = self._macro_rule_to_compact_text(macro_id)
         cot = []
 
-        cot.append('Task type: macro')
+        cot.append('TYPE=macro')
+        cot.append('IDX=left_to_right_0_7')
         cot.append('')
-        cot.append('Indexing:')
-        cot.append('Bits are indexed left-to-right as 0..7.')
-        cot.append('')
-        cot.append('Macro rule matching:')
-        cot.append(f'{macro_desc} maps each given input to its expected output.')
-        cot.append(f'Chosen macro: {macro_desc}')
-        cot.append(f'Macro id: {macro_id}')
-        cot.append('')
-        cot.append('Macro check:')
+        cot.append('FIND:')
+        cot.append(f'candidate={macro_rule}')
 
         proof_examples = examples[:self.max_macro_proof_examples]
 
         for ex_idx, (ex_in, ex_out) in enumerate(proof_examples, start=1):
             predicted = self._apply_macro_pattern(macro_id, ex_in)
-            status = 'ok' if predicted == ex_out else 'mismatch'
-            cot.append(f'ex{ex_idx}: {ex_in} -> {predicted}; expected {ex_out}; {status}')
+            cot.append(f'ex{ex_idx} in={ex_in} y={ex_out} m={predicted}')
 
         if len(examples) > len(proof_examples):
             remaining = len(examples) - len(proof_examples)
-            cot.append(f'... {remaining} more example(s) also match this macro rule.')
+            cot.append(f'more={remaining}')
 
         cot.append('')
-        cot.append('Apply to target:')
-        cot.append(f'target = {target_input}')
-        cot.append(f'{macro_desc}: {target_input} -> {target_output}')
+        cot.append('SELECT:')
+        cot.append(f'r={macro_rule} why=all_examples')
+
         cot.append('')
-        cot.append(f'The final answer: {target_output}')
+        cot.append(f'TARGET={target_input}')
+        cot.append('')
+        cot.append('APPLY:')
+        cot.append(f'{macro_rule}({target_input})={target_output}')
+        cot.append('')
+        cot.append(f'ANSWER={target_output}')
 
         return '\n'.join(cot)
 
@@ -519,65 +695,55 @@ class BitManipulationSolver:
         target_input = solution['target_input']
         target_output = solution['target_output']
         final_rules = solution['final_rules']
+        flat_matches = solution['flat_matches']
+        selection_reasons = solution.get('selection_reasons') or ['direct'] * 8
+        run_groups = solution.get('run_groups') or []
 
         cot = []
 
-        cot.append('Task type: bit_rules')
+        cot.append('TYPE=bit_rules')
+        cot.append('IDX=left_to_right_0_7')
         cot.append('')
-        cot.append('Indexing:')
-        cot.append('Bits are indexed left-to-right as 0..7.')
-        cot.append('')
-        cot.append('Output columns:')
-        cot.append('Each output bit is checked as a column across all examples.')
-
-        for out_idx in range(8):
-            expected = self._expected_column(examples, out_idx)
-            cot.append(f'out[{out_idx}] expected = {expected}')
-
-        cot.append('')
-        cot.append('Rule matching:')
+        cot.append('FIND:')
 
         for out_idx, selected_rule in enumerate(final_rules):
-            expected = self._expected_column(examples, out_idx)
-            selected_column = self._rule_column(selected_rule, examples)
-            rule_text = self._rule_to_text(selected_rule)
-
-            if selected_rule[0] == 'UNKNOWN':
-                cot.append(
-                    f'out[{out_idx}]: expected {expected}; no matching standard rule -> '
-                    f'choose out[{out_idx}] = UNKNOWN fallback 1'
-                )
-            else:
-                cot.append(
-                    f'out[{out_idx}]: expected {expected}; {rule_text} gives {selected_column} -> '
-                    f'choose out[{out_idx}] = {rule_text}'
-                )
+            valid_rules = flat_matches[out_idx] if flat_matches is not None else []
+            cot.append(self._find_trace_line(out_idx, examples, valid_rules, selected_rule))
 
         cot.append('')
-        cot.append('Pattern summary:')
-
-        for line in self._pattern_summary_lines(final_rules):
-            cot.append(line)
+        cot.append('RUN:')
+        if run_groups:
+            for group in run_groups:
+                cot.append(self._run_group_to_cot(group))
+        else:
+            cot.append('none')
 
         cot.append('')
-        cot.append('Apply to target:')
-        cot.append(f'target = {target_input}')
-        cot.append('target bits:')
-        cot.append(' '.join(f'in[{idx}]={bit}' for idx, bit in enumerate(target_input)))
+        cot.append('SELECT:')
+        for out_idx, rule in enumerate(final_rules):
+            rule_text = self._rule_to_compact_text(rule)
+            why = selection_reasons[out_idx] if out_idx < len(selection_reasons) else 'direct'
+            cot.append(f'o{out_idx} r={rule_text} why={why}')
+
         cot.append('')
+        cot.append(f'TARGET={target_input}')
+        cot.append('')
+        cot.append('APPLY:')
 
         output_bits = []
 
         for out_idx, rule in enumerate(final_rules):
-            eval_text, result = self._operation_eval_text(rule, target_input)
+            eval_text, result = self._operation_eval_compact_text(rule, target_input)
             output_bits.append(str(result))
-            cot.append(f'out[{out_idx}] = {eval_text}')
+            cot.append(f'o{out_idx}={eval_text}')
 
         recomputed_output = ''.join(output_bits)
 
         cot.append('')
-        cot.append(f'result = {recomputed_output}')
-        cot.append(f'The final answer: {target_output}')
+        cot.append(f'ANSWER={recomputed_output}')
+
+        if recomputed_output != target_output:
+            cot.append(f'SOLVER_ANSWER={target_output}')
 
         return '\n'.join(cot)
 
@@ -586,9 +752,9 @@ class BitManipulationSolver:
 
         if solution['status'] == 'parse_error':
             return '\n'.join([
-                'Task type: parse_error',
-                'Reason: could not parse at least one example pair or the target input.',
-                'The final answer: nan',
+                'TYPE=parse_error',
+                'REASON=parse_failed',
+                'ANSWER=nan',
             ])
 
         if solution['task_type'] == 'macro':
@@ -599,6 +765,10 @@ class BitManipulationSolver:
     def extract_answer(self, cot_text: str) -> str:
         if not cot_text:
             return 'nan'
+
+        match = re.search(r'(?im)^\s*ANSWER\s*=\s*([01]{8})\s*$', cot_text)
+        if match:
+            return match.group(1)
 
         match = re.search(r'(?i)final\s+answer:\s*([01]{8})', cot_text)
         return match.group(1) if match else 'nan'
