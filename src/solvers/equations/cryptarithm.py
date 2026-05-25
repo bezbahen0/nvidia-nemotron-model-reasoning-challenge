@@ -57,6 +57,9 @@ class TraceConfig:
     max_branch_rejects: int = 3
     include_global_support_pruning: bool = True
     max_global_support_space: int = 2_000_000
+    max_partial_target_space: int = 250_000
+    max_window_width: int = 3
+    allow_partial_target_solution: bool = True
 
 @dataclass
 class SearchStats:
@@ -513,6 +516,25 @@ class _CryptarithmCore:
             if changes:
                 return True, DomainEvent(kind="ALLDIFF", label="fixed", constraint="fixed digits cannot appear in other domains", changes=changes, fixed=fixed)
 
+        # Hidden single: if a digit can be used by only one symbol, that symbol is fixed.
+        digit_places: Dict[int, List[str]] = {d: [] for d in range(10)}
+        for ch, values in domains.items():
+            if len(values) == 1:
+                continue
+            for d in values:
+                digit_places[d].append(ch)
+        for d, places in digit_places.items():
+            if len(places) != 1:
+                continue
+            ch = places[0]
+            if len(domains[ch]) <= 1:
+                continue
+            before = tuple(sorted(domains[ch]))
+            domains[ch].intersection_update({d})
+            after = tuple(sorted(domains[ch]))
+            if after != before:
+                return True, DomainEvent(kind="HIDDEN", label=f"digit {d}", constraint=f"only {self._literal(ch)} can be {d}", changes={ch: (before, after)}, fixed={ch: d})
+
         # Hall-set / naked-pair pruning. For <=10 symbols, checking small subsets is cheap.
         open_symbols = [ch for ch, values in domains.items() if 1 < len(values) <= 4]
         for size in range(2, min(4, len(open_symbols)) + 1):
@@ -620,7 +642,7 @@ class _CryptarithmCore:
         selected: List[DomainEvent] = []
         selected_keys: Set[Tuple[Any, ...]] = set()
         for event in deduped:
-            important = event.kind in {"NO0", "GLOBAL", "HALL", "CAT"} or event.kind.startswith("COL") or bool(event.fixed) or bool(event.contradiction)
+            important = event.kind in {"NO0", "GLOBAL", "HALL", "HIDDEN", "CAT"} or event.kind.startswith("COL") or event.kind.startswith("WIN") or bool(event.fixed) or bool(event.contradiction)
             if important:
                 selected.append(event)
                 selected_keys.add(self._event_key(event))
@@ -934,6 +956,143 @@ class _ColumnDeductiveSolver(_CryptarithmCore):
             return False, None
         return True, DomainEvent(kind=kind, label=eq.display(), constraint=constraint_text, changes=changes, fixed=fixed)
 
+    def _low_value_from_lsd(self, lsd_symbols: Sequence[str], local: Assignment, width: int) -> int:
+        value = 0
+        multiplier = 1
+        for i in range(width):
+            if i < len(lsd_symbols):
+                value += local[lsd_symbols[i]] * multiplier
+            multiplier *= 10
+        return value
+
+    def _project_window_symbols_only(
+        self,
+        eq: Equation,
+        rule: Rule,
+        width: int,
+        state: _ColumnState,
+    ) -> Tuple[Optional[bool], Optional[DomainEvent]]:
+        """Project a low-column window without assigning the full equation.
+
+        WIN constraints sit between single COL constraints and full EQ projection:
+        they combine the lowest `width` columns at once, so carries/borrows are
+        forced more strongly while the proof remains local and readable.
+        """
+        if width <= 1 or rule.name == "concat_fwd":
+            return False, None
+        left = self._lsd_symbols(eq.left, rule)
+        right = self._lsd_symbols(eq.right, rule)
+        result = self._lsd_symbols(eq.result, rule)
+        m = 10 ** width
+        scope: List[str] = []
+        for seq in (left, right, result):
+            for ch in seq[:width]:
+                if ch not in scope:
+                    scope.append(ch)
+        if not scope:
+            return False, None
+
+        def pred(local: Assignment) -> bool:
+            lv = self._low_value_from_lsd(left, local, width)
+            rv = self._low_value_from_lsd(right, local, width)
+            ov = self._low_value_from_lsd(result, local, width)
+            if rule.name == "add":
+                return (lv + rv - ov) % m == 0
+            if rule.name == "add_p1":
+                return (lv + rv + 1 - ov) % m == 0
+            if rule.name == "add_m1":
+                return (lv + rv - 1 - ov) % m == 0
+            if rule.name == "mul":
+                return (lv * rv - ov) % m == 0
+            if rule.name == "mul_p1":
+                return (lv * rv + 1 - ov) % m == 0
+            if rule.name == "mul_m1":
+                return (lv * rv - 1 - ov) % m == 0
+            if rule.name == "sub_signed":
+                if eq.has_sign:
+                    return (rv - lv - ov) % m == 0
+                return (lv - rv - ov) % m == 0
+            if rule.name == "absdiff":
+                return (lv - rv - ov) % m == 0 or (rv - lv - ov) % m == 0
+            return True
+
+        label = f"{eq.display()}[0..{width-1}]"
+        if rule.name.startswith("add"):
+            op = "+1" if rule.name == "add_p1" else "-1" if rule.name == "add_m1" else ""
+            constraint = f"low{width}: A+B{op}=R mod {m}"
+        elif rule.name.startswith("mul"):
+            op = "+1" if rule.name == "mul_p1" else "-1" if rule.name == "mul_m1" else ""
+            constraint = f"low{width}: A*B{op}=R mod {m}"
+        elif rule.name == "sub_signed":
+            constraint = f"low{width}: {'B-A' if eq.has_sign else 'A-B'}=R mod {m}"
+        else:
+            constraint = f"low{width}: abs(A-B)=R mod {m}"
+        return self._project_evidence(scope, state.symbol_domains, pred, f"WIN{width}", label, constraint)
+
+    def _domain_space(self, domains: Domains) -> int:
+        total = 1
+        for values in domains.values():
+            total *= max(1, len(values))
+            if total > self.trace_config.max_partial_target_space:
+                break
+        return total
+
+    def _symbolic_concat_target(self, left: str, right: str, rule: Rule) -> Optional[str]:
+        if rule.name != "concat_fwd":
+            return None
+        return right + left if rule.reverse else left + right
+
+    def _unique_target_from_domains(
+        self,
+        equations: Sequence[Equation],
+        combo: Dict[str, Rule],
+        target_left: str,
+        target_op: str,
+        target_right: str,
+        domains: Domains,
+    ) -> Optional[Dict[str, Any]]:
+        if self._domain_space(domains) > self.trace_config.max_partial_target_space:
+            return None
+        symbols = sorted(domains, key=lambda ch: (len(domains[ch]), ch))
+        answers: Set[str] = set()
+        a_vals: Set[int] = set()
+        b_vals: Set[int] = set()
+        v_vals: Set[int] = set()
+        witness: Optional[Assignment] = None
+        witness_a: Optional[int] = None
+        witness_b: Optional[int] = None
+        witness_value: Optional[int] = None
+        valid_count = 0
+        for assignment in self._enumerate_symbol_assignments(symbols, domains):
+            if not self._verify(equations, combo, assignment):
+                continue
+            answer, error, a, b, value = self._encode_target(target_left, target_op, target_right, combo[target_op], assignment)
+            if answer is None or error is not None or value is None:
+                continue
+            valid_count += 1
+            if witness is None:
+                witness = dict(assignment)
+                witness_a, witness_b, witness_value = a, b, value
+            answers.add(answer)
+            a_vals.add(a)
+            b_vals.add(b)
+            v_vals.add(value)
+            if len(answers) > 1:
+                return None
+        if valid_count == 0 or not answers or witness is None:
+            return None
+        return {
+            "answer": next(iter(answers)),
+            "assignment": witness,
+            "a_values": a_vals,
+            "b_values": b_vals,
+            "value_values": v_vals,
+            "valid_count": valid_count,
+            "witness_a": witness_a,
+            "witness_b": witness_b,
+            "witness_value": witness_value,
+        }
+
     def _project_exact_symbols_only(
         self,
         eq: Equation,
@@ -986,6 +1145,13 @@ class _ColumnDeductiveSolver(_CryptarithmCore):
                 for col in range(max_cols):
                     changed_col, event = self._project_column_real(idx, eq, rule, col, state)
                     if changed_col is None:
+                        if events is not None and event is not None: events.append(event)
+                        return False
+                    if events is not None and event is not None: events.append(event)
+                max_width = min(max_cols, self.trace_config.max_window_width)
+                for width in range(2, max_width + 1):
+                    changed_win, event = self._project_window_symbols_only(eq, rule, width, state)
+                    if changed_win is None:
                         if events is not None and event is not None: events.append(event)
                         return False
                     if events is not None and event is not None: events.append(event)
@@ -1052,51 +1218,97 @@ class _ColumnDeductiveSolver(_CryptarithmCore):
                 return {"answer": None, "debug": [f"Target operator `{target_op}` was not found among examples."], "trace": []}
             ordered_ops = sorted(candidates, key=lambda op: (len(candidates[op]), -len(by_op[op]), op))
 
-            solved: List[Tuple[str, Assignment, Dict[str, Rule], List[DomainEvent], _ColumnState, Tuple[Any, ...]]] = []
+            solved: List[Dict[str, Any]] = []
+            answer_set: Set[str] = set()
             for combo in self._enumerate_rule_combos(ordered_ops, candidates):
                 state = _ColumnState({ch: set(range(10)) for ch in symbols})
                 events: List[DomainEvent] = []
                 if not self._propagate_deductive(equations, combo, state, events, use_exact_projection=True):
                     continue
+
                 assignment = self._assignment_from_domains(state.symbol_domains)
-                if assignment is None:
-                    continue
-                if not self._verify(equations, combo, assignment):
-                    continue
-                answer, error, a, b, value = self._encode_target(target_left, target_op, target_right, combo[target_op], assignment)
-                if answer is None or error is not None:
-                    continue
-                key = (answer, tuple(sorted(assignment.items())), tuple(sorted((op, self._rule_short(rule)) for op, rule in combo.items())))
-                solved.append((answer, assignment, combo, events, state, (a, b, value, key)))
-                if len(solved) > 1:
+                solution_kind = "full_map"
+                partial_info: Optional[Dict[str, Any]] = None
+
+                if assignment is not None:
+                    if not self._verify(equations, combo, assignment):
+                        continue
+                    answer, error, a, b, value = self._encode_target(target_left, target_op, target_right, combo[target_op], assignment)
+                    if answer is None or error is not None or value is None:
+                        continue
+                else:
+                    if not self.trace_config.allow_partial_target_solution:
+                        continue
+                    partial = self._unique_target_from_domains(equations, combo, target_left, target_op, target_right, state.symbol_domains)
+                    if partial is None:
+                        # If the target operator is concat, try the purely symbolic target.
+                        symbolic = self._symbolic_concat_target(target_left, target_right, combo[target_op])
+                        if symbolic is None:
+                            continue
+                        # Still require at least one completion to avoid accepting contradictory constraints.
+                        continue
+                    assignment = partial["assignment"]
+                    answer = partial["answer"]
+                    a = partial.get("witness_a")
+                    b = partial.get("witness_b")
+                    value = partial.get("witness_value")
+                    solution_kind = "partial_target"
+                    partial_info = partial
+
+                solved.append({
+                    "answer": answer,
+                    "assignment": assignment,
+                    "combo": combo,
+                    "events": events,
+                    "state": state,
+                    "a": a,
+                    "b": b,
+                    "value": value,
+                    "kind": solution_kind,
+                    "partial_info": partial_info,
+                })
+                answer_set.add(answer)
+                if len(answer_set) > 1 or len(solved) > 1:
                     break
 
             elapsed = round(time.time() - started, 4)
             if not solved:
                 return {
                     "answer": None,
-                    "debug": ["REJECT_DEDUCTIVE: no rule combo produced a singleton digit map by column propagation only."],
-                    "trace": ["REJECT_DEDUCTIVE: no rule combo produced a singleton digit map by column propagation only."],
-                    "solution": "REJECT_DEDUCTIVE: no rule combo produced a singleton digit map by column propagation only.",
+                    "debug": ["REJECT_DEDUCTIVE: no rule combo produced a full map or unique target answer by deductive propagation."],
+                    "trace": ["REJECT_DEDUCTIVE: no rule combo produced a full map or unique target answer by deductive propagation."],
+                    "solution": "REJECT_DEDUCTIVE: no rule combo produced a full map or unique target answer by deductive propagation.",
                     "metadata": {"deductive_only": True, "uses_digit_search": False, "rejected_for_training": True},
                     "stats": self.stats.__dict__,
                     "elapsed_seconds": elapsed,
                 }
             if len(solved) > 1:
-                answers = {item[0] for item in solved}
-                return {
-                    "answer": None,
-                    "debug": [f"REJECT_DEDUCTIVE_AMBIGUOUS: multiple singleton rule/map solutions survived; answers={sorted(answers)}."],
-                    "trace": [f"REJECT_DEDUCTIVE_AMBIGUOUS: multiple singleton rule/map solutions survived; answers={sorted(answers)}."],
-                    "solution": f"REJECT_DEDUCTIVE_AMBIGUOUS: multiple singleton rule/map solutions survived; answers={sorted(answers)}.",
-                    "metadata": {"deductive_only": True, "uses_digit_search": False, "rejected_for_training": True},
-                    "stats": self.stats.__dict__,
-                    "elapsed_seconds": elapsed,
-                }
+                answers = {item["answer"] for item in solved}
+                if len(answers) > 1:
+                    return {
+                        "answer": None,
+                        "debug": [f"REJECT_DEDUCTIVE_AMBIGUOUS: multiple rule/map solutions survived; answers={sorted(answers)}."],
+                        "trace": [f"REJECT_DEDUCTIVE_AMBIGUOUS: multiple rule/map solutions survived; answers={sorted(answers)}."],
+                        "solution": f"REJECT_DEDUCTIVE_AMBIGUOUS: multiple rule/map solutions survived; answers={sorted(answers)}.",
+                        "metadata": {"deductive_only": True, "uses_digit_search": False, "rejected_for_training": True},
+                        "stats": self.stats.__dict__,
+                        "elapsed_seconds": elapsed,
+                    }
+                # Same final answer under multiple internal solutions: keep the first proof.
+                solved = [solved[0]]
 
-            answer, assignment, combo, events, state, extra = solved[0]
-            a, b, value, _key = extra
-            lines = self._render_deductive_solution(equations, clean_target, target_left, target_op, target_right, combo, assignment, answer, None, a, b, value, candidates, events, state)
+            item = solved[0]
+            answer = item["answer"]
+            assignment = item["assignment"]
+            combo = item["combo"]
+            events = item["events"]
+            state = item["state"]
+            a = item["a"]
+            b = item["b"]
+            value = item["value"]
+            solution_kind = item["kind"]
+            partial_info = item["partial_info"]
+            lines = self._render_deductive_solution(equations, clean_target, target_left, target_op, target_right, combo, assignment, answer, None, a, b, value, candidates, events, state, solution_kind, partial_info)
             return {
                 "answer": answer,
                 "debug": lines,
@@ -1114,6 +1326,8 @@ class _ColumnDeductiveSolver(_CryptarithmCore):
                     "target_operator_seen_in_examples": True,
                     "target_operator": target_op,
                     "symbols_count": len(symbols),
+                    "solution_kind": solution_kind,
+                    "target_solved_partially": solution_kind == "partial_target",
                 },
                 "stats": self.stats.__dict__,
                 "elapsed_seconds": elapsed,
@@ -1232,11 +1446,13 @@ class CryptarithmSolver(_ColumnDeductiveSolver):
         candidates: Dict[str, List[Rule]],
         events: Sequence[DomainEvent],
         proof_state: _ColumnState,
+        solution_kind: str = "full_map",
+        partial_info: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         by_op: Dict[str, List[Equation]] = {}
         for eq in equations:
             by_op.setdefault(eq.op, []).append(eq)
-        symbols = sorted(assignment)
+        symbols = sorted(proof_state.symbol_domains)
         lines: List[str] = []
         add = lines.append
         add("TYPE cryptarithm")
@@ -1256,15 +1472,24 @@ class CryptarithmSolver(_ColumnDeductiveSolver):
             add(self._format_domain_event(event))
         open_symbols = [ch for ch in sorted(proof_state.symbol_domains) if len(proof_state.symbol_domains[ch]) > 1]
         open_aux = [name for name in sorted(proof_state.aux_domains) if len(proof_state.aux_domains[name]) > 1]
-        if open_symbols:
-            add("REJECT_OPEN_MAP: " + "; ".join(f"{self._literal(ch)}∈{self._digits_dense(proof_state.symbol_domains[ch])}" for ch in open_symbols) + ".")
-        elif open_aux:
-            add("AUX_OPEN: " + "; ".join(f"{self._var_text(name)}∈{self._digits_dense(proof_state.aux_domains[name])}" for name in open_aux[:12]) + ".")
-            add("MAP_SOLVED: digit map fixed; aux ambiguity irrelevant.")
+        fixed_map = {ch: next(iter(vals)) for ch, vals in proof_state.symbol_domains.items() if len(vals) == 1}
+        if solution_kind == "partial_target":
+            add("TARGET_SOLVED_PARTIAL: target answer is unique across all valid completions; no digit branch used.")
+            if fixed_map:
+                add("MAP_FIXED: " + "; ".join(f"{self._literal(ch)}={fixed_map[ch]}" for ch in sorted(fixed_map)) + ".")
+            if open_symbols:
+                add("FREE: " + "; ".join(f"{self._literal(ch)}∈{self._digits_dense(proof_state.symbol_domains[ch])}" for ch in open_symbols) + ".")
+            add("WITNESS_MAP: " + "; ".join(f"{self._literal(ch)}={assignment[ch]}" for ch in sorted(assignment)) + ".")
         else:
-            add("MAP_SOLVED: deterministic columns + AllDiff/Hall; no search.")
-        add("MAP: " + "; ".join(f"{self._literal(ch)}={assignment[ch]}" for ch in symbols) + ".")
-        add("VERIFY")
+            if open_symbols:
+                add("REJECT_OPEN_MAP: " + "; ".join(f"{self._literal(ch)}∈{self._digits_dense(proof_state.symbol_domains[ch])}" for ch in open_symbols) + ".")
+            elif open_aux:
+                add("AUX_OPEN: " + "; ".join(f"{self._var_text(name)}∈{self._digits_dense(proof_state.aux_domains[name])}" for name in open_aux[:12]) + ".")
+                add("MAP_SOLVED: digit map fixed; aux ambiguity irrelevant.")
+            else:
+                add("MAP_SOLVED: deterministic columns + AllDiff/Hall; no search.")
+            add("MAP: " + "; ".join(f"{self._literal(ch)}={assignment[ch]}" for ch in sorted(assignment)) + ".")
+        add("VERIFY" if solution_kind == "full_map" else "VERIFY_WITNESS")
         for eq in equations:
             rule = combo[eq.op]
             a = self._number(eq.left, assignment, rule.reverse)
@@ -1279,8 +1504,13 @@ class CryptarithmSolver(_ColumnDeductiveSolver):
             add(f"TGT {self._literal(clean_target)}: {target_a},{target_b}; error={target_error or 'invalid'}.")
             add("FINAL <no valid answer>")
         else:
-            op_text, _ = self._operation_line_dense(combo[target_op], target_a, target_b)
-            add(f"TGT {self._literal(clean_target)}: {target_a},{target_b}; {op_text}; enc={self._literal(answer)}.")
+            if solution_kind == "partial_target" and partial_info is not None:
+                def vals_text(values: Set[int]) -> str:
+                    return self._digits_dense(values) if len(values) > 1 else str(next(iter(values)))
+                add(f"TGT_UNIQUE {self._literal(clean_target)}: A∈{vals_text(partial_info['a_values'])}; B∈{vals_text(partial_info['b_values'])}; V∈{vals_text(partial_info['value_values'])}; valid_maps={partial_info['valid_count']}; enc={self._literal(answer)}.")
+            else:
+                op_text, _ = self._operation_line_dense(combo[target_op], target_a, target_b)
+                add(f"TGT {self._literal(clean_target)}: {target_a},{target_b}; {op_text}; enc={self._literal(answer)}.")
             add(f"FINAL {answer}")
         return lines
 
