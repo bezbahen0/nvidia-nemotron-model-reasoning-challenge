@@ -32,6 +32,23 @@ class SolverConfig:
     stop_after_first_match: bool = True
     include_untried_candidate_summary: bool = True
     max_candidate_attempts_per_operator: Optional[int] = None
+    # New policy: family search. The unit of search is a mathematical family
+    # such as cat/rev_cat, add/add1/addm1, mul/mul1/mulm1.
+    # A family block is evaluated once for all transform pairs; if it contains
+    # one or more matching operations, the first match inside that family block
+    # is selected by deterministic transform/op order.
+    family_search: bool = True
+    # If true, when a mathematical family is first reached, compute the same
+    # family for every operand/result transform pair in one batch. Selection
+    # still follows the original candidate order; this only avoids repeating
+    # near-identical family tests for rev/non-rev variants later.
+    batch_transforms_per_family: bool = True
+    # If true, a failed candidate whose operation/transform was already rejected
+    # by an earlier family test is not emitted as a separate candidate line.
+    # The trace remains replayable because the family block already lists the
+    # decision for that operation and transform. Passing candidates are still
+    # emitted when their priority position is reached.
+    suppress_redundant_known_failures: bool = True
 
 
 @dataclass
@@ -41,6 +58,32 @@ class Example:
     b: str
     raw_out: str
     norm_out: str
+
+
+@dataclass
+class RequiredRow:
+    input_a: str
+    input_b: str
+    transformed_a: str
+    transformed_b: str
+    raw_out: str
+    norm_out: str
+    required_raw_result: str
+    rev_ops: bool
+    rev_res: bool
+    lines: List[str]
+
+
+
+
+@dataclass
+class FamilyResult:
+    family: str
+    family_label: str
+    candidate_ops: List[str]
+    op_passes: Dict[str, bool]
+    op_reasons: Dict[str, str]
+    lines: List[str]
 
 
 @dataclass
@@ -60,8 +103,6 @@ class EvalStep:
 
 class ASTBruteForceSolver:
     """
-    Equation solver with reduced search space and replay-complete trace.
-
     Main idea:
       1. Detect/normalize output sign notation per operator.
          Example: 18 } 50 = }32 is normalized to expected numeric output -32.
@@ -324,74 +365,446 @@ class ASTBruteForceSolver:
 
     # Search ----------------------------------------------------------------
 
+    def _family_search_order(self) -> List[Tuple[str, str, List[str]]]:
+        """Deterministic family order used by the family-search policy.
+
+        The old candidate order was operation-position based. In this policy the
+        solver searches by mathematical family first. This is a deliberate policy
+        change: fewer blocks are tested and the trace is shorter, but ambiguous
+        cases can select a different rule than pure candidate-position search.
+        """
+        return [
+            ("concat", "cat/rev_cat", ["cat", "rev_cat"]),
+            ("add_offset", "add/add1/addm1", ["add", "add1", "addm1"]),
+            ("abs_diff_sign", "abs_diff/neg_abs_diff", ["abs_diff", "neg_abs_diff"]),
+            ("sub_offset", "sub/sub1/subm1", ["sub", "sub1", "subm1"]),
+            ("single_rev_sub", "rev_sub", ["rev_sub"]),
+            ("mul_offset", "mul/mul1/mulm1", ["mul", "mul1", "mulm1"]),
+            ("mod_family", "max_mod_min/mod/rev_mod", ["max_mod_min", "mod", "rev_mod"]),
+            ("div_family", "div/rev_div", ["div", "rev_div"]),
+        ]
+
     def _match_operator(self, op: str, group: List[Example], fmt: str) -> Tuple[Optional[Hypothesis], List[Attempt]]:
+        """Family-first search.
+
+        Search unit:
+          family block × all transform pairs
+
+        Selection policy:
+          1. Evaluate families in deterministic family order.
+          2. Each family block computes decisions for every rev_ops/rev_result pair.
+          3. If a family block contains at least one passing operation, select the
+             first passing transform/op combination by transform order, then the
+             operation order inside that family.
+          4. Stop searching this operator after the first passing family block.
+
+        This keeps the trace replayable while avoiding redundant candidate-level
+        FAIL lines for operations that a family proof has already ruled out.
+        """
+        if not self.config.family_search:
+            # The distributed version is intended to use family search. Keeping a
+            # clear failure here is safer than silently falling back to an older
+            # policy with much longer traces.
+            raise RuntimeError("This solver file is configured for family_search=True")
+
         attempts: List[Attempt] = []
         selected: Optional[Hypothesis] = None
-        attempt_index = 0
+        required_cache: Dict[Tuple[bool, bool], List[RequiredRow]] = {}
 
-        for tier, op_names in (("common", self.common_ops_order), ("rare", self.rare_ops_order)):
+        def get_required_rows(rv_ops: bool, rv_res: bool) -> List[RequiredRow]:
+            k = (rv_ops, rv_res)
+            if k not in required_cache:
+                required_cache[k] = self._required_rows_for_transform(
+                    op_char=op,
+                    group=group,
+                    rev_ops=rv_ops,
+                    rev_res=rv_res,
+                )
+            return required_cache[k]
+
+        family_order = self._family_search_order()
+        for family_index, (family, family_label, op_order) in enumerate(family_order, 1):
+            if (
+                self.config.max_candidate_attempts_per_operator is not None
+                and family_index > self.config.max_candidate_attempts_per_operator
+            ):
+                break
+
+            batch_results: Dict[Tuple[bool, bool], FamilyResult] = {}
+            batch_required_rows: Dict[Tuple[bool, bool], List[RequiredRow]] = {}
+            passing_hypotheses: List[Hypothesis] = []
+
             for rev_ops, rev_res in self.transform_order:
-                for op_name in op_names:
-                    attempt_index += 1
-                    if (
-                        self.config.max_candidate_attempts_per_operator is not None
-                        and attempt_index > self.config.max_candidate_attempts_per_operator
-                    ):
-                        return selected, attempts
+                rows = get_required_rows(rev_ops, rev_res)
+                result = self._compute_family_result(family, rows)
+                batch_required_rows[(rev_ops, rev_res)] = rows
+                batch_results[(rev_ops, rev_res)] = result
 
-                    attempt = self._evaluate_candidate(
-                        op_char=op,
-                        group=group,
-                        op_name=op_name,
-                        rev_ops=rev_ops,
-                        rev_res=rev_res,
-                        fmt=fmt,
-                        tier=tier,
-                        attempt_index=attempt_index,
-                    )
-                    attempts.append(attempt)
-                    if attempt["passes"] and selected is None:
-                        selected = (op_name, rev_ops, rev_res, fmt)
-                        if self.config.stop_after_first_match:
-                            return selected, attempts
+                # Select within the family by transform order first, then by the
+                # explicit operation order for this family. This is printed in the
+                # CoT and is therefore replayable.
+                for op_name in op_order:
+                    if result.op_passes.get(op_name, False):
+                        passing_hypotheses.append((op_name, rev_ops, rev_res, fmt))
 
+            selected_in_block = passing_hypotheses[0] if passing_hypotheses else None
+            attempt: Attempt = {
+                "index": family_index,
+                "family": family,
+                "family_label": family_label,
+                "op_order": op_order,
+                "fmt": fmt,
+                "passes": selected_in_block is not None,
+                "selected_hypothesis": selected_in_block,
+                "passing_hypotheses": passing_hypotheses,
+                "batch_family_results": batch_results,
+                "batch_required_rows": batch_required_rows,
+                "family_blocks_reached": family_index,
+                "total_family_blocks": len(family_order),
+            }
+            attempts.append(attempt)
+
+            if selected_in_block is not None and selected is None:
+                selected = selected_in_block
+                if self.config.stop_after_first_match:
+                    break
+
+        for a in attempts:
+            a["family_blocks_reached"] = len(attempts)
+            a["total_family_blocks"] = len(family_order)
         return selected, attempts
 
-    def _evaluate_candidate(
+    def _required_rows_for_transform(
         self,
         op_char: str,
         group: List[Example],
-        op_name: str,
         rev_ops: bool,
         rev_res: bool,
-        fmt: str,
-        tier: str,
-        attempt_index: int,
-    ) -> Attempt:
-        example_steps: List[EvalStep] = []
-        passes = True
-        stop_reason = "all examples matched"
-
+    ) -> List[RequiredRow]:
+        rows: List[RequiredRow] = []
         for ex in group:
-            step = self._eval_example(ex.a, ex.b, op_char, op_name, rev_ops, rev_res, fmt, expected=ex.norm_out)
-            example_steps.append(step)
-            if step.match is False:
-                passes = False
-                stop_reason = f"first mismatch on {ex.a}{op_char}{ex.b}: produced {step.after_result_transform}, expected {ex.norm_out}"
-                if self.config.failed_candidate_mode != "all_examples":
-                    break
+            ta, tb = self._transform_operands(ex.a, ex.b, rev_ops)
+            lines: List[str] = []
+            lines.append(self._operand_step_text(ex.a, ex.b, ta, tb, rev_ops))
+            if rev_res:
+                required = self._rev_digits(ex.norm_out)
+                lines.append(
+                    f"inverse result transform: visible normalized output {ex.norm_out} must have come from raw result {required}, because reversing {required} gives {ex.norm_out}"
+                )
+            else:
+                required = ex.norm_out
+                lines.append(f"inverse result transform: result is not reversed, so required raw result is {required}")
+            rows.append(
+                RequiredRow(
+                    input_a=ex.a,
+                    input_b=ex.b,
+                    transformed_a=ta,
+                    transformed_b=tb,
+                    raw_out=ex.raw_out,
+                    norm_out=ex.norm_out,
+                    required_raw_result=required,
+                    rev_ops=rev_ops,
+                    rev_res=rev_res,
+                    lines=lines,
+                )
+            )
+        return rows
 
-        return {
-            "index": attempt_index,
-            "tier": tier,
-            "op_name": op_name,
-            "rev_ops": rev_ops,
-            "rev_res": rev_res,
-            "fmt": fmt,
-            "passes": passes,
-            "stop_reason": stop_reason,
-            "steps": example_steps,
-        }
+    def _family_for_operation(self, op_name: str) -> str:
+        if op_name in {"cat", "rev_cat"}:
+            return "concat"
+        if op_name in {"add", "add1", "addm1"}:
+            return "add_offset"
+        if op_name in {"sub", "sub1", "subm1"}:
+            return "sub_offset"
+        if op_name in {"mul", "mul1", "mulm1"}:
+            return "mul_offset"
+        if op_name in {"abs_diff", "neg_abs_diff"}:
+            return "abs_diff_sign"
+        if op_name in {"div", "rev_div"}:
+            return "div_family"
+        if op_name in {"max_mod_min", "mod", "rev_mod"}:
+            return "mod_family"
+        return f"single_{op_name}"
+
+    def _compute_family_result(self, family: str, rows: List[RequiredRow]) -> FamilyResult:
+        if family == "concat":
+            return self._compute_concat_family(rows)
+        if family == "add_offset":
+            return self._compute_offset_family(
+                family=family,
+                family_label="add/add1/addm1",
+                rows=rows,
+                base_name="A+B",
+                base_fn=lambda a, b: a + b,
+                op_by_offset={0: "add", 1: "add1", -1: "addm1"},
+            )
+        if family == "sub_offset":
+            return self._compute_offset_family(
+                family=family,
+                family_label="sub/sub1/subm1",
+                rows=rows,
+                base_name="A-B",
+                base_fn=lambda a, b: a - b,
+                op_by_offset={0: "sub", 1: "sub1", -1: "subm1"},
+            )
+        if family == "mul_offset":
+            return self._compute_offset_family(
+                family=family,
+                family_label="mul/mul1/mulm1",
+                rows=rows,
+                base_name="A*B",
+                base_fn=lambda a, b: a * b,
+                op_by_offset={0: "mul", 1: "mul1", -1: "mulm1"},
+            )
+        if family == "abs_diff_sign":
+            return self._compute_abs_diff_family(rows)
+        if family == "div_family":
+            return self._compute_exact_operation_family(
+                family=family,
+                family_label="div/rev_div",
+                rows=rows,
+                op_names=["div", "rev_div"],
+            )
+        if family == "mod_family":
+            return self._compute_mod_family(rows)
+        if family.startswith("single_"):
+            op_name = family[len("single_"):]
+            return self._compute_exact_operation_family(
+                family=family,
+                family_label=op_name,
+                rows=rows,
+                op_names=[op_name],
+            )
+        return self._compute_exact_operation_family(family, family, rows, [])
+
+    @staticmethod
+    def _canonical_int(text: str) -> Optional[int]:
+        try:
+            value = int(text)
+        except ValueError:
+            return None
+        return value if str(value) == text else None
+
+    def _row_ints(self, row: RequiredRow) -> Tuple[int, int]:
+        return int(row.transformed_a), int(row.transformed_b)
+
+    def _canonical_required_values(self, rows: List[RequiredRow], lines: List[str]) -> Optional[List[int]]:
+        values: List[int] = []
+        for i, row in enumerate(rows, 1):
+            y = self._canonical_int(row.required_raw_result)
+            if y is None:
+                lines.append(
+                    f"  row {i}: required raw result {row.required_raw_result} is not a canonical integer string. "
+                    f"Arithmetic operations output canonical integers like 2, -2, 0, so this family cannot match this row."
+                )
+                return None
+            values.append(y)
+        return values
+
+    def _compute_offset_family(
+        self,
+        family: str,
+        family_label: str,
+        rows: List[RequiredRow],
+        base_name: str,
+        base_fn: Callable[[int, int], int],
+        op_by_offset: Dict[int, str],
+    ) -> FamilyResult:
+        offset_desc = ", ".join(
+            f"{op} needs k={'+' if off > 0 else ''}{off}" for off, op in op_by_offset.items()
+        )
+        lines: List[str] = [
+            f"Family test {family_label}: compute k = required_raw_Y - ({base_name}). {offset_desc}.",
+        ]
+        required_values = self._canonical_required_values(rows, lines)
+        op_passes = {op: False for op in op_by_offset.values()}
+        op_reasons: Dict[str, str] = {}
+        if required_values is None:
+            for op in op_passes:
+                op_reasons[op] = "required raw Y is not a canonical integer for at least one row"
+            return FamilyResult(family, family_label, list(op_by_offset.values()), op_passes, op_reasons, lines)
+
+        residuals: List[int] = []
+        residual_terms: List[str] = []
+        for row, y in zip(rows, required_values):
+            a, b = self._row_ints(row)
+            base = base_fn(a, b)
+            k = y - base
+            residuals.append(k)
+            residual_terms.append(f"{y}-{base}={k}")
+        lines.append(f"  residuals k: [{'; '.join(residual_terms)}] -> {residuals}")
+
+        decisions: List[str] = []
+        for offset, op in op_by_offset.items():
+            passes = all(k == offset for k in residuals)
+            op_passes[op] = passes
+            offset_label = f"+{offset}" if offset > 0 else str(offset)
+            op_reasons[op] = (
+                f"all residuals are {offset_label}" if passes else f"residuals {residuals} are not all {offset_label}"
+            )
+            decisions.append(f"{op}={'MATCH' if passes else 'no'}")
+        lines.append("  decisions: " + ", ".join(decisions))
+        if not any(op_passes.values()):
+            lines.append("  conclusion: no allowed offset 0, +1, or -1 fits all examples in this family")
+        return FamilyResult(family, family_label, list(op_by_offset.values()), op_passes, op_reasons, lines)
+
+
+    def _compute_concat_family(self, rows: List[RequiredRow]) -> FamilyResult:
+        family = "concat"
+        family_label = "cat/rev_cat"
+        op_names = ["cat", "rev_cat"]
+        op_passes = {op: True for op in op_names}
+        op_reasons: Dict[str, str] = {}
+        lines: List[str] = ["Family test cat/rev_cat: compare strings, because concatenation may keep leading zeros."]
+        row_bits: List[str] = []
+        for i, row in enumerate(rows, 1):
+            cat = row.transformed_a + row.transformed_b
+            rev_cat = row.transformed_b + row.transformed_a
+            y = row.required_raw_result
+            cat_match = cat == y
+            rev_cat_match = rev_cat == y
+            op_passes["cat"] = op_passes["cat"] and cat_match
+            op_passes["rev_cat"] = op_passes["rev_cat"] and rev_cat_match
+            row_bits.append(f"row{i}:Y={y}, cat={cat}({'ok' if cat_match else 'no'}), rev_cat={rev_cat}({'ok' if rev_cat_match else 'no'})")
+        lines.append("  " + "; ".join(row_bits))
+        lines.append("  decisions: " + ", ".join(f"{op}={'MATCH' if op_passes[op] else 'no'}" for op in op_names))
+        for op in op_names:
+            op_reasons[op] = f"{op} matches every row" if op_passes[op] else f"{op} fails at least one row"
+        return FamilyResult(family, family_label, op_names, op_passes, op_reasons, lines)
+
+
+    def _compute_abs_diff_family(self, rows: List[RequiredRow]) -> FamilyResult:
+        family = "abs_diff_sign"
+        family_label = "abs_diff/neg_abs_diff"
+        op_names = ["abs_diff", "neg_abs_diff"]
+        op_passes = {op: True for op in op_names}
+        op_reasons: Dict[str, str] = {}
+        lines: List[str] = ["Family test abs_diff/neg_abs_diff: D=abs(A-B); abs_diff needs Y=D, neg_abs_diff needs Y=-D."]
+        required_values = self._canonical_required_values(rows, lines)
+        if required_values is None:
+            for op in op_names:
+                op_passes[op] = False
+                op_reasons[op] = "required raw Y is not a canonical integer for at least one row"
+            return FamilyResult(family, family_label, op_names, op_passes, op_reasons, lines)
+        row_bits: List[str] = []
+        for i, (row, y) in enumerate(zip(rows, required_values), 1):
+            a, b = self._row_ints(row)
+            d = abs(a - b)
+            abs_match = y == d
+            neg_match = y == -d
+            op_passes["abs_diff"] = op_passes["abs_diff"] and abs_match
+            op_passes["neg_abs_diff"] = op_passes["neg_abs_diff"] and neg_match
+            row_bits.append(f"row{i}:Y={y},D={d},Y=D:{'ok' if abs_match else 'no'},Y=-D:{'ok' if neg_match else 'no'}")
+        lines.append("  " + "; ".join(row_bits))
+        lines.append("  decisions: " + ", ".join(f"{op}={'MATCH' if op_passes[op] else 'no'}" for op in op_names))
+        for op in op_names:
+            op_reasons[op] = f"{op} matches every row" if op_passes[op] else f"{op} fails at least one row"
+        return FamilyResult(family, family_label, op_names, op_passes, op_reasons, lines)
+
+
+    def _compute_exact_operation_family(
+        self,
+        family: str,
+        family_label: str,
+        rows: List[RequiredRow],
+        op_names: List[str],
+    ) -> FamilyResult:
+        op_passes = {op: True for op in op_names}
+        op_reasons: Dict[str, str] = {}
+        lines: List[str] = [f"Family test {family_label}: compute exact operation values and compare to required raw Y."]
+        row_bits: List[str] = []
+        for i, row in enumerate(rows, 1):
+            pieces = [f"row{i}:Y={row.required_raw_result}"]
+            for op in op_names:
+                produced, _ = self._apply_operation(op, row.transformed_a, row.transformed_b)
+                match = produced == row.required_raw_result
+                op_passes[op] = op_passes[op] and bool(match)
+                pieces.append(f"{op}={produced if produced is not None else 'invalid'}({'ok' if match else 'no'})")
+            row_bits.append(",".join(pieces))
+        if row_bits:
+            lines.append("  " + "; ".join(row_bits))
+        lines.append("  decisions: " + ", ".join(f"{op}={'MATCH' if op_passes[op] else 'no'}" for op in op_names))
+        for op in op_names:
+            op_reasons[op] = f"{op} matches every row" if op_passes[op] else f"{op} fails at least one row"
+        return FamilyResult(family, family_label, op_names, op_passes, op_reasons, lines)
+
+
+    def _compute_mod_family(self, rows: List[RequiredRow]) -> FamilyResult:
+        family = "mod_family"
+        family_label = "max_mod_min/mod/rev_mod"
+        op_names = ["max_mod_min", "mod", "rev_mod"]
+        op_passes = {op: True for op in op_names}
+        op_reasons: Dict[str, str] = {}
+        lines: List[str] = ["Family test max_mod_min/mod/rev_mod: first use modulo range 0..divisor-1, then exact values."]
+        required_values = self._canonical_required_values(rows, lines)
+        if required_values is None:
+            for op in op_names:
+                op_passes[op] = False
+                op_reasons[op] = "required raw Y is not a canonical integer for at least one row"
+            return FamilyResult(family, family_label, op_names, op_passes, op_reasons, lines)
+
+        row_bits: List[str] = []
+        for i, (row, y) in enumerate(zip(rows, required_values), 1):
+            a, b = self._row_ints(row)
+            pieces = [f"row{i}:Y={y}"]
+            checks: List[Tuple[str, Optional[int], Optional[int]]] = []
+            checks.append(("max_mod_min", None if (a == 0 or b == 0) else max(a, b) % min(a, b), None if (a == 0 or b == 0) else min(a, b)))
+            checks.append(("mod", None if b == 0 else a % b, b if b != 0 else None))
+            checks.append(("rev_mod", None if a == 0 else b % a, a if a != 0 else None))
+            for op, produced, divisor in checks:
+                if produced is None or divisor is None:
+                    op_passes[op] = False
+                    pieces.append(f"{op}=invalid(no)")
+                    continue
+                if y < 0 or y >= divisor:
+                    op_passes[op] = False
+                    pieces.append(f"{op}:Y outside 0..{divisor-1}(no)")
+                    continue
+                match = produced == y
+                op_passes[op] = op_passes[op] and match
+                pieces.append(f"{op}={produced}({'ok' if match else 'no'})")
+            row_bits.append(",".join(pieces))
+        lines.append("  " + "; ".join(row_bits))
+        lines.append("  decisions: " + ", ".join(f"{op}={'MATCH' if op_passes[op] else 'no'}" for op in op_names))
+        for op in op_names:
+            op_reasons[op] = f"{op} matches every row" if op_passes[op] else f"{op} fails at least one row"
+        return FamilyResult(family, family_label, op_names, op_passes, op_reasons, lines)
+
+
+    def _eval_required_row(self, row: RequiredRow, op_char: str, op_name: str, fmt: str) -> EvalStep:
+        # Kept for verification/debug compatibility. Main search uses family-pruning.
+        lines: List[str] = []
+        lines.append(
+            f"use precomputed row: A={int(row.transformed_a)}, B={int(row.transformed_b)}, required raw result={row.required_raw_result}"
+        )
+        raw_result, op_lines = self._apply_operation(op_name, row.transformed_a, row.transformed_b)
+        lines.extend(op_lines)
+        if raw_result is None:
+            produced = "<invalid>"
+            final = "<invalid>"
+            match = False
+        else:
+            produced = raw_result
+            visible_norm = self._rev_digits(produced) if row.rev_res else produced
+            final = self._denormalize_output_for_format(visible_norm, op_char, fmt)
+            match = produced == row.required_raw_result
+        lines.append(
+            f"compare raw operation result: produced {produced} vs required {row.required_raw_result} -> {'MATCH' if match else 'WRONG'}"
+        )
+        return EvalStep(
+            input_a=row.input_a,
+            input_b=row.input_b,
+            transformed_a=row.transformed_a,
+            transformed_b=row.transformed_b,
+            op_name=op_name,
+            raw_result=produced,
+            after_result_transform=self._rev_digits(produced) if produced != "<invalid>" and row.rev_res else produced,
+            final_output=final,
+            expected=row.required_raw_result,
+            match=match,
+            lines=lines,
+        )
 
     # Operation evaluation --------------------------------------------------
 
@@ -588,22 +1001,30 @@ class ASTBruteForceSolver:
         return lines
 
     def _render_search_space(self) -> List[str]:
+        family_order = self._family_search_order()
         lines = [
             "Search space",
-            "Search policy: ordered first-match search. The first candidate that matches all examples is selected; lower-priority candidates are not tested.",
-            "We do not search arbitrary output formats. First we normalize operator-prefix/operator-suffix negative outputs, then we search:",
+            "Search policy: ordered family search. The first family block that contains a full match is selected; lower-priority families are not tested.",
+            "A family block checks related operations together, for example add/add1/addm1 or mul/mul1/mulm1.",
+            "Each family block is evaluated once for every operand/result transform pair.",
+            "Inside a passing family block, selection is deterministic: transform order first, then the operation order listed for that family.",
+            "This is a deliberate simplification compared with candidate-by-candidate search: the trace is shorter, and the policy itself is fully stated here.",
+            "We do not search arbitrary output formats. First we normalize operator-prefix/operator-suffix negative outputs.",
+            "Search axes:",
             "- operand transform: normal operands or reversed digits of both operands",
             "- result transform: normal result digits or reversed result digits",
-            "- operations: common operations first, rare operations second",
+            "- family: related operations tested together",
             "Transform order:",
         ]
         for rev_ops, rev_res in self.transform_order:
             lines.append(f"- rev_ops={rev_ops}, rev_result={rev_res}")
-        lines.append("Common operation order: " + ", ".join(self.common_ops_order))
-        lines.append("Rare operation order: " + ", ".join(self.rare_ops_order))
-        lines.append(f"Maximum possible candidates per operator: 4 * ({len(self.common_ops_order)} + {len(self.rare_ops_order)}) = {4 * (len(self.common_ops_order) + len(self.rare_ops_order))}")
+        lines.append("Family order:")
+        for i, (_, label, ops) in enumerate(family_order, 1):
+            lines.append(f"{i}. {label}: operation order inside family = " + ", ".join(ops))
+        lines.append(f"Maximum family blocks per operator: {len(family_order)}")
+        lines.append(f"Equivalent candidate space still covered: 4 transforms * {sum(len(x[2]) for x in family_order)} operations = {4 * sum(len(x[2]) for x in family_order)} transform-operation candidates")
         if not self.config.stop_after_first_match:
-            lines.append("Configured mode: exhaustive; continue after a match and log all candidates.")
+            lines.append("Configured mode: exhaustive over family blocks; continue after a matching family.")
         lines.append("")
         return lines
 
@@ -632,43 +1053,66 @@ class ASTBruteForceSolver:
             group = groups[op]
             attempts = attempts_by_op[op]
             selected = found_by_op.get(op)
+            total_family_blocks = len(self._family_search_order())
             lines.append(f"Operator {self._literal(op)}")
             lines.append("examples: " + "; ".join(f"{ex.a} {op} {ex.b} -> raw {ex.raw_out}, normalized {ex.norm_out}" for ex in group))
-            max_possible = 4 * (len(self.common_ops_order) + len(self.rare_ops_order))
-            lines.append(f"attempted candidates: {len(attempts)} out of {max_possible} possible")
+            lines.append(f"family blocks reached by ordered search: {len(attempts)} out of {total_family_blocks} possible")
+            lines.append("selection policy for this operator: first passing family block wins; inside that block, transform order wins before operation order")
             if selected:
-                lines.append(f"selected first passing candidate: {self._hypothesis_name(selected)}")
+                lines.append(f"selected rule: {self._hypothesis_name(selected)}")
                 if self.config.stop_after_first_match:
-                    skipped = max_possible - len(attempts)
-                    lines.append(
-                        f"search stopped after the first full match; lower-priority candidates not tried: {skipped}"
-                    )
+                    lines.append(f"search stopped after this family block; lower-priority family blocks not tested: {total_family_blocks - len(attempts)}")
             else:
-                lines.append("selected first passing candidate: none")
+                lines.append("selected rule: none")
 
             if self.config.include_all_candidate_attempts:
                 for attempt in attempts:
-                    mark = " SELECTED" if selected and self._attempt_to_hypothesis(attempt) == selected else ""
                     status = "PASS" if attempt["passes"] else "FAIL"
+                    selected_here = attempt.get("selected_hypothesis")
+                    mark = " SELECTED" if selected_here and selected_here == selected else ""
                     lines.append(
-                        f"[{attempt['index']:03d}] {status}{mark}: "
-                        f"tier={attempt['tier']}, rev_ops={attempt['rev_ops']}, rev_result={attempt['rev_res']}, operation={attempt['op_name']}"
+                        f"Family block {attempt['index']:02d}: {status}{mark}: {attempt['family_label']}"
                     )
-                    if attempt["passes"]:
-                        lines.append("  reason: all examples matched")
-                    else:
-                        lines.append(f"  reason: {attempt['stop_reason']}")
-
-                    if attempt["passes"] or self.config.include_failed_candidate_steps:
-                        for step_i, step in enumerate(attempt["steps"], 1):
-                            lines.append(f"  example {step_i}: {step.input_a} {op} {step.input_b}")
-                            for detail in step.lines:
-                                lines.append(f"    {detail}")
-                    elif attempt["steps"]:
-                        step = attempt["steps"][-1]
+                    lines.append("  operation order inside this family: " + ", ".join(attempt.get("op_order", [])))
+                    batch_results: Dict[Tuple[bool, bool], FamilyResult] = attempt["batch_family_results"]
+                    batch_rows: Dict[Tuple[bool, bool], List[RequiredRow]] = attempt.get("batch_required_rows") or {}
+                    # Print the family formula once. Do not repeat the same explanatory
+                    # sentence for every transform pair; each transform line then shows
+                    # only its rows, calculations, decisions, and passing operations.
+                    first_result = batch_results[self.transform_order[0]]
+                    if first_result.lines:
+                        lines.append("  family formula: " + first_result.lines[0].strip())
+                    lines.append("  test this family for every transform pair:")
+                    for b_rev_ops, b_rev_res in self.transform_order:
+                        b_key = (b_rev_ops, b_rev_res)
+                        b_result: FamilyResult = batch_results[b_key]
+                        rows = batch_rows.get(b_key, [])
+                        row_summaries = []
+                        for row_i, row in enumerate(rows, 1):
+                            row_summaries.append(
+                                f"r{row_i}:A={int(row.transformed_a)},B={int(row.transformed_b)},Y={row.required_raw_result}"
+                            )
+                        useful_details = [d.strip() for d in b_result.lines[1:]] if len(b_result.lines) > 1 else []
+                        passing_ops = [op_name for op_name in attempt.get("op_order", []) if b_result.op_passes.get(op_name, False)]
+                        pass_text = "pass=" + (", ".join(passing_ops) if passing_ops else "none")
+                        details = " | ".join(useful_details) if useful_details else "no extra calculation details"
                         lines.append(
-                            f"  first checked example: produced {step.after_result_transform}, expected {step.expected}"
+                            f"    rev_ops={b_rev_ops}, rev_result={b_rev_res}: "
+                            + "; ".join(row_summaries)
+                            + " | "
+                            + details
+                            + " | "
+                            + pass_text
                         )
+
+                    if selected_here:
+                        op_name, rev_ops, rev_res, fmt = selected_here
+                        lines.append(
+                            f"  family block contains at least one full match; choose first by transform order then operation order: "
+                            f"rev_ops={rev_ops}, rev_result={rev_res}, operation={op_name}"
+                        )
+                    else:
+                        lines.append("  family block has no full match for any transform pair")
             lines.append("")
         return lines
 
@@ -752,14 +1196,14 @@ class ASTBruteForceSolver:
             "trace": lines,
             "solution": "\n".join(lines),
             "rule_source": rule_source,
-            "training_category": "equations_transformation.full_trace",
+            "training_category": "equations_transformation.family_search",
             "metadata": {
                 "target_operator_seen_in_examples": not fallback,
                 "uses_fallback_inference": fallback,
                 "target_operator": target_operator,
                 "selected_rule": self._hypothesis_name(selected) if selected else None,
-                "search_space": "sign_normalization + rev_ops/rev_result/operation",
-                "search_policy": "ordered_first_match" if self.config.stop_after_first_match else "exhaustive_all_candidates",
+                "search_space": "sign_normalization + inverse_result_transform_required_table + rev_ops/rev_result/operation",
+                "search_policy": "ordered_family_search" if self.config.stop_after_first_match else "exhaustive_family_search",
             },
         }
 
