@@ -19,7 +19,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 from trl import SFTTrainer, SFTConfig
-from src.metric import verify
+from src.metric import extract_final_answer, verify
 from src.log import logger
 
 def parse_args():
@@ -78,6 +78,25 @@ def parse_args():
     # telemetry
     parser.add_argument("--train_telemetry", action="store_true")
     parser.add_argument("--eval_telemetry", action="store_true")
+
+    # generation-based eval accuracy
+    parser.add_argument(
+        "--eval_generation_max_new_tokens",
+        type=int,
+        default=4096,
+        help="Max new tokens for honest full-answer validation generation",
+    )
+    parser.add_argument(
+        "--eval_generation_batch_size",
+        type=int,
+        default=16,
+        help="Generation eval batch size. 0 means use per_device_eval_batch_size",
+    )
+    parser.add_argument(
+        "--eval_accuracy_save_predictions",
+        action="store_true",
+        help="Save generated validation predictions as jsonl under output_dir/eval_accuracy_predictions",
+    )
     
     return parser.parse_args()
 
@@ -94,6 +113,22 @@ class TimeLimitCallback(TrainerCallback):
             control.should_save = True
 
 
+INSTRUCTION_SUFFIX = "\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`"
+
+
+def _safe_str(value, default=""):
+    if value is None:
+        return default
+
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+
+    return str(value)
+
+
 def load_metadata(data_path):
     df = pd.read_csv(data_path)
 
@@ -101,39 +136,66 @@ def load_metadata(data_path):
 
     for source_row_index, row in df.iterrows():
         metadata[int(source_row_index)] = {
-            "id": str(row["id"]),
-            "source": str(row["source"]),
-            "label": str(row["label"]),
+            "id": _safe_str(row.get("id", source_row_index), str(source_row_index)),
+            "source": _safe_str(row.get("source", "unknown"), "unknown"),
+            "label": _safe_str(row.get("label", "unknown"), "unknown"),
+            "answer": _safe_str(row.get("answer", ""), ""),
+            "prompt": _safe_str(row.get("prompt", ""), ""),
         }
 
     return metadata
+
+
+def load_eval_accuracy_rows(data_path):
+    df = pd.read_csv(data_path)
+
+    before_len = len(df)
+    rows = []
+
+    for source_row_index, row in df.iterrows():
+        prompt = _safe_str(row.get("prompt", ""), "").strip()
+        answer = _safe_str(row.get("answer", ""), "").strip()
+
+        if not prompt or not answer:
+            continue
+
+        rows.append({
+            "source_row_index": int(source_row_index),
+            "id": _safe_str(row.get("id", source_row_index), str(source_row_index)),
+            "source": _safe_str(row.get("source", "unknown"), "unknown"),
+            "label": _safe_str(row.get("label", "unknown"), "unknown"),
+            "prompt": prompt,
+            "answer": answer,
+        })
+
+    logger.info(
+        f"Eval accuracy rows loaded without correctness filtering: {before_len} -> {len(rows)}"
+    )
+
+    return rows
 
 
 def prepare_dataset(csv_path, eval=False):
     df = pd.read_csv(csv_path)
 
     if eval:
-        before_len = len(df)
-        
-        df = df[df.computed_answer.notna()]
-        df = df[df.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1)]
-
-
         logger.info(
-            f"Eval dataset filtered by is_correct=True: {before_len} -> {len(df)}"
+            f"Eval teacher-forced dataset loaded without correctness filtering: len={len(df)}"
         )
-
-    instruction_suffix = "\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`"
 
     formatted_data = []
 
     for source_row_index, row in df.iterrows():
-        user_text = str(row["prompt"]) + instruction_suffix
+        user_text = _safe_str(row.get("prompt", ""), "") + INSTRUCTION_SUFFIX
 
-        computed_answer = str(row["computed_answer"]).strip()
+        computed_answer = _safe_str(row.get("computed_answer", ""), "").strip()
+        if not computed_answer:
+            computed_answer = _safe_str(row.get("answer", ""), "").strip()
+
+        generated_cot = _safe_str(row.get("generated_cot", ""), "")
 
         assistant_text = (
-            f"<think>\n{row['generated_cot']}\n</think>\n"
+            f"<think>\n{generated_cot}\n</think>\n"
             f"Final Answer: \\boxed{{{computed_answer}}}"
         )
 
@@ -146,8 +208,8 @@ def prepare_dataset(csv_path, eval=False):
                 {"role": "assistant", "content": assistant_text}
             ],
         })
-    return Dataset.from_list(formatted_data)
 
+    return Dataset.from_list(formatted_data)
 
 def import_linear_cross_entropy():
     try:
@@ -174,6 +236,10 @@ class TelemetrySFTTrainer(SFTTrainer):
         train_telemetry_enabled=True,
         eval_telemetry_enabled=True,
         telemetry_tokenizer=None,
+        eval_accuracy_rows=None,
+        eval_generation_max_new_tokens=2048,
+        eval_generation_batch_size=0,
+        eval_accuracy_save_predictions=False,
         loss_impl="default",
         cce_impl="cce",
         cce_compare_default_loss_once=False,
@@ -184,6 +250,10 @@ class TelemetrySFTTrainer(SFTTrainer):
 
         self.train_telemetry_metadata = train_telemetry_metadata or {}
         self.eval_telemetry_metadata = eval_telemetry_metadata or {}
+        self.eval_accuracy_rows = list(eval_accuracy_rows or [])
+        self.eval_generation_max_new_tokens = int(eval_generation_max_new_tokens)
+        self.eval_generation_batch_size = int(eval_generation_batch_size)
+        self.eval_accuracy_save_predictions = bool(eval_accuracy_save_predictions)
         
         self.train_telemetry_output_dir = train_telemetry_output_dir
         self.eval_telemetry_output_dir = eval_telemetry_output_dir
@@ -239,6 +309,258 @@ class TelemetrySFTTrainer(SFTTrainer):
             return batch
 
         self.data_collator = telemetry_data_collator
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        start_time = time.time()
+
+        metrics = self._compute_generation_accuracy(metric_key_prefix=metric_key_prefix)
+        metrics[f"{metric_key_prefix}_runtime"] = round(time.time() - start_time, 4)
+
+        if metrics.get(f"{metric_key_prefix}_runtime", 0.0) > 0:
+            total = float(metrics.get(f"{metric_key_prefix}_total", 0.0))
+            metrics[f"{metric_key_prefix}_samples_per_second"] = round(
+                total / max(metrics[f"{metric_key_prefix}_runtime"], 1e-12),
+                4,
+            )
+
+        self.log(metrics)
+        logger.info("[generation_eval] " + json.dumps(metrics, ensure_ascii=False, sort_keys=True))
+
+        self.control = self.callback_handler.on_evaluate(
+            self.args,
+            self.state,
+            self.control,
+            metrics,
+        )
+
+        return metrics
+
+    def _compute_generation_accuracy(self, metric_key_prefix="eval"):
+        tokenizer = self.telemetry_tokenizer
+        if tokenizer is None:
+            raise RuntimeError("Generation eval accuracy requires telemetry_tokenizer")
+
+        if len(self.eval_accuracy_rows) == 0:
+            logger.warning("[generation_eval] No eval accuracy rows found")
+            return {
+                f"{metric_key_prefix}_accuracy": 0.0,
+                f"{metric_key_prefix}_correct": 0,
+                f"{metric_key_prefix}_total": 0,
+                f"{metric_key_prefix}_not_found": 0,
+            }
+
+        world_size = 1
+        rank = 0
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+
+        if distributed:
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+
+        local_rows = self.eval_accuracy_rows[rank::world_size]
+        labels = sorted({str(row.get("label", "unknown")) for row in self.eval_accuracy_rows})
+        label_to_index = {label: index for index, label in enumerate(labels)}
+
+        local_correct = 0
+        local_total = 0
+        local_not_found = 0
+        local_label_correct = torch.zeros(len(labels), dtype=torch.long)
+        local_label_total = torch.zeros(len(labels), dtype=torch.long)
+
+        predictions_file = None
+        if self.eval_accuracy_save_predictions:
+            predictions_dir = os.path.join(self.args.output_dir, "eval_accuracy_predictions")
+            os.makedirs(predictions_dir, exist_ok=True)
+            predictions_path = os.path.join(
+                predictions_dir,
+                f"step-{int(self.state.global_step)}_rank-{rank}.jsonl",
+            )
+            predictions_file = open(predictions_path, "w", encoding="utf-8")
+
+        model = self._unwrap_model_for_generation()
+        device = self._get_model_device(model)
+        was_training = model.training
+        model.eval()
+
+        old_padding_side = getattr(tokenizer, "padding_side", "right")
+        tokenizer.padding_side = "left"
+
+        old_use_cache = None
+        if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+            old_use_cache = model.config.use_cache
+            model.config.use_cache = True
+
+        generation_batch_size = self.eval_generation_batch_size
+        if generation_batch_size <= 0:
+            generation_batch_size = int(self.args.per_device_eval_batch_size)
+        generation_batch_size = max(1, generation_batch_size)
+
+        max_prompt_length = getattr(self.args, "max_length", None)
+        if max_prompt_length is None:
+            max_prompt_length = getattr(self.args, "max_seq_length", None)
+
+        try:
+            with torch.no_grad():
+                for batch_start in range(0, len(local_rows), generation_batch_size):
+                    batch_rows = local_rows[batch_start:batch_start + generation_batch_size]
+                    prompt_texts = [self._build_generation_prompt(row, tokenizer) for row in batch_rows]
+
+                    tokenize_kwargs = {
+                        "return_tensors": "pt",
+                        "padding": True,
+                        "truncation": True,
+                    }
+                    if max_prompt_length is not None:
+                        tokenize_kwargs["max_length"] = int(max_prompt_length)
+
+                    batch = tokenizer(prompt_texts, **tokenize_kwargs).to(device)
+                    input_width = batch["input_ids"].shape[1]
+
+                    generated = model.generate(
+                        **batch,
+                        max_new_tokens=self.eval_generation_max_new_tokens,
+                        do_sample=False,
+                        num_beams=1,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        use_cache=True,
+                    )
+
+                    for row_index, row in enumerate(batch_rows):
+                        generated_tail_ids = generated[row_index, input_width:]
+                        generated_text = tokenizer.decode(
+                            generated_tail_ids,
+                            skip_special_tokens=True,
+                            clean_up_tokenization_spaces=False,
+                        )
+                        predicted_answer = extract_final_answer(generated_text)
+                        is_correct = verify(row["answer"], predicted_answer)
+
+                        label = str(row.get("label", "unknown"))
+                        label_index = label_to_index[label]
+
+                        local_total += 1
+                        local_correct += int(is_correct)
+                        local_not_found += int(predicted_answer == "NOT_FOUND")
+                        local_label_total[label_index] += 1
+                        local_label_correct[label_index] += int(is_correct)
+
+                        if predictions_file is not None:
+                            record = {
+                                "step": int(self.state.global_step),
+                                "source_row_index": int(row.get("source_row_index", -1)),
+                                "id": str(row.get("id", "")),
+                                "source": str(row.get("source", "unknown")),
+                                "label": label,
+                                "answer": str(row["answer"]),
+                                "predicted_answer": str(predicted_answer),
+                                "is_correct": bool(is_correct),
+                                "generated_text": generated_text,
+                            }
+                            predictions_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        finally:
+            if predictions_file is not None:
+                predictions_file.close()
+
+            if old_use_cache is not None:
+                model.config.use_cache = old_use_cache
+
+            tokenizer.padding_side = old_padding_side
+
+            if was_training:
+                model.train()
+
+        device_for_reduce = device if torch.device(device).type != "cpu" else torch.device("cpu")
+        totals_tensor = torch.tensor(
+            [local_correct, local_total, local_not_found],
+            dtype=torch.long,
+            device=device_for_reduce,
+        )
+        label_correct_tensor = local_label_correct.to(device_for_reduce)
+        label_total_tensor = local_label_total.to(device_for_reduce)
+
+        if distributed:
+            torch.distributed.all_reduce(totals_tensor, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(label_correct_tensor, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(label_total_tensor, op=torch.distributed.ReduceOp.SUM)
+
+        correct = int(totals_tensor[0].item())
+        total = int(totals_tensor[1].item())
+        not_found = int(totals_tensor[2].item())
+
+        metrics = {
+            f"{metric_key_prefix}_accuracy": float(correct / total) if total > 0 else 0.0,
+            f"{metric_key_prefix}_correct": correct,
+            f"{metric_key_prefix}_total": total,
+            f"{metric_key_prefix}_not_found": not_found,
+        }
+
+        label_correct_cpu = label_correct_tensor.detach().cpu().tolist()
+        label_total_cpu = label_total_tensor.detach().cpu().tolist()
+
+        for label, label_index in label_to_index.items():
+            label_total = int(label_total_cpu[label_index])
+            label_correct = int(label_correct_cpu[label_index])
+            safe_label = self._safe_metric_name(label)
+
+            metrics[f"{metric_key_prefix}_label_accuracy/{safe_label}"] = (
+                float(label_correct / label_total) if label_total > 0 else 0.0
+            )
+            metrics[f"{metric_key_prefix}_label_correct/{safe_label}"] = label_correct
+            metrics[f"{metric_key_prefix}_label_total/{safe_label}"] = label_total
+
+        return metrics
+
+    def _build_generation_prompt(self, row, tokenizer):
+        messages = [
+            {
+                "role": "user",
+                "content": str(row["prompt"]) + INSTRUCTION_SUFFIX,
+            }
+        ]
+
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            return f"User: {messages[0]['content']}\nAssistant:"
+
+    def _get_model_device(self, model):
+        try:
+            return next(model.parameters()).device
+        except StopIteration:
+            return self.args.device
+
+    def _unwrap_model_for_generation(self):
+        if hasattr(self, "accelerator") and self.accelerator is not None:
+            model = self.accelerator.unwrap_model(self.model)
+        else:
+            model = self.model
+
+        if not hasattr(model, "generate") and hasattr(model, "module"):
+            model = model.module
+
+        if not hasattr(model, "generate"):
+            raise RuntimeError(f"Model object does not expose generate(): {type(model)}")
+
+        return model
+
+    def _safe_metric_name(self, value):
+        value = str(value)
+        safe_chars = []
+
+        for char in value:
+            if char.isalnum() or char in ("_", "-", "."):
+                safe_chars.append(char)
+            else:
+                safe_chars.append("_")
+
+        safe_value = "".join(safe_chars).strip("_")
+        return safe_value or "unknown"
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         source_row_index = inputs.pop("source_row_index", None)
@@ -977,6 +1299,7 @@ def main():
     val_dataset = prepare_dataset(args.val_path, eval=True)
     logger.info(f"val dataset final len: {len(val_dataset)}")
     eval_metadata = load_metadata(args.val_path)
+    eval_accuracy_rows = load_eval_accuracy_rows(args.val_path)
 
     logger.info("Загрузка модели в bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -1016,8 +1339,8 @@ def main():
         save_strategy="steps",
         save_steps=args.eval_steps,
         save_total_limit=2, 
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        metric_for_best_model="eval_accuracy",
+        greater_is_better=True,
         load_best_model_at_end=True,
         
         optim="paged_adamw_8bit",
@@ -1049,12 +1372,16 @@ def main():
         callbacks=[TimeLimitCallback(max_hours=args.max_hours), MemoryStatsCallback()],
         train_telemetry_metadata=train_metadata,
         eval_telemetry_metadata=eval_metadata,
+        eval_accuracy_rows=eval_accuracy_rows,
         train_telemetry_output_dir=train_telemetry_output_dir,
         eval_telemetry_output_dir=eval_telemetry_output_dir,
         telemetry_save_steps=args.eval_steps,
         train_telemetry_enabled=args.train_telemetry,
         eval_telemetry_enabled=args.eval_telemetry,
         telemetry_tokenizer=tokenizer,
+        eval_generation_max_new_tokens=args.eval_generation_max_new_tokens,
+        eval_generation_batch_size=args.eval_generation_batch_size,
+        eval_accuracy_save_predictions=args.eval_accuracy_save_predictions,
         loss_impl=args.loss_impl,
         cce_impl=args.cce_impl,
         cce_compare_default_loss_once=args.cce_compare_default_loss_once,
