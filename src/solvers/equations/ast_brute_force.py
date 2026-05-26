@@ -1157,7 +1157,6 @@ class ASTBruteForceSolver:
             lines.append(f"  {detail}")
         lines.append(f"Computed output: {step.final_output}")
         lines.append(f"Final answer: {step.final_output}")
-        lines.append(self._boxed(step.final_output))
         return step.final_output, lines
 
     def _render_fallback_no_rule(self, q_a: str, q_op: str, q_b: str) -> Tuple[str, List[str]]:
@@ -1173,7 +1172,6 @@ class ASTBruteForceSolver:
             lines.append(f"  {detail}")
         lines.append(f"Computed output: {step.final_output}")
         lines.append(f"Final answer: {step.final_output}")
-        lines.append(self._boxed(step.final_output))
         return step.final_output, lines
 
     def _render_fallback(self, q_a: str, q_op: str, q_b: str) -> Tuple[str, List[str]]:
@@ -1190,20 +1188,12 @@ class ASTBruteForceSolver:
             lines.append(f"  {detail}")
         lines.append(f"Computed output: {step.final_output}")
         lines.append(f"Final answer: {step.final_output}")
-        lines.append(self._boxed(step.final_output))
         return step.final_output, lines
 
     def _operand_step_text(self, a: str, b: str, ta: str, tb: str, rev_ops: bool) -> str:
         if rev_ops:
             return f"operand transform: reverse both operands: {a}->{ta}, {b}->{tb}; A={int(ta)}, B={int(tb)}"
         return f"operand transform: keep operands: {a}->{ta}, {b}->{tb}; A={int(ta)}, B={int(tb)}"
-
-    @staticmethod
-    def _boxed(answer: str) -> str:
-        # If the answer itself contains braces, do not try to make a malformed LaTeX box.
-        if "{" in answer or "}" in answer:
-            return f"Boxed answer text: {answer}"
-        return f"\\boxed{{{answer}}}"
 
     def _success(
         self,
