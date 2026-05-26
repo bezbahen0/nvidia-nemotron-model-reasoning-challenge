@@ -1015,10 +1015,9 @@ def main():
         eval_steps=args.eval_steps,
         save_strategy="steps",
         save_steps=args.eval_steps,
-        save_total_limit=2, 
+        save_total_limit=3, 
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        load_best_model_at_end=True,
         
         optim="paged_adamw_8bit",
         gradient_checkpointing=True,
@@ -1071,10 +1070,6 @@ def main():
     else:
         logger.info("Запуск обучения с нуля.")
         trainer.train()
-
-    logger.info(f"Save adapters to {args.output_dir}...")
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
 
 if __name__ == "__main__":
     main()
