@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 
 from src.augmentation.equations.cryptarithm_generator import CryptarithmTaskGenerator
 from src.augmentation.equations.ast_brute_force_generator import ASTBruteForceTaskGenerator
-from src.augmentation.bit_manipulation import BitManipulationTaskGenerator
+from src.augmentation.bit_manipulation import BitMatchingAugmentGenerator
 from src.augmentation.encryption import EncryptionTaskGenerator
 from src.metric import verify
 from src.log import logger
@@ -56,11 +56,28 @@ def main():
 
     logger.info(f"Datset countes: \n{data.label.value_counts()}")
 
+    # bit manipulation
+    bit_matching_generator = BitMatchingAugmentGenerator(seed=args.seed)
+
+    bit_mp_gen_dataset = bit_matching_generator.generate_dataset(
+        source_data=data[data.label == "bit manipulation"].copy(),
+        sample_frac=1.0,
+        only_solver_correct=False,
+    )
+
+    logger.info("\nBit matching augmenter:")
+    logger.info(bit_mp_gen_dataset.columns.tolist())
+    logger.info(bit_mp_gen_dataset.task_mode.value_counts(normalize=True))
+    logger.info(f"Generated rows: {len(bit_mp_gen_dataset)}")
+    logger.info(
+        f"Source solver correct rate: "
+        f"{bit_mp_gen_dataset['source_solver_correct'].mean() if len(bit_mp_gen_dataset) else 0.0}"
+    )
+    
     multipliers = {
-        "bit manipulation": 0.5,
         "cryptarithm": 3.5,
         "numeral equations": 2.0,
-        "encryption": 0.5,
+        "encryption": 1.0,
     }
 
     # Equations
@@ -89,17 +106,7 @@ def main():
     logger.info(equations_ast_dataset.columns.tolist())
     logger.info(equations_ast_dataset.task_mode.value_counts(normalize=True))
     logger.info(f'Accuracy: {equations_ast_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean()}')
-    
-    # bit manipulation
-    bit_manipulation_generator = BitManipulationTaskGenerator(seed=args.seed)
 
-    bit_mp_gen_dataset = bit_manipulation_generator.generate_dataset(
-        int(len(data[data.label == "bit manipulation"]) * multipliers["bit manipulation"])
-    )
-    logger.info("\Bit manipulation generator:")
-    logger.info(bit_mp_gen_dataset.columns.tolist())
-    logger.info(bit_mp_gen_dataset.task_mode.value_counts(normalize=True))
-    logger.info(f'Accuracy: {bit_mp_gen_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean()}')
 
     # Encryption
 

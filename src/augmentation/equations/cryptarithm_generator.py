@@ -11,7 +11,7 @@ try:
 except ImportError:
     pandarallel = None
 
-from src.solvers.equations.cryptarithm import CryptarithmSolver, TraceConfig
+from src.solvers.equations.cryptarithm import CryptarithmCSPSolver, TraceConfig
 
 
 cryptarithm_prompt_template = """In Alice's Wonderland, a secret set of transformation rules is applied to equations. Below are a few examples:
@@ -473,14 +473,14 @@ class CryptarithmTaskGenerator:
         self.rng = random.Random(seed)
 
     @staticmethod
-    def _make_solver() -> CryptarithmSolver:
-        return CryptarithmSolver(
+    def _make_solver() -> CryptarithmCSPSolver:
+        return CryptarithmCSPSolver(
             trace_config=TraceConfig(
-                #max_steps=180,
-                #max_solution_chars=24000,
-                #max_examples_per_step=0,
-                #include_rejected_hypotheses=False,
-                #include_search_branches=True,
+                max_steps=180,
+                max_solution_chars=24000,
+                max_examples_per_step=0,
+                include_rejected_hypotheses=False,
+                include_search_branches=True,
             )
         )
 

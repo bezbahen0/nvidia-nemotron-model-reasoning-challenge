@@ -3,7 +3,7 @@ from typing import List, Tuple, Dict, Optional
 
 from src.solvers.equations.ast_brute_force import ASTBruteForceSolver
 from src.solvers.equations.pseudo_math import PseudoMathStringSolver
-from src.solvers.equations.cryptarithm import CryptarithmSolver
+from src.solvers.equations.cryptarithm import CryptarithmCSPSolver
 
 class BaseEquationSolver:
     """
@@ -14,7 +14,7 @@ class BaseEquationSolver:
     def __init__(self):
         # Initialize the pool of available solvers
         self.ast_solver = ASTBruteForceSolver()
-        self.csp_solver = CryptarithmSolver()
+        self.csp_solver = CryptarithmCSPSolver()
         self.string_solver = PseudoMathStringSolver()
 
     def _extract_sections(self, text: str) -> Tuple[str, str]:
