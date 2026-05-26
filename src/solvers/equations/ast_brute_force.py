@@ -1066,7 +1066,6 @@ class ASTBruteForceSolver:
             total_family_blocks = len(self._family_search_order())
             lines.append(f"Operator {self._literal(op)}")
             lines.append("examples: " + "; ".join(f"{ex.a} {op} {ex.b} -> raw {ex.raw_out}, normalized {ex.norm_out}" for ex in group))
-            lines.append(f"family blocks reached by ordered search: {len(attempts)} out of {total_family_blocks} possible")
             lines.append("selection policy for this operator: first passing family block wins; inside that block, transform order wins before operation order")
 
             for attempt in attempts:
