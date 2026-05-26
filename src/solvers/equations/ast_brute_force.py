@@ -155,7 +155,7 @@ class ASTBruteForceSolver:
                 "trace": lines,
                 "solution": "\n".join(lines),
                 "rule_source": "direct_operator_rule",
-                "training_category": "equations_transformation.tong_style_direct_operator",
+                "training_category": "equations_transformation.direct_operator",
                 "metadata": {
                     "target_operator_seen_in_examples": True,
                     "uses_fallback_inference": False,
@@ -754,7 +754,7 @@ class ASTBruteForceSolver:
                 "answer": final_ans,
                 "lines": lines,
                 "rule_source": "fallback_inference",
-                "training_category": "equations_transformation.tong_style_fallback_operator_absent",
+                "training_category": "equations_transformation.fallback_operator_absent",
                 "metadata": {
                     "target_operator_seen_in_examples": False,
                     "uses_fallback_inference": True,
@@ -777,7 +777,7 @@ class ASTBruteForceSolver:
                 "answer": std,
                 "lines": lines,
                 "rule_source": "standard_arithmetic_fallback",
-                "training_category": "equations_transformation.tong_style_standard_arithmetic_fallback",
+                "training_category": "equations_transformation.standard_arithmetic_fallback",
                 "metadata": {
                     "target_operator_seen_in_examples": False,
                     "uses_fallback_inference": True,

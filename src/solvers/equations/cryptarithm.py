@@ -198,7 +198,7 @@ class CryptarithmSolver:
                 "rules": {op: self._rule_name(rule) for op, rule in combo.items()},
                 "stats": self.stats.__dict__,
                 "elapsed_seconds": round(time.time() - started, 4),
-                "training_category": "cryptarithm.tong_style_hybrid",
+                "training_category": "cryptarithm.hybrid",
             }
         except TimeoutError:
             return self._failure("solver timeout", started)
