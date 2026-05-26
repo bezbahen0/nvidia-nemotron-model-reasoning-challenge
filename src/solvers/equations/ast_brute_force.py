@@ -11,47 +11,6 @@ Attempt = Dict[str, Any]
 
 
 @dataclass
-class SolverConfig:
-    # Trace over the reduced search space:
-    #   2 operand transforms × 2 result transforms × (8 common + 11 tier-2 rare operations)
-    # Output prefix/suffix for negatives is normalized before matching, so it is NOT a search axis.
-    #
-    # Default policy is ordered first-match search:
-    #   try candidates in deterministic priority order;
-    #   select the first candidate that matches all examples;
-    #   stop searching that operator.
-    # This keeps the trace replay-complete without logging lower-priority candidates that
-    # the algorithm never uses. Set stop_after_first_match=False to recover exhaustive
-    # full-space logging.
-    include_search_space: bool = True
-    include_output_normalization: bool = True
-    include_all_candidate_attempts: bool = True
-    include_failed_candidate_steps: bool = True
-    failed_candidate_mode: str = "until_first_failure"  # "until_first_failure" or "all_examples"
-    include_verification: bool = True
-    stop_after_first_match: bool = True
-    include_untried_candidate_summary: bool = True
-    max_candidate_attempts_per_operator: Optional[int] = None
-    # New policy: family search. The unit of search is a mathematical family
-    # such as cat/rev_cat, add/add1/addm1, mul/mul1/mulm1.
-    # A family block is evaluated once for all transform pairs; if it contains
-    # one or more matching operations, the first match inside that family block
-    # is selected by deterministic transform/op order.
-    family_search: bool = True
-    # If true, when a mathematical family is first reached, compute the same
-    # family for every operand/result transform pair in one batch. Selection
-    # still follows the original candidate order; this only avoids repeating
-    # near-identical family tests for rev/non-rev variants later.
-    batch_transforms_per_family: bool = True
-    # If true, a failed candidate whose operation/transform was already rejected
-    # by an earlier family test is not emitted as a separate candidate line.
-    # The trace remains replayable because the family block already lists the
-    # decision for that operation and transform. Passing candidates are still
-    # emitted when their priority position is reached.
-    suppress_redundant_known_failures: bool = True
-
-
-@dataclass
 class Example:
     a: str
     op: str
@@ -103,6 +62,8 @@ class EvalStep:
 
 class ASTBruteForceSolver:
     """
+    Equation solver with reduced search space and replay-complete family-search trace.
+
     Main idea:
       1. Detect/normalize output sign notation per operator.
          Example: 18 } 50 = }32 is normalized to expected numeric output -32.
@@ -119,8 +80,7 @@ class ASTBruteForceSolver:
       sign-normalization + (rev_ops × rev_result × operation)
     """
 
-    def __init__(self, config: Optional[SolverConfig] = None):
-        self.config = config or SolverConfig()
+    def __init__(self):
         self._numeric_re = re.compile(r"^(-?\d+)\s*([^\d\s]+)\s*(-?\d+)$")
 
         self.common_ops_order = [
@@ -214,6 +174,22 @@ class ASTBruteForceSolver:
         return "nan"
 
     def solve(self, examples_text: str, target_text: str) -> Dict[str, Any]:
+        """Target-first solver.
+
+        This version intentionally does NOT infer rules for every operator in the
+        prompt. The metric uses only the final answer, so the search is focused on
+        the operator that appears in the target expression.
+
+        Policy:
+          1. Parse and normalize all examples cheaply.
+          2. If the target operator appears in examples, use only those examples.
+          3. Run ordered family search for that operator.
+          4. Verify the selected target-operator rule and apply it to the target.
+          5. If the target operator never appears, use the explicit abs-diff fallback.
+
+        This preserves the same per-operator rule search as the previous
+        family-search solver, but avoids solving irrelevant operators.
+        """
         qm = self._numeric_re.fullmatch(str(target_text).strip())
         if not qm:
             return self._failure("target expression must look like '<number><operator><number>'")
@@ -228,29 +204,55 @@ class ASTBruteForceSolver:
         for ex in examples:
             groups[ex.op].append(ex)
 
-        found_by_op: Dict[str, Hypothesis] = {}
-        attempts_by_op: Dict[str, List[Attempt]] = {}
-        for op in sorted(groups.keys()):
-            found, attempts = self._match_operator(op, groups[op], fmt_by_op[op])
-            attempts_by_op[op] = attempts
-            if found is not None:
-                found_by_op[op] = found
-
         lines: List[str] = []
         lines.extend(self._render_header(examples, f"{q_a}{q_op}{q_b}"))
-        if self.config.include_search_space:
-            lines.extend(self._render_search_space())
-        if self.config.include_output_normalization:
-            lines.extend(self._render_output_normalization(examples, fmt_by_op))
-        lines.extend(self._render_rule_matching(groups, attempts_by_op, found_by_op))
-        if self.config.include_verification:
-            lines.extend(self._render_verification(groups, found_by_op))
+        lines.extend(self._render_search_space())
 
-        if q_op in found_by_op:
-            final, target_lines = self._render_target_direct(q_a, q_op, q_b, found_by_op[q_op])
+        lines.append("Target-first filtering")
+        lines.append(f"The target expression uses operator {self._literal(q_op)}.")
+        if q_op in groups:
+            ignored_ops = [op for op in sorted(groups) if op != q_op]
+            lines.append(
+                f"Use only examples with operator {self._literal(q_op)} first, because only this operator is needed to compute the final answer."
+            )
+            if ignored_ops:
+                lines.append(
+                    "Ignored for rule search: "
+                    + ", ".join(f"operator {self._literal(op)} ({len(groups[op])} example{'s' if len(groups[op]) != 1 else ''})" for op in ignored_ops)
+                    + "."
+                )
+            else:
+                lines.append("No other operators are present.")
+            lines.append("")
+
+            lines.extend(self._render_output_normalization_for_ops(examples, fmt_by_op, [q_op]))
+
+            found, attempts = self._match_operator(q_op, groups[q_op], fmt_by_op[q_op])
+            attempts_by_op: Dict[str, List[Attempt]] = {q_op: attempts}
+            found_by_op: Dict[str, Hypothesis] = {q_op: found} if found is not None else {}
+
+            lines.extend(self._render_rule_matching({q_op: groups[q_op]}, attempts_by_op, found_by_op))
+            lines.extend(self._render_verification({q_op: groups[q_op]}, found_by_op))
+
+            if found is not None:
+                final, target_lines = self._render_target_direct(q_a, q_op, q_b, found)
+                lines.extend(target_lines)
+                return self._success(final, lines, "target_first_direct_operator_rule", q_op, found, False)
+
+            # Target operator was present, but no rule in the reduced family space
+            # explained its examples. Use the same explicit fallback rather than
+            # spending tokens solving unrelated operators that cannot define this
+            # target operator under the per-operator policy.
+            final, target_lines = self._render_fallback_no_rule(q_a, q_op, q_b)
             lines.extend(target_lines)
-            return self._success(final, lines, "direct_operator_rule", q_op, found_by_op[q_op], False)
+            return self._success(final, lines, "fallback_abs_diff_for_unresolved_target_operator", q_op, None, True)
 
+        # Target operator is absent. Unseen operators
+        # use the explicit absolute-difference fallback. There is no need to infer
+        # unrelated operators first.
+        lines.append(f"No example uses target operator {self._literal(q_op)}.")
+        lines.append("Skip rule search and use the explicit unseen-operator fallback.")
+        lines.append("")
         final, target_lines = self._render_fallback(q_a, q_op, q_b)
         lines.extend(target_lines)
         return self._success(final, lines, "fallback_abs_diff_for_unseen_operator", q_op, None, True)
@@ -336,6 +338,7 @@ class ASTBruteForceSolver:
         return fmt_by_op, ordered
 
     def _detect_format(self, op: str, group: List[Example]) -> str:
+        # operator prefix/suffix means a negative number displayed with the operator sign.
         if op != "-" and any(ex.raw_out.startswith(op) and len(ex.raw_out) > len(op) for ex in group):
             return "neg_prefix"
         if op != "-" and any(ex.raw_out.endswith(op) and len(ex.raw_out) > len(op) for ex in group):
@@ -401,12 +404,6 @@ class ASTBruteForceSolver:
         This keeps the trace replayable while avoiding redundant candidate-level
         FAIL lines for operations that a family proof has already ruled out.
         """
-        if not self.config.family_search:
-            # The distributed version is intended to use family search. Keeping a
-            # clear failure here is safer than silently falling back to an older
-            # policy with much longer traces.
-            raise RuntimeError("This solver file is configured for family_search=True")
-
         attempts: List[Attempt] = []
         selected: Optional[Hypothesis] = None
         required_cache: Dict[Tuple[bool, bool], List[RequiredRow]] = {}
@@ -424,12 +421,6 @@ class ASTBruteForceSolver:
 
         family_order = self._family_search_order()
         for family_index, (family, family_label, op_order) in enumerate(family_order, 1):
-            if (
-                self.config.max_candidate_attempts_per_operator is not None
-                and family_index > self.config.max_candidate_attempts_per_operator
-            ):
-                break
-
             batch_results: Dict[Tuple[bool, bool], FamilyResult] = {}
             batch_required_rows: Dict[Tuple[bool, bool], List[RequiredRow]] = {}
             passing_hypotheses: List[Hypothesis] = []
@@ -466,8 +457,7 @@ class ASTBruteForceSolver:
 
             if selected_in_block is not None and selected is None:
                 selected = selected_in_block
-                if self.config.stop_after_first_match:
-                    break
+                break
 
         for a in attempts:
             a["family_blocks_reached"] = len(attempts)
@@ -987,10 +977,10 @@ class ASTBruteForceSolver:
         return f"rev_ops={rev_ops}/rev_result={rev_res}/{op_name}/format={fmt}"
 
     def _render_header(self, examples: List[Example], target_expr: str) -> List[str]:
-        policy = "ordered first-match search" if self.config.stop_after_first_match else "exhaustive matching"
         lines = [
-            f"We need to infer the hidden equation transformation by {policy} over a reduced search space.",
-            "The output is judged only by the final answer, but the trace below is written so the solution can be replayed from the prompt and this text.",
+            "We need to infer only the rule needed for the target equation.",
+            "The output is judged only by the final answer, so this solver uses target-first family search instead of solving every operator in the prompt.",
+            "The trace below is written so the chosen rule and final answer can be replayed from the prompt and this text.",
             "",
             "Examples",
         ]
@@ -1004,13 +994,14 @@ class ASTBruteForceSolver:
         family_order = self._family_search_order()
         lines = [
             "Search space",
-            "Search policy: ordered family search. The first family block that contains a full match is selected; lower-priority families are not tested.",
+            "Search policy: target-first ordered family search.",
+            "Only the target operator is searched when it has examples; unrelated operators are not solved.",
             "A family block checks related operations together, for example add/add1/addm1 or mul/mul1/mulm1.",
             "Each family block is evaluated once for every operand/result transform pair.",
+            "The first family block for the target operator that contains a full match is selected; lower-priority families are not tested.",
             "Inside a passing family block, selection is deterministic: transform order first, then the operation order listed for that family.",
-            "This is a deliberate simplification compared with candidate-by-candidate search: the trace is shorter, and the policy itself is fully stated here.",
-            "We do not search arbitrary output formats. First we normalize operator-prefix/operator-suffix negative outputs.",
-            "Search axes:",
+            "We do not search arbitrary output formats. First we normalize operator-prefix/operator-suffix negative outputs for the relevant operator.",
+            "Search axes for the target operator:",
             "- operand transform: normal operands or reversed digits of both operands",
             "- result transform: normal result digits or reversed result digits",
             "- family: related operations tested together",
@@ -1023,8 +1014,27 @@ class ASTBruteForceSolver:
             lines.append(f"{i}. {label}: operation order inside family = " + ", ".join(ops))
         lines.append(f"Maximum family blocks per operator: {len(family_order)}")
         lines.append(f"Equivalent candidate space still covered: 4 transforms * {sum(len(x[2]) for x in family_order)} operations = {4 * sum(len(x[2]) for x in family_order)} transform-operation candidates")
-        if not self.config.stop_after_first_match:
-            lines.append("Configured mode: exhaustive over family blocks; continue after a matching family.")
+        lines.append("")
+        return lines
+
+    def _render_output_normalization_for_ops(
+        self,
+        examples: List[Example],
+        fmt_by_op: Dict[str, str],
+        ops: List[str],
+    ) -> List[str]:
+        lines = ["Normalize outputs for relevant examples"]
+        for op in ops:
+            if op not in fmt_by_op:
+                continue
+            fmt = fmt_by_op[op]
+            lines.append(f"Operator {self._literal(op)} detected display format: {fmt}")
+            op_examples = [e for e in examples if e.op == op]
+            for ex in op_examples:
+                if ex.raw_out == ex.norm_out:
+                    lines.append(f"- {ex.raw_out} stays {ex.norm_out}")
+                else:
+                    lines.append(f"- {ex.raw_out} normalizes to {ex.norm_out}")
         lines.append("")
         return lines
 
@@ -1060,13 +1070,11 @@ class ASTBruteForceSolver:
             lines.append("selection policy for this operator: first passing family block wins; inside that block, transform order wins before operation order")
             if selected:
                 lines.append(f"selected rule: {self._hypothesis_name(selected)}")
-                if self.config.stop_after_first_match:
-                    lines.append(f"search stopped after this family block; lower-priority family blocks not tested: {total_family_blocks - len(attempts)}")
+                lines.append(f"search stopped after this family block; lower-priority family blocks not tested: {total_family_blocks - len(attempts)}")
             else:
                 lines.append("selected rule: none")
 
-            if self.config.include_all_candidate_attempts:
-                for attempt in attempts:
+            for attempt in attempts:
                     status = "PASS" if attempt["passes"] else "FAIL"
                     selected_here = attempt.get("selected_hypothesis")
                     mark = " SELECTED" if selected_here and selected_here == selected else ""
@@ -1152,6 +1160,22 @@ class ASTBruteForceSolver:
         lines.append(self._boxed(step.final_output))
         return step.final_output, lines
 
+    def _render_fallback_no_rule(self, q_a: str, q_op: str, q_b: str) -> Tuple[str, List[str]]:
+        step = self._eval_example(q_a, q_b, q_op, "abs_diff", False, False, "num", expected=None)
+        lines = [
+            "Target",
+            f"Target operator {self._literal(q_op)} was present in the examples, but no reduced-family rule matched all of its examples.",
+            "Fallback rule: use absolute difference on the original operands.",
+            "This fallback is explicit: no operand reversal, no result reversal, no learned operation from another symbol.",
+            f"Replay fallback on target {q_a} {q_op} {q_b}:",
+        ]
+        for detail in step.lines:
+            lines.append(f"  {detail}")
+        lines.append(f"Computed output: {step.final_output}")
+        lines.append(f"Final answer: {step.final_output}")
+        lines.append(self._boxed(step.final_output))
+        return step.final_output, lines
+
     def _render_fallback(self, q_a: str, q_op: str, q_b: str) -> Tuple[str, List[str]]:
         hyp: Hypothesis = ("abs_diff", False, False, "num")
         step = self._eval_example(q_a, q_b, q_op, "abs_diff", False, False, "num", expected=None)
@@ -1203,7 +1227,7 @@ class ASTBruteForceSolver:
                 "target_operator": target_operator,
                 "selected_rule": self._hypothesis_name(selected) if selected else None,
                 "search_space": "sign_normalization + inverse_result_transform_required_table + rev_ops/rev_result/operation",
-                "search_policy": "ordered_family_search" if self.config.stop_after_first_match else "exhaustive_family_search",
+                "search_policy": "target_first_ordered_family_search",
             },
         }
 
