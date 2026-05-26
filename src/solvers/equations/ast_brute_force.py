@@ -1,92 +1,155 @@
 from __future__ import annotations
 
 import re
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
-Hypothesis = Tuple[str, str, str]
+Hypothesis = Tuple[str, bool, bool, str]
+Attempt = Dict[str, Any]
 
 
 @dataclass
 class SolverConfig:
-    max_candidates_shown: int = 10
-    max_verification_examples_per_operator: int = 12
-    include_candidate_counts: bool = True
-    include_global_style: bool = True
+    # Trace over the reduced search space:
+    #   2 operand transforms × 2 result transforms × (8 common + 11 tier-2 rare operations)
+    # Output prefix/suffix for negatives is normalized before matching, so it is NOT a search axis.
+    #
+    # Default policy is ordered first-match search:
+    #   try candidates in deterministic priority order;
+    #   select the first candidate that matches all examples;
+    #   stop searching that operator.
+    # This keeps the trace replay-complete without logging lower-priority candidates that
+    # the algorithm never uses. Set stop_after_first_match=False to recover exhaustive
+    # full-space logging.
+    include_search_space: bool = True
+    include_output_normalization: bool = True
+    include_all_candidate_attempts: bool = True
+    include_failed_candidate_steps: bool = True
+    failed_candidate_mode: str = "until_first_failure"  # "until_first_failure" or "all_examples"
+    include_verification: bool = True
+    stop_after_first_match: bool = True
+    include_untried_candidate_summary: bool = True
+    max_candidate_attempts_per_operator: Optional[int] = None
+
+
+@dataclass
+class Example:
+    a: str
+    op: str
+    b: str
+    raw_out: str
+    norm_out: str
+
+
+@dataclass
+class EvalStep:
+    input_a: str
+    input_b: str
+    transformed_a: str
+    transformed_b: str
+    op_name: str
+    raw_result: str
+    after_result_transform: str
+    final_output: str
+    expected: Optional[str]
+    match: Optional[bool]
+    lines: List[str]
 
 
 class ASTBruteForceSolver:
     """
-    Search is still brute-force over:
-      operand_config × operation × output_format
+    Equation solver with reduced search space and replay-complete trace.
 
-    CoT format:
-      Examples
-      Shared style
-      Rule matching
-      Verify selected rules
-      Target
+    Main idea:
+      1. Detect/normalize output sign notation per operator.
+         Example: 18 } 50 = }32 is normalized to expected numeric output -32.
+      2. Search only:
+           reverse operands? yes/no
+           reverse result? yes/no
+           operation in common-first, tier-2-rare-second candidate list
+      3. Use ordered first-match search by default: keep the complete trace up to the
+         first candidate that matches all examples, then stop searching that operator.
+
+    This intentionally removes the old axis:
+      operand_config × operation × output_format
+    and replaces it with:
+      sign-normalization + (rev_ops × rev_result × operation)
     """
 
     def __init__(self, config: Optional[SolverConfig] = None):
         self.config = config or SolverConfig()
         self._numeric_re = re.compile(r"^(-?\d+)\s*([^\d\s]+)\s*(-?\d+)$")
 
-        self.config_desc = {
-            "fwd": "read operands normally",
-            "swap_ops": "swap the two operands",
-            "rev_digits": "reverse the digits of both operands",
-            "swap_rev": "reverse the digits of both operands and swap them",
-        }
+        self.common_ops_order = [
+            "cat",
+            "rev_cat",
+            "add",
+            "abs_diff",
+            "neg_abs_diff",
+            "sub",
+            "rev_sub",
+            "mul",
+        ]
+        # Tier 2 only. Tier 3 digit/cross/determinant feature-engineering operations
+        # are intentionally excluded from the main training CoT search space.
+        self.rare_ops_order = [
+            "mul1",
+            "mulm1",
+            "add1",
+            "addm1",
+            "sub1",
+            "subm1",
+            "max_mod_min",
+            "div",
+            "mod",
+            "rev_div",
+            "rev_mod",
+        ]
+        self.transform_order = [
+            (True, True),
+            (False, False),
+            (True, False),
+            (False, True),
+        ]
 
         self.op_desc = {
-            "add": "addition",
-            "sub": "subtraction",
-            "mul": "multiplication",
-            "abs_diff": "absolute difference",
-            "div": "integer division",
-            "mod": "modulo",
-            "rev_div": "reverse integer division",
-            "rev_mod": "reverse modulo",
-            "rev_sub": "reverse subtraction",
-            "add1": "addition plus one",
-            "sub1": "subtraction plus one",
-            "mul1": "multiplication plus one",
-            "addm1": "addition minus one",
-            "subm1": "subtraction minus one",
-            "mulm1": "multiplication minus one",
-            "neg_abs_diff": "negative absolute difference",
-            "cat": "concatenation",
-            "rev_cat": "reverse concatenation",
-            "dsum_add": "sum of digit sums",
-            "dsum_mul": "product of digit sums",
-            "max_mod_min": "larger operand modulo smaller operand",
-            "cross_sum": "cross digit sum",
-            "cross_diff_abs": "absolute difference of digit sums",
-            "cross_concat": "cross digit concatenation",
-            "cross_rev_concat": "reverse cross digit concatenation",
+            "cat": "concatenation: write A followed by B",
+            "rev_cat": "reverse concatenation: write B followed by A",
+            "add": "addition: A + B",
+            "abs_diff": "absolute difference: abs(A - B)",
+            "neg_abs_diff": "negative absolute difference: -abs(A - B)",
+            "sub": "subtraction: A - B",
+            "rev_sub": "reverse subtraction: B - A",
+            "mul": "multiplication: A * B",
+            "mul1": "multiplication plus one: A * B + 1",
+            "mulm1": "multiplication minus one: A * B - 1",
+            "add1": "addition plus one: A + B + 1",
+            "addm1": "addition minus one: A + B - 1",
+            "sub1": "subtraction plus one: A - B + 1",
+            "subm1": "subtraction minus one: A - B - 1",
+            "max_mod_min": "larger operand modulo smaller operand: max(A,B) % min(A,B)",
+            "div": "integer division: A // B",
+            "mod": "modulo: A % B",
+            "rev_div": "reverse integer division: B // A",
+            "rev_mod": "reverse modulo: B % A",
+            "digit_abs_diff": "digit absolute difference: |a1-b1| followed by |a2-b2|",
+            "digit_add_mod10": "digit add mod 10: (a1+b1)%10 followed by (a2+b2)%10",
+            "digit_sub_mod10": "digit sub mod 10: (a1-b1)%10 followed by (a2-b2)%10",
+            "cross_mul": "cross multiply: a1*b1 + a2*b2",
+            "cross_mul_rev": "reverse cross multiply: a1*b2 + a2*b1",
+            "digit_mul": "digit multiply: a1*b1 followed by a2*b2",
+            "digit_mul_rev": "reverse digit multiply: a1*b2 followed by a2*b1",
+            "digit_sum_diff": "digit sum difference: (a1+a2) - (b1+b2)",
+            "digit_sum_sum": "digit sum sum: (a1+a2) + (b1+b2)",
+            "digit_product_diff": "digit product difference: a1*a2 - b1*b2",
+            "digit_product_sum": "digit product sum: a1*a2 + b1*b2",
+            "determinant": "determinant: a1*b2 - a2*b1",
+            "abs_determinant": "absolute determinant: abs(a1*b2 - a2*b1)",
         }
 
-        self.fmt_desc = {
-            "raw": "write the result directly",
-            "abs": "write the absolute result",
-            "zpad2": "write the result padded to 2 digits",
-            "zpad3": "write the result padded to 3 digits",
-            "rev": "reverse the result digits, preserving a leading minus sign if present",
-            "abs_rev": "reverse the absolute result digits",
-            "first_digit": "keep only the first result digit",
-            "last_digit": "keep only the last result digit",
-            "sign_pref_raw": "write the absolute result; if negative, put the operator symbol before it",
-            "sign_suff_raw": "write the absolute result; if negative, put the operator symbol after it",
-            "sign_pref_rev": "reverse the absolute result digits; if negative, put the operator symbol before them",
-            "sign_suff_rev": "reverse the absolute result digits; if negative, put the operator symbol after them",
-            "raw_pref": "prefix the operator to the raw result",
-            "raw_suff": "suffix the operator to the raw result",
-            "abs_pref": "prefix the operator to the absolute result",
-            "abs_suff": "suffix the operator to the absolute result",
-        }
+    # Public API -------------------------------------------------------------
 
     def generate_cot(self, prompt: Any) -> str:
         examples_text, target_text = self._split_prompt(prompt)
@@ -97,10 +160,10 @@ class ASTBruteForceSolver:
     def extract_answer(cot_text: Any) -> str:
         text = "" if cot_text is None else str(cot_text)
         patterns = [
+            r"(?im)^\s*Final answer\s*:\s*(\S+)\s*$",
+            r"(?im)^\s*Computed output\s*:\s*(\S+)\s*$",
+            r"(?im)^\s*Answer\s*:\s*(\S+)\s*$",
             r"\\boxed\{([^{}\s]+)\}",
-            r"(?im)^\s*Final answer\s*:\s*([^\s]+)\s*$",
-            r"(?im)^\s*Computed output\s*:\s*([^\s]+)\s*$",
-            r"(?im)^\s*Answer\s*:\s*([^\s]+)\s*$",
         ]
         for pattern in patterns:
             m = re.search(pattern, text)
@@ -115,66 +178,43 @@ class ASTBruteForceSolver:
             return self._failure("target expression must look like '<number><operator><number>'")
 
         q_a, q_op, q_b = qm.group(1), qm.group(2).strip(), qm.group(3)
-        parsed = self._parse_examples(examples_text)
-        if not parsed:
+        raw_examples = self._parse_examples(examples_text)
+        if not raw_examples:
             return self._failure("no valid examples found")
 
-        ops_grouped: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-        for ex in parsed:
-            ops_grouped[ex["op"]].append(ex)
+        fmt_by_op, examples = self._normalize_outputs(raw_examples)
+        groups: Dict[str, List[Example]] = defaultdict(list)
+        for ex in examples:
+            groups[ex.op].append(ex)
 
-        op_hypotheses = self._find_operator_hypotheses(ops_grouped)
-        global_config, global_fmt = self._infer_shared_style(op_hypotheses, ops_grouped)
-        resolved_ops = self._select_operator_rules(op_hypotheses, ops_grouped, global_config, global_fmt)
-
-        used_base_ops = {self._base_operation_name(h[1]) for h in resolved_ops.values()}
+        found_by_op: Dict[str, Hypothesis] = {}
+        attempts_by_op: Dict[str, List[Attempt]] = {}
+        for op in sorted(groups.keys()):
+            found, attempts = self._match_operator(op, groups[op], fmt_by_op[op])
+            attempts_by_op[op] = attempts
+            if found is not None:
+                found_by_op[op] = found
 
         lines: List[str] = []
-        lines.extend(self._render_header(parsed, f"{q_a}{q_op}{q_b}"))
+        lines.extend(self._render_header(examples, f"{q_a}{q_op}{q_b}"))
+        if self.config.include_search_space:
+            lines.extend(self._render_search_space())
+        if self.config.include_output_normalization:
+            lines.extend(self._render_output_normalization(examples, fmt_by_op))
+        lines.extend(self._render_rule_matching(groups, attempts_by_op, found_by_op))
+        if self.config.include_verification:
+            lines.extend(self._render_verification(groups, found_by_op))
 
-        if self.config.include_global_style:
-            lines.append("Shared style")
-            lines.append(f"operand style: {global_config} ({self.config_desc.get(global_config, global_config)})")
-            lines.append(f"output format: {self._format_label(global_fmt)} ({self.fmt_desc.get(global_fmt, global_fmt)})")
-            lines.append("")
+        if q_op in found_by_op:
+            final, target_lines = self._render_target_direct(q_a, q_op, q_b, found_by_op[q_op])
+            lines.extend(target_lines)
+            return self._success(final, lines, "direct_operator_rule", q_op, found_by_op[q_op], False)
 
-        lines.extend(self._render_rule_matching(ops_grouped, op_hypotheses, resolved_ops, global_config, global_fmt))
-        lines.extend(self._render_verification(ops_grouped, resolved_ops))
+        final, target_lines = self._render_fallback(q_a, q_op, q_b)
+        lines.extend(target_lines)
+        return self._success(final, lines, "fallback_abs_diff_for_unseen_operator", q_op, None, True)
 
-        if q_op in resolved_ops:
-            selected = resolved_ops[q_op]
-            try:
-                a, b, sa, sb, value, final_ans = self._apply_hypothesis(q_a, q_b, q_op, selected)
-            except Exception as exc:
-                return self._failure(f"target calculation failed: {type(exc).__name__}: {exc}")
-
-            lines.extend(self._render_target_direct(q_op, selected, a, b, sa, sb, value, final_ans))
-            return {
-                "answer": final_ans,
-                "debug": lines,
-                "trace": lines,
-                "solution": "\n".join(lines),
-                "rule_source": "direct_operator_rule",
-                "training_category": "equations_transformation.direct_operator",
-                "metadata": {
-                    "target_operator_seen_in_examples": True,
-                    "uses_fallback_inference": False,
-                    "target_operator": q_op,
-                    "selected_rule": self._hypothesis_name(selected),
-                },
-            }
-
-        fallback_result = self._fallback(q_a, q_op, q_b, global_config, global_fmt, used_base_ops)
-        lines.extend(fallback_result["lines"])
-        return {
-            "answer": fallback_result["answer"],
-            "debug": lines,
-            "trace": lines,
-            "solution": "\n".join(lines),
-            "rule_source": fallback_result["rule_source"],
-            "training_category": fallback_result["training_category"],
-            "metadata": fallback_result["metadata"],
-        }
+    # Parsing / normalization ----------------------------------------------
 
     def _split_prompt(self, prompt: Any) -> Tuple[str, str]:
         text = "" if prompt is None else str(prompt)
@@ -193,15 +233,13 @@ class ASTBruteForceSolver:
             r"(?is)(?:result|output)\s+for:\s*([^\n.]+)",
             r"(?is)target\s*:?\s*([^\n.]+)",
         ]
-
         target = ""
         for pattern in target_patterns:
             m = re.search(pattern, text)
             if m:
-                candidate = m.group(1).strip().rstrip(".")
-                compact = candidate.replace(" ", "")
-                if self._numeric_re.fullmatch(compact):
-                    target = compact
+                candidate = m.group(1).strip().rstrip(".").replace(" ", "")
+                if self._numeric_re.fullmatch(candidate):
+                    target = candidate
                     break
 
         if not target:
@@ -213,8 +251,8 @@ class ASTBruteForceSolver:
 
         return "\n".join(example_lines), target
 
-    def _parse_examples(self, examples_text: str) -> List[Dict[str, str]]:
-        parsed: List[Dict[str, str]] = []
+    def _parse_examples(self, examples_text: str) -> List[Example]:
+        parsed: List[Example] = []
         for line in str(examples_text).splitlines():
             if "=" not in line:
                 continue
@@ -222,616 +260,510 @@ class ASTBruteForceSolver:
             m = self._numeric_re.fullmatch(lhs.strip())
             if not m:
                 continue
-            parsed.append(
-                {
-                    "a": m.group(1),
-                    "op": m.group(2).strip(),
-                    "b": m.group(3),
-                    "raw_out": rhs.replace(" ", "").strip(),
-                }
-            )
+            a, op, b = m.group(1), m.group(2).strip(), m.group(3)
+            out = rhs.replace(" ", "").strip()
+            parsed.append(Example(a=a, op=op, b=b, raw_out=out, norm_out=out))
         return parsed
+
+    def _normalize_outputs(self, raw_examples: List[Example]) -> Tuple[Dict[str, str], List[Example]]:
+        groups: Dict[str, List[Example]] = defaultdict(list)
+        for ex in raw_examples:
+            groups[ex.op].append(ex)
+
+        fmt_by_op: Dict[str, str] = {}
+        normalized: List[Example] = []
+
+        for op, group in groups.items():
+            fmt = self._detect_format(op, group)
+            fmt_by_op[op] = fmt
+            for ex in group:
+                normalized.append(
+                    Example(
+                        a=ex.a,
+                        op=ex.op,
+                        b=ex.b,
+                        raw_out=ex.raw_out,
+                        norm_out=self._normalize_output_for_format(ex.raw_out, op, fmt),
+                    )
+                )
+
+        # Preserve original example order.
+        by_key: Dict[Tuple[str, str, str, str], Example] = {
+            (e.a, e.op, e.b, e.raw_out): e for e in normalized
+        }
+        ordered = [by_key[(e.a, e.op, e.b, e.raw_out)] for e in raw_examples]
+        return fmt_by_op, ordered
+
+    def _detect_format(self, op: str, group: List[Example]) -> str:
+        if op != "-" and any(ex.raw_out.startswith(op) and len(ex.raw_out) > len(op) for ex in group):
+            return "neg_prefix"
+        if op != "-" and any(ex.raw_out.endswith(op) and len(ex.raw_out) > len(op) for ex in group):
+            return "neg_suffix"
+        if any(ex.raw_out.endswith("-") and len(ex.raw_out) > 1 for ex in group):
+            return "neg_suffix_dash"
+        # Do not treat a normal leading '-' as a separate output format. It is just a negative number.
+        return "num"
+
+    def _normalize_output_for_format(self, out: str, op: str, fmt: str) -> str:
+        if fmt == "neg_prefix" and op and out.startswith(op) and len(out) > len(op):
+            return "-" + out[len(op):]
+        if fmt == "neg_suffix" and op and out.endswith(op) and len(out) > len(op):
+            return "-" + out[:-len(op)]
+        if fmt == "neg_suffix_dash" and out.endswith("-") and len(out) > 1:
+            return "-" + out[:-1]
+        return out
+
+    def _denormalize_output_for_format(self, normalized: str, op: str, fmt: str) -> str:
+        if fmt == "neg_prefix" and normalized.startswith("-"):
+            return op + normalized[1:]
+        if fmt == "neg_suffix" and normalized.startswith("-"):
+            return normalized[1:] + op
+        if fmt == "neg_suffix_dash" and normalized.startswith("-"):
+            return normalized[1:] + "-"
+        return normalized
+
+    # Search ----------------------------------------------------------------
+
+    def _match_operator(self, op: str, group: List[Example], fmt: str) -> Tuple[Optional[Hypothesis], List[Attempt]]:
+        attempts: List[Attempt] = []
+        selected: Optional[Hypothesis] = None
+        attempt_index = 0
+
+        for tier, op_names in (("common", self.common_ops_order), ("rare", self.rare_ops_order)):
+            for rev_ops, rev_res in self.transform_order:
+                for op_name in op_names:
+                    attempt_index += 1
+                    if (
+                        self.config.max_candidate_attempts_per_operator is not None
+                        and attempt_index > self.config.max_candidate_attempts_per_operator
+                    ):
+                        return selected, attempts
+
+                    attempt = self._evaluate_candidate(
+                        op_char=op,
+                        group=group,
+                        op_name=op_name,
+                        rev_ops=rev_ops,
+                        rev_res=rev_res,
+                        fmt=fmt,
+                        tier=tier,
+                        attempt_index=attempt_index,
+                    )
+                    attempts.append(attempt)
+                    if attempt["passes"] and selected is None:
+                        selected = (op_name, rev_ops, rev_res, fmt)
+                        if self.config.stop_after_first_match:
+                            return selected, attempts
+
+        return selected, attempts
+
+    def _evaluate_candidate(
+        self,
+        op_char: str,
+        group: List[Example],
+        op_name: str,
+        rev_ops: bool,
+        rev_res: bool,
+        fmt: str,
+        tier: str,
+        attempt_index: int,
+    ) -> Attempt:
+        example_steps: List[EvalStep] = []
+        passes = True
+        stop_reason = "all examples matched"
+
+        for ex in group:
+            step = self._eval_example(ex.a, ex.b, op_char, op_name, rev_ops, rev_res, fmt, expected=ex.norm_out)
+            example_steps.append(step)
+            if step.match is False:
+                passes = False
+                stop_reason = f"first mismatch on {ex.a}{op_char}{ex.b}: produced {step.after_result_transform}, expected {ex.norm_out}"
+                if self.config.failed_candidate_mode != "all_examples":
+                    break
+
+        return {
+            "index": attempt_index,
+            "tier": tier,
+            "op_name": op_name,
+            "rev_ops": rev_ops,
+            "rev_res": rev_res,
+            "fmt": fmt,
+            "passes": passes,
+            "stop_reason": stop_reason,
+            "steps": example_steps,
+        }
+
+    # Operation evaluation --------------------------------------------------
+
+    def _rev_digits(self, s: str) -> str:
+        return "-" + s[1:][::-1] if s.startswith("-") else s[::-1]
+
+    def _transform_operands(self, a: str, b: str, rev_ops: bool) -> Tuple[str, str]:
+        if rev_ops:
+            return self._rev_digits(a), self._rev_digits(b)
+        return a, b
+
+    def _eval_example(
+        self,
+        a: str,
+        b: str,
+        op_char: str,
+        op_name: str,
+        rev_ops: bool,
+        rev_res: bool,
+        fmt: str,
+        expected: Optional[str],
+    ) -> EvalStep:
+        ta, tb = self._transform_operands(a, b, rev_ops)
+        lines: List[str] = []
+        lines.append(self._operand_step_text(a, b, ta, tb, rev_ops))
+
+        raw_result, op_lines = self._apply_operation(op_name, ta, tb)
+        lines.extend(op_lines)
+
+        if raw_result is None:
+            normalized = "<invalid>"
+            final = "<invalid>"
+            lines.append(f"result transform: operation is invalid, so no result can be transformed")
+        else:
+            normalized = self._rev_digits(raw_result) if rev_res else raw_result
+            if rev_res:
+                lines.append(f"result transform: reverse digits of {raw_result} -> {normalized}")
+            else:
+                lines.append(f"result transform: keep result as {normalized}")
+            final = self._denormalize_output_for_format(normalized, op_char, fmt)
+            if fmt != "num":
+                lines.append(f"display format {fmt}: normalized {normalized} -> visible {final}")
+            else:
+                lines.append(f"display format num: visible output is {final}")
+
+        match: Optional[bool] = None
+        if expected is not None:
+            match = normalized == expected
+            lines.append(f"compare normalized output: produced {normalized} vs expected {expected} -> {'MATCH' if match else 'WRONG'}")
+
+        return EvalStep(
+            input_a=a,
+            input_b=b,
+            transformed_a=ta,
+            transformed_b=tb,
+            op_name=op_name,
+            raw_result=raw_result if raw_result is not None else "<invalid>",
+            after_result_transform=normalized,
+            final_output=final,
+            expected=expected,
+            match=match,
+            lines=lines,
+        )
+
+    def _apply_operation(self, op_name: str, sa: str, sb: str) -> Tuple[Optional[str], List[str]]:
+        lines: List[str] = []
+        try:
+            a, b = int(sa), int(sb)
+        except ValueError:
+            return None, [f"operation {op_name}: invalid integer operands A={sa}, B={sb}"]
+
+        def emit(expr: str, value: Any) -> Tuple[str, List[str]]:
+            return str(value), [f"operation {op_name}: {expr} = {value}"]
+
+        if op_name == "cat":
+            return sa + sb, [f"operation cat: concat({sa}, {sb}) = {sa + sb}"]
+        if op_name == "rev_cat":
+            return sb + sa, [f"operation rev_cat: concat({sb}, {sa}) = {sb + sa}"]
+        if op_name == "add":
+            return emit(f"{a} + {b}", a + b)
+        if op_name == "abs_diff":
+            return emit(f"abs({a} - {b})", abs(a - b))
+        if op_name == "neg_abs_diff":
+            return emit(f"-abs({a} - {b})", -abs(a - b))
+        if op_name == "sub":
+            return emit(f"{a} - {b}", a - b)
+        if op_name == "rev_sub":
+            return emit(f"{b} - {a}", b - a)
+        if op_name == "mul":
+            return emit(f"{a} * {b}", a * b)
+        if op_name == "mul1":
+            return emit(f"{a} * {b} + 1", a * b + 1)
+        if op_name == "mulm1":
+            return emit(f"{a} * {b} - 1", a * b - 1)
+        if op_name == "add1":
+            return emit(f"{a} + {b} + 1", a + b + 1)
+        if op_name == "addm1":
+            return emit(f"{a} + {b} - 1", a + b - 1)
+        if op_name == "sub1":
+            return emit(f"{a} - {b} + 1", a - b + 1)
+        if op_name == "subm1":
+            return emit(f"{a} - {b} - 1", a - b - 1)
+        if op_name == "max_mod_min":
+            if a == 0 or b == 0:
+                return None, ["operation max_mod_min: invalid because min(A,B) is zero"]
+            big, small = max(a, b), min(a, b)
+            return emit(f"{big} % {small}", big % small)
+        if op_name == "div":
+            if b == 0:
+                return None, ["operation div: invalid because B is zero"]
+            return emit(f"{a} // {b}", a // b)
+        if op_name == "mod":
+            if b == 0:
+                return None, ["operation mod: invalid because B is zero"]
+            return emit(f"{a} % {b}", a % b)
+        if op_name == "rev_div":
+            if a == 0:
+                return None, ["operation rev_div: invalid because A is zero"]
+            return emit(f"{b} // {a}", b // a)
+        if op_name == "rev_mod":
+            if a == 0:
+                return None, ["operation rev_mod: invalid because A is zero"]
+            return emit(f"{b} % {a}", b % a)
+
+        digs = self._two_digits(sa, sb)
+        if digs is None:
+            return None, [f"operation {op_name}: invalid because both transformed operands must be two unsigned digits"]
+        d1, d2, d3, d4 = digs
+
+        if op_name == "digit_abs_diff":
+            value = f"{abs(d1 - d3)}{abs(d2 - d4)}"
+            return value, [f"operation digit_abs_diff: |{d1}-{d3}| || |{d2}-{d4}| = {value}"]
+        if op_name == "digit_add_mod10":
+            value = f"{(d1 + d3) % 10}{(d2 + d4) % 10}"
+            return value, [f"operation digit_add_mod10: ({d1}+{d3})%10 || ({d2}+{d4})%10 = {value}"]
+        if op_name == "digit_sub_mod10":
+            value = f"{(d1 - d3) % 10}{(d2 - d4) % 10}"
+            return value, [f"operation digit_sub_mod10: ({d1}-{d3})%10 || ({d2}-{d4})%10 = {value}"]
+        if op_name == "cross_mul":
+            return emit(f"{d1}*{d3} + {d2}*{d4}", d1 * d3 + d2 * d4)
+        if op_name == "cross_mul_rev":
+            return emit(f"{d1}*{d4} + {d2}*{d3}", d1 * d4 + d2 * d3)
+        if op_name == "digit_mul":
+            value = f"{d1 * d3}{d2 * d4}"
+            return value, [f"operation digit_mul: {d1}*{d3} || {d2}*{d4} = {value}"]
+        if op_name == "digit_mul_rev":
+            value = f"{d1 * d4}{d2 * d3}"
+            return value, [f"operation digit_mul_rev: {d1}*{d4} || {d2}*{d3} = {value}"]
+        if op_name == "digit_sum_diff":
+            return emit(f"({d1}+{d2}) - ({d3}+{d4})", (d1 + d2) - (d3 + d4))
+        if op_name == "digit_sum_sum":
+            return emit(f"({d1}+{d2}) + ({d3}+{d4})", (d1 + d2) + (d3 + d4))
+        if op_name == "digit_product_diff":
+            return emit(f"{d1}*{d2} - {d3}*{d4}", d1 * d2 - d3 * d4)
+        if op_name == "digit_product_sum":
+            return emit(f"{d1}*{d2} + {d3}*{d4}", d1 * d2 + d3 * d4)
+        if op_name == "determinant":
+            return emit(f"{d1}*{d4} - {d2}*{d3}", d1 * d4 - d2 * d3)
+        if op_name == "abs_determinant":
+            return emit(f"abs({d1}*{d4} - {d2}*{d3})", abs(d1 * d4 - d2 * d3))
+
+        return None, [f"operation {op_name}: unknown operation"]
+
+    @staticmethod
+    def _two_digits(sa: str, sb: str) -> Optional[Tuple[int, int, int, int]]:
+        if sa.startswith("-") or sb.startswith("-"):
+            return None
+        if len(sa) != 2 or len(sb) != 2 or not sa.isdigit() or not sb.isdigit():
+            return None
+        return int(sa[0]), int(sa[1]), int(sb[0]), int(sb[1])
+
+    # Rendering --------------------------------------------------------------
 
     @staticmethod
     def _literal(text: str) -> str:
         return repr(text)
 
-    def _format_label(self, fmt: str) -> str:
-        labels = {
-            "raw": "result_direct",
-            "abs": "absolute_result",
-            "zpad2": "zero_padded_2_digits",
-            "zpad3": "zero_padded_3_digits",
-            "rev": "reverse_result_digits",
-            "abs_rev": "reverse_absolute_result_digits",
-            "first_digit": "first_result_digit",
-            "last_digit": "last_result_digit",
-            "sign_pref_raw": "result_with_operator_sign_if_negative",
-            "sign_suff_raw": "result_with_operator_sign_suffix_if_negative",
-            "sign_pref_rev": "reverse_result_with_operator_sign_if_negative",
-            "sign_suff_rev": "reverse_result_with_operator_sign_suffix_if_negative",
-            "raw_pref": "operator_prefixed_raw_result",
-            "raw_suff": "operator_suffixed_raw_result",
-            "abs_pref": "operator_prefixed_absolute_result",
-            "abs_suff": "operator_suffixed_absolute_result",
-        }
-        return labels.get(fmt, fmt)
+    def _hypothesis_name(self, h: Hypothesis) -> str:
+        op_name, rev_ops, rev_res, fmt = h
+        return f"rev_ops={rev_ops}/rev_result={rev_res}/{op_name}/format={fmt}"
 
-    def _rev(self, s: str) -> str:
-        s = str(s)
-        return "-" + s[1:][::-1] if s.startswith("-") else s[::-1]
-
-    def _get_operand_configs(self, sa: str, sb: str) -> Dict[str, Tuple[int, int, str, str]]:
-        return {
-            "fwd": (int(sa), int(sb), sa, sb),
-            "swap_ops": (int(sb), int(sa), sb, sa),
-            "rev_digits": (int(self._rev(sa)), int(self._rev(sb)), self._rev(sa), self._rev(sb)),
-            "swap_rev": (int(self._rev(sb)), int(self._rev(sa)), self._rev(sb), self._rev(sa)),
-        }
-
-    def _get_operations(self, a: int, b: int, sa: str, sb: str) -> Dict[str, int]:
-        ops: Dict[str, int] = {
-            "add": a + b,
-            "sub": a - b,
-            "mul": a * b,
-            "abs_diff": abs(a - b),
-            "rev_sub": b - a,
-            "add1": a + b + 1,
-            "sub1": a - b + 1,
-            "mul1": a * b + 1,
-            "addm1": a + b - 1,
-            "subm1": a - b - 1,
-            "mulm1": a * b - 1,
-            "neg_abs_diff": -abs(a - b),
-        }
-
-        if b != 0:
-            ops["div"] = a // b
-            ops["mod"] = a % b
-        if a != 0:
-            ops["rev_div"] = b // a
-            ops["rev_mod"] = b % a
-
-        if len(sa + sb) < 15:
-            try:
-                ops["cat"] = int(sa + sb)
-            except ValueError:
-                pass
-
-        if len(sb + sa) < 15:
-            try:
-                ops["rev_cat"] = int(sb + sa)
-            except ValueError:
-                pass
-
-        ops["dsum_add"] = sum(int(d) for d in str(abs(a))) + sum(int(d) for d in str(abs(b)))
-        ops["dsum_mul"] = sum(int(d) for d in str(abs(a))) * sum(int(d) for d in str(abs(b)))
-
-        if a != 0 and b != 0:
-            ops["max_mod_min"] = max(a, b) % min(a, b)
-
-        if len(sa) == 2 and len(sb) == 2 and sa.lstrip("-").isdigit() and sb.lstrip("-").isdigit():
-            d1, d2 = int(sa[-2]), int(sa[-1])
-            d3, d4 = int(sb[-2]), int(sb[-1])
-            ops["cross_sum"] = d1 * d3 + d2 * d4
-            ops["cross_diff_abs"] = abs((d1 + d2) - (d3 + d4))
-            ops["cross_concat"] = int(str(d1 * d3) + str(d2 * d4))
-            ops["cross_rev_concat"] = int(str(d1 * d4) + str(d2 * d3))
-
-        return ops
-
-    def _get_formats(self, val: int, op_char: str) -> Dict[str, str]:
-        sval = str(val)
-        abs_val = abs(val)
-        s_abs = str(abs_val)
-
-        formats = {
-            "raw": sval,
-            "abs": s_abs,
-            "zpad2": f"{val:02d}" if val >= 0 else f"-{abs_val:02d}",
-            "zpad3": f"{val:03d}" if val >= 0 else f"-{abs_val:03d}",
-            "rev": "-" + s_abs[::-1] if val < 0 else s_abs[::-1],
-            "abs_rev": s_abs[::-1],
-            "first_digit": sval[0] if val >= 0 else "-" + s_abs[0],
-            "last_digit": sval[-1] if val >= 0 else "-" + s_abs[-1],
-        }
-
-        if val < 0 and op_char:
-            formats["sign_pref_raw"] = op_char + s_abs
-            formats["sign_suff_raw"] = s_abs + op_char
-            formats["sign_pref_rev"] = op_char + s_abs[::-1]
-            formats["sign_suff_rev"] = s_abs[::-1] + op_char
-        elif val >= 0 and op_char:
-            formats["sign_pref_raw"] = s_abs
-            formats["sign_suff_raw"] = s_abs
-            formats["sign_pref_rev"] = s_abs[::-1]
-            formats["sign_suff_rev"] = s_abs[::-1]
-
-        if op_char:
-            formats["raw_pref"] = op_char + sval
-            formats["raw_suff"] = sval + op_char
-            formats["abs_pref"] = op_char + s_abs
-            formats["abs_suff"] = s_abs + op_char
-
-        return formats
-
-    def _score_hypothesis(
-        self,
-        config: str,
-        op_name: str,
-        fmt: str,
-        num_examples: int,
-        global_config: Optional[str] = None,
-        global_fmt: Optional[str] = None,
-    ) -> int:
-        score = 0
-
-        score += {"fwd": 0, "swap_ops": 20, "rev_digits": 30, "swap_rev": 50}.get(config, 100)
-
-        if fmt == "abs":
-            score += 5
-        elif fmt.startswith("sign_"):
-            score += 7
-        elif fmt.startswith("raw_") or fmt.startswith("abs_"):
-            score += 9
-        elif fmt in {"zpad2", "zpad3"}:
-            score += 15
-        elif fmt == "rev":
-            score += 25
-        elif fmt == "abs_rev":
-            score += 27
-        elif "digit" in fmt:
-            score += 40
-
-        op_penalties = {
-            "add": 0,
-            "sub": 1,
-            "abs_diff": 2,
-            "mul": 3,
-            "cat": 4,
-            "div": 10,
-            "mod": 11,
-            "rev_sub": 12,
-            "rev_cat": 13,
-            "add1": 20,
-            "sub1": 21,
-            "mul1": 22,
-            "addm1": 23,
-            "subm1": 24,
-            "mulm1": 25,
-            "neg_abs_diff": 26,
-            "max_mod_min": 27,
-            "dsum_add": 30,
-            "dsum_mul": 31,
-            "cross_sum": 40,
-            "cross_diff_abs": 41,
-            "cross_concat": 42,
-            "cross_rev_concat": 43,
-        }
-        score += op_penalties.get(op_name, 50)
-
-        if num_examples == 1 and op_name in {"mod", "div", "rev_mod", "rev_div"}:
-            score += 100
-
-        if global_config and global_fmt and config == global_config and fmt == global_fmt:
-            score -= 1000
-
-        return score
-
-    def _find_operator_hypotheses(self, ops_grouped: Dict[str, List[Dict[str, str]]]) -> Dict[str, List[Hypothesis]]:
-        configs_order = ["fwd", "rev_digits", "swap_ops", "swap_rev"]
-        full_ops_keys = list(self._get_operations(12, 34, "12", "34").keys())
-        op_hypotheses: Dict[str, List[Hypothesis]] = {}
-
-        for op, group in ops_grouped.items():
-            valid: List[Hypothesis] = []
-            fmt_names = list(self._get_formats(1, op).keys())
-
-            for op_config in configs_order:
-                for op_name in full_ops_keys:
-                    for out_fmt in fmt_names:
-                        if out_fmt in {"first_digit", "last_digit"} and len(group) < 3:
-                            continue
-
-                        all_pass = True
-                        for ex in group:
-                            cfg = self._get_operand_configs(ex["a"], ex["b"])[op_config]
-                            ops = self._get_operations(*cfg)
-
-                            if op_name not in ops:
-                                all_pass = False
-                                break
-
-                            formats = self._get_formats(ops[op_name], op)
-                            if out_fmt not in formats or formats[out_fmt] != ex["raw_out"]:
-                                all_pass = False
-                                break
-
-                        if all_pass:
-                            valid.append((op_config, op_name, out_fmt))
-
-            op_hypotheses[op] = valid
-
-        return op_hypotheses
-
-    def _infer_shared_style(
-        self,
-        op_hypotheses: Dict[str, List[Hypothesis]],
-        ops_grouped: Dict[str, List[Dict[str, str]]],
-    ) -> Tuple[str, str]:
-        anomaly_config: Optional[str] = None
-        anomaly_fmt: Optional[str] = None
-        config_penalties = {"fwd": 0, "swap_ops": 20, "rev_digits": 30, "swap_rev": 50}
-
-        for hyps in op_hypotheses.values():
-            if not hyps:
-                continue
-            configs_used = {h[0] for h in hyps}
-            if "fwd" not in configs_used:
-                anomaly_config = min(configs_used, key=lambda c: config_penalties.get(c, 100))
-                break
-
-        for op, hyps in op_hypotheses.items():
-            if not hyps:
-                continue
-            fmts_used = {h[2] for h in hyps}
-            if "raw" not in fmts_used:
-                best_h = min(hyps, key=lambda h: self._score_hypothesis(h[0], h[1], h[2], len(ops_grouped[op])))
-                anomaly_fmt = best_h[2]
-                break
-
-        config_counts: Counter[str] = Counter()
-        fmt_counts: Counter[str] = Counter()
-
-        for op, hyps in op_hypotheses.items():
-            if not hyps:
-                continue
-            best_base = min(hyps, key=lambda h: self._score_hypothesis(h[0], h[1], h[2], len(ops_grouped[op])))
-            config_counts[best_base[0]] += 1
-            fmt_counts[best_base[2]] += 1
-
-        global_config = anomaly_config or (config_counts.most_common(1)[0][0] if config_counts else "fwd")
-        global_fmt = anomaly_fmt or (fmt_counts.most_common(1)[0][0] if fmt_counts else "raw")
-
-        return global_config, global_fmt
-
-    def _select_operator_rules(
-        self,
-        op_hypotheses: Dict[str, List[Hypothesis]],
-        ops_grouped: Dict[str, List[Dict[str, str]]],
-        global_config: str,
-        global_fmt: str,
-    ) -> Dict[str, Hypothesis]:
-        resolved: Dict[str, Hypothesis] = {}
-        for op, hyps in op_hypotheses.items():
-            if not hyps:
-                continue
-            resolved[op] = min(
-                hyps,
-                key=lambda h: self._score_hypothesis(h[0], h[1], h[2], len(ops_grouped[op]), global_config, global_fmt),
-            )
-        return resolved
-
-    def _hypothesis_name(self, hyp: Hypothesis) -> str:
-        return f"{hyp[0]}/{hyp[1]}/{self._format_label(hyp[2])}"
-
-    def _rule_line(self, hyp: Hypothesis) -> str:
-        config, op_name, fmt = hyp
-        return (
-            f"{config} ({self.config_desc.get(config, config)}); "
-            f"{op_name} ({self.op_desc.get(op_name, op_name)}); "
-            f"{self._format_label(fmt)} ({self.fmt_desc.get(fmt, fmt)})"
-        )
-
-    def _candidate_counts(self, hyps: List[Hypothesis]) -> str:
-        cfg = Counter(h[0] for h in hyps)
-        op = Counter(h[1] for h in hyps)
-        fmt = Counter(h[2] for h in hyps)
-
-        cfg_s = " ".join(f"{k}:{v}" for k, v in cfg.most_common())
-        op_s = " ".join(f"{k}:{v}" for k, v in op.most_common(8))
-        fmt_s = " ".join(f"{self._format_label(k)}:{v}" for k, v in fmt.most_common(8))
-
-        return f"configs [{cfg_s}], operations [{op_s}], formats [{fmt_s}]"
-
-    def _render_header(self, parsed: List[Dict[str, str]], target_expr: str) -> List[str]:
+    def _render_header(self, examples: List[Example], target_expr: str) -> List[str]:
+        policy = "ordered first-match search" if self.config.stop_after_first_match else "exhaustive matching"
         lines = [
-            "We need to infer the hidden equation transformation by matching examples.",
-            "A rule has three parts: operand style, arithmetic operation, and output format.",
+            f"We need to infer the hidden equation transformation by {policy} over a reduced search space.",
+            "The output is judged only by the final answer, but the trace below is written so the solution can be replayed from the prompt and this text.",
             "",
             "Examples",
         ]
-        for i, ex in enumerate(parsed, 1):
-            lines.append(f"{i}. {ex['a']} {ex['op']} {ex['b']} = {ex['raw_out']}")
+        for i, ex in enumerate(examples, 1):
+            lines.append(f"{i}. {ex.a} {ex.op} {ex.b} = {ex.raw_out}")
         lines.append(f"Target: {target_expr}")
+        lines.append("")
+        return lines
+
+    def _render_search_space(self) -> List[str]:
+        lines = [
+            "Search space",
+            "Search policy: ordered first-match search. The first candidate that matches all examples is selected; lower-priority candidates are not tested.",
+            "We do not search arbitrary output formats. First we normalize operator-prefix/operator-suffix negative outputs, then we search:",
+            "- operand transform: normal operands or reversed digits of both operands",
+            "- result transform: normal result digits or reversed result digits",
+            "- operations: common operations first, rare operations second",
+            "Transform order:",
+        ]
+        for rev_ops, rev_res in self.transform_order:
+            lines.append(f"- rev_ops={rev_ops}, rev_result={rev_res}")
+        lines.append("Common operation order: " + ", ".join(self.common_ops_order))
+        lines.append("Rare operation order: " + ", ".join(self.rare_ops_order))
+        lines.append(f"Maximum possible candidates per operator: 4 * ({len(self.common_ops_order)} + {len(self.rare_ops_order)}) = {4 * (len(self.common_ops_order) + len(self.rare_ops_order))}")
+        if not self.config.stop_after_first_match:
+            lines.append("Configured mode: exhaustive; continue after a match and log all candidates.")
+        lines.append("")
+        return lines
+
+    def _render_output_normalization(self, examples: List[Example], fmt_by_op: Dict[str, str]) -> List[str]:
+        lines = ["Normalize outputs"]
+        for op in sorted(fmt_by_op):
+            fmt = fmt_by_op[op]
+            lines.append(f"Operator {self._literal(op)} detected display format: {fmt}")
+            op_examples = [e for e in examples if e.op == op]
+            for ex in op_examples:
+                if ex.raw_out == ex.norm_out:
+                    lines.append(f"- {ex.raw_out} stays {ex.norm_out}")
+                else:
+                    lines.append(f"- {ex.raw_out} normalizes to {ex.norm_out}")
         lines.append("")
         return lines
 
     def _render_rule_matching(
         self,
-        ops_grouped: Dict[str, List[Dict[str, str]]],
-        op_hypotheses: Dict[str, List[Hypothesis]],
-        resolved_ops: Dict[str, Hypothesis],
-        global_config: str,
-        global_fmt: str,
+        groups: Dict[str, List[Example]],
+        attempts_by_op: Dict[str, List[Attempt]],
+        found_by_op: Dict[str, Hypothesis],
     ) -> List[str]:
         lines: List[str] = ["Rule matching"]
-
-        for op in sorted(ops_grouped.keys()):
-            group = ops_grouped[op]
-            hyps = op_hypotheses.get(op, [])
-
+        for op in sorted(groups.keys()):
+            group = groups[op]
+            attempts = attempts_by_op[op]
+            selected = found_by_op.get(op)
             lines.append(f"Operator {self._literal(op)}")
-            lines.append("examples: " + "; ".join(f"{ex['a']} {op} {ex['b']} -> {ex['raw_out']}" for ex in group))
+            lines.append("examples: " + "; ".join(f"{ex.a} {op} {ex.b} -> raw {ex.raw_out}, normalized {ex.norm_out}" for ex in group))
+            max_possible = 4 * (len(self.common_ops_order) + len(self.rare_ops_order))
+            lines.append(f"attempted candidates: {len(attempts)} out of {max_possible} possible")
+            if selected:
+                lines.append(f"selected first passing candidate: {self._hypothesis_name(selected)}")
+                if self.config.stop_after_first_match:
+                    skipped = max_possible - len(attempts)
+                    lines.append(
+                        f"search stopped after the first full match; lower-priority candidates not tried: {skipped}"
+                    )
+            else:
+                lines.append("selected first passing candidate: none")
 
-            if not hyps:
-                lines.append("matching candidates: none")
-                lines.append("")
-                continue
+            if self.config.include_all_candidate_attempts:
+                for attempt in attempts:
+                    mark = " SELECTED" if selected and self._attempt_to_hypothesis(attempt) == selected else ""
+                    status = "PASS" if attempt["passes"] else "FAIL"
+                    lines.append(
+                        f"[{attempt['index']:03d}] {status}{mark}: "
+                        f"tier={attempt['tier']}, rev_ops={attempt['rev_ops']}, rev_result={attempt['rev_res']}, operation={attempt['op_name']}"
+                    )
+                    if attempt["passes"]:
+                        lines.append("  reason: all examples matched")
+                    else:
+                        lines.append(f"  reason: {attempt['stop_reason']}")
 
-            if self.config.include_candidate_counts:
-                lines.append(f"matching candidates: {len(hyps)}; {self._candidate_counts(hyps)}")
-
-            ranked = sorted(
-                hyps,
-                key=lambda h: self._score_hypothesis(h[0], h[1], h[2], len(group), global_config, global_fmt),
-            )
-
-            lines.append("best candidates")
-            for h in ranked[: self.config.max_candidates_shown]:
-                score = self._score_hypothesis(h[0], h[1], h[2], len(group), global_config, global_fmt)
-                mark = " <- selected" if h == resolved_ops.get(op) else ""
-                lines.append(f"- {self._hypothesis_name(h)} score={score}{mark}")
-
-            selected = resolved_ops[op]
-            lines.append(f"Best: {self._hypothesis_name(selected)}")
-            lines.append(f"meaning: {self._rule_line(selected)}")
+                    if attempt["passes"] or self.config.include_failed_candidate_steps:
+                        for step_i, step in enumerate(attempt["steps"], 1):
+                            lines.append(f"  example {step_i}: {step.input_a} {op} {step.input_b}")
+                            for detail in step.lines:
+                                lines.append(f"    {detail}")
+                    elif attempt["steps"]:
+                        step = attempt["steps"][-1]
+                        lines.append(
+                            f"  first checked example: produced {step.after_result_transform}, expected {step.expected}"
+                        )
             lines.append("")
-
         return lines
 
-    def _render_verification(
-        self,
-        ops_grouped: Dict[str, List[Dict[str, str]]],
-        resolved_ops: Dict[str, Hypothesis],
-    ) -> List[str]:
+    def _attempt_to_hypothesis(self, attempt: Attempt) -> Hypothesis:
+        return (attempt["op_name"], attempt["rev_ops"], attempt["rev_res"], attempt["fmt"])
+
+    def _render_verification(self, groups: Dict[str, List[Example]], found_by_op: Dict[str, Hypothesis]) -> List[str]:
         lines: List[str] = ["Verify selected rules"]
-
-        for op in sorted(ops_grouped.keys()):
-            if op not in resolved_ops:
+        for op in sorted(groups.keys()):
+            if op not in found_by_op:
+                lines.append(f"Operator {self._literal(op)} has no selected rule to verify")
                 continue
-
-            selected = resolved_ops[op]
-            group = ops_grouped[op]
-            lines.append(f"Operator {self._literal(op)} uses {self._hypothesis_name(selected)}")
-
-            for ex in group[: self.config.max_verification_examples_per_operator]:
-                a, b, sa, sb, value, formatted = self._apply_hypothesis(ex["a"], ex["b"], op, selected)
-                op_text = self._operation_text(selected[1], a, b, sa, sb, value)
-                status = "ok" if formatted == ex["raw_out"] else "fail"
-                lines.append(
-                    f"{ex['a']} {op} {ex['b']}: A={a}, B={b}; "
-                    f"{op_text}; format -> {formatted}; expected={ex['raw_out']}; {status}"
-                )
-
-            if len(group) > self.config.max_verification_examples_per_operator:
-                lines.append(f"... {len(group) - self.config.max_verification_examples_per_operator} more examples verified.")
-
+            hyp = found_by_op[op]
+            op_name, rev_ops, rev_res, fmt = hyp
+            lines.append(f"Operator {self._literal(op)} uses {self._hypothesis_name(hyp)}")
+            for ex in groups[op]:
+                step = self._eval_example(ex.a, ex.b, op, op_name, rev_ops, rev_res, fmt, expected=ex.norm_out)
+                lines.append(f"- {ex.a} {op} {ex.b} = {ex.raw_out}")
+                for detail in step.lines:
+                    lines.append(f"  {detail}")
         lines.append("")
         return lines
 
-    def _render_target_direct(
-        self,
-        q_op: str,
-        selected: Hypothesis,
-        a: int,
-        b: int,
-        sa: str,
-        sb: str,
-        value: int,
-        final_ans: str,
-    ) -> List[str]:
-        return [
+    def _render_target_direct(self, q_a: str, q_op: str, q_b: str, hyp: Hypothesis) -> Tuple[str, List[str]]:
+        op_name, rev_ops, rev_res, fmt = hyp
+        step = self._eval_example(q_a, q_b, q_op, op_name, rev_ops, rev_res, fmt, expected=None)
+        lines = [
             "Target",
-            f"Use operator {self._literal(q_op)} rule: {self._hypothesis_name(selected)}",
-            f"Decode operands: A={a}, B={b}",
-            f"Apply operation: {self._operation_text(selected[1], a, b, sa, sb, value)}",
-            f"Apply format: {self.fmt_desc.get(selected[2], selected[2])} -> {final_ans}",
-            f"Computed output: {final_ans}",
-            f"Final answer: {final_ans}",
-            f"\\boxed{{{final_ans}}}",
+            f"Target operator {self._literal(q_op)} was found in the examples.",
+            f"Use selected rule: {self._hypothesis_name(hyp)}",
+            f"Replay the rule on target {q_a} {q_op} {q_b}:",
         ]
+        for detail in step.lines:
+            lines.append(f"  {detail}")
+        lines.append(f"Computed output: {step.final_output}")
+        lines.append(f"Final answer: {step.final_output}")
+        lines.append(self._boxed(step.final_output))
+        return step.final_output, lines
 
-    def _operation_text(self, op_name: str, a: int, b: int, sa: str, sb: str, value: int) -> str:
-        if op_name == "add":
-            return f"{a} + {b} = {value}"
-        if op_name == "sub":
-            return f"{a} - {b} = {value}"
-        if op_name == "mul":
-            return f"{a} * {b} = {value}"
-        if op_name == "abs_diff":
-            return f"abs({a} - {b}) = {value}"
-        if op_name == "div":
-            return f"{a} // {b} = {value}"
-        if op_name == "mod":
-            return f"{a} % {b} = {value}"
-        if op_name == "rev_div":
-            return f"{b} // {a} = {value}"
-        if op_name == "rev_mod":
-            return f"{b} % {a} = {value}"
-        if op_name == "rev_sub":
-            return f"{b} - {a} = {value}"
-        if op_name == "add1":
-            return f"{a} + {b} + 1 = {value}"
-        if op_name == "sub1":
-            return f"{a} - {b} + 1 = {value}"
-        if op_name == "mul1":
-            return f"{a} * {b} + 1 = {value}"
-        if op_name == "addm1":
-            return f"{a} + {b} - 1 = {value}"
-        if op_name == "subm1":
-            return f"{a} - {b} - 1 = {value}"
-        if op_name == "mulm1":
-            return f"{a} * {b} - 1 = {value}"
-        if op_name == "neg_abs_diff":
-            return f"-abs({a} - {b}) = {value}"
-        if op_name == "cat":
-            return f"concat({sa}, {sb}) = {value}"
-        if op_name == "rev_cat":
-            return f"concat({sb}, {sa}) = {value}"
-        if op_name == "dsum_add":
-            return f"digit_sum({a}) + digit_sum({b}) = {value}"
-        if op_name == "dsum_mul":
-            return f"digit_sum({a}) * digit_sum({b}) = {value}"
-        if op_name == "max_mod_min":
-            return f"max({a}, {b}) % min({a}, {b}) = {value}"
-        if op_name == "cross_sum":
-            return f"cross_sum({sa}, {sb}) = {value}"
-        if op_name == "cross_diff_abs":
-            return f"cross_diff_abs({sa}, {sb}) = {value}"
-        if op_name == "cross_concat":
-            return f"cross_concat({sa}, {sb}) = {value}"
-        if op_name == "cross_rev_concat":
-            return f"cross_rev_concat({sa}, {sb}) = {value}"
-        return f"{op_name}({a}, {b}) = {value}"
+    def _render_fallback(self, q_a: str, q_op: str, q_b: str) -> Tuple[str, List[str]]:
+        hyp: Hypothesis = ("abs_diff", False, False, "num")
+        step = self._eval_example(q_a, q_b, q_op, "abs_diff", False, False, "num", expected=None)
+        lines = [
+            "Target",
+            f"Target operator {self._literal(q_op)} was not found in the examples.",
+            "Fallback rule: use absolute difference on the original operands.",
+            "This fallback is explicit: no operand reversal, no result reversal, no learned operation from another symbol.",
+            f"Replay fallback on target {q_a} {q_op} {q_b}:",
+        ]
+        for detail in step.lines:
+            lines.append(f"  {detail}")
+        lines.append(f"Computed output: {step.final_output}")
+        lines.append(f"Final answer: {step.final_output}")
+        lines.append(self._boxed(step.final_output))
+        return step.final_output, lines
 
-    def _apply_hypothesis(self, left: str, right: str, op_char: str, hyp: Hypothesis) -> Tuple[int, int, str, str, int, str]:
-        op_config, op_name, out_fmt = hyp
-        a, b, sa, sb = self._get_operand_configs(left, right)[op_config]
-        ops = self._get_operations(a, b, sa, sb)
-        value = ops[op_name]
-        formatted = self._get_formats(value, op_char)[out_fmt]
-        return a, b, sa, sb, value, formatted
+    def _operand_step_text(self, a: str, b: str, ta: str, tb: str, rev_ops: bool) -> str:
+        if rev_ops:
+            return f"operand transform: reverse both operands: {a}->{ta}, {b}->{tb}; A={int(ta)}, B={int(tb)}"
+        return f"operand transform: keep operands: {a}->{ta}, {b}->{tb}; A={int(ta)}, B={int(tb)}"
 
-    def _base_operation_name(self, op_name: str) -> str:
-        if op_name in {"add", "add1", "addm1", "dsum_add"}:
-            return "add"
-        if op_name in {"sub", "sub1", "subm1", "abs_diff", "neg_abs_diff", "rev_sub"}:
-            return "sub"
-        if op_name in {"mul", "mul1", "mulm1", "dsum_mul"}:
-            return "mul"
-        if op_name in {"cat", "rev_cat"}:
-            return "cat"
-        if op_name in {"div", "rev_div"}:
-            return "div"
-        if op_name in {"mod", "rev_mod", "max_mod_min"}:
-            return "mod"
-        return op_name
+    @staticmethod
+    def _boxed(answer: str) -> str:
+        # If the answer itself contains braces, do not try to make a malformed LaTeX box.
+        if "{" in answer or "}" in answer:
+            return f"Boxed answer text: {answer}"
+        return f"\\boxed{{{answer}}}"
 
-    def _fallback(
+    def _success(
         self,
-        q_a: str,
-        q_op: str,
-        q_b: str,
-        global_config: str,
-        global_fmt: str,
-        used_base_ops: set[str],
+        answer: str,
+        lines: List[str],
+        rule_source: str,
+        target_operator: str,
+        selected: Optional[Hypothesis],
+        fallback: bool,
     ) -> Dict[str, Any]:
-        lines: List[str] = ["Target"]
-        lines.append(f"Operator {self._literal(q_op)} does not have a directly verified rule.")
-
-        strict_base_pool = ["add", "sub", "cat", "mul", "div"]
-        avail_ops = [name for name in strict_base_pool if name not in used_base_ops]
-        best_op = avail_ops[0] if avail_ops else strict_base_pool[0]
-        fallback_hyp: Hypothesis = (global_config, best_op, global_fmt)
-
-        lines.append("Fallback inference")
-        lines.append(
-            f"use unused core operation {best_op} with shared operand style {global_config} "
-            f"and format {self._format_label(global_fmt)}"
-        )
-        lines.append("confidence: weaker than direct rule matching because the target operator was absent or unresolved")
-
-        try:
-            a, b, sa, sb, value, final_ans = self._apply_hypothesis(q_a, q_b, q_op, fallback_hyp)
-            lines.append(f"Decode operands: A={a}, B={b}")
-            lines.append(f"Apply operation: {self._operation_text(best_op, a, b, sa, sb, value)}")
-            lines.append(f"Apply format: {self.fmt_desc.get(global_fmt, global_fmt)} -> {final_ans}")
-            lines.append(f"Computed output: {final_ans}")
-            lines.append(f"Final answer: {final_ans}")
-            lines.append(f"\\boxed{{{final_ans}}}")
-            return {
-                "answer": final_ans,
-                "lines": lines,
-                "rule_source": "fallback_inference",
-                "training_category": "equations_transformation.fallback_operator_absent",
-                "metadata": {
-                    "target_operator_seen_in_examples": False,
-                    "uses_fallback_inference": True,
-                    "target_operator": q_op,
-                    "fallback_operation": best_op,
-                    "fallback_config": global_config,
-                    "fallback_format": self._format_label(global_fmt),
-                },
-            }
-        except Exception as exc:
-            lines.append(f"Fallback failed: {type(exc).__name__}: {exc}")
-
-        std = self._standard_arithmetic(q_a, q_op, q_b)
-        if std is not None:
-            lines.append(f"Standard arithmetic fallback gives {std}.")
-            lines.append(f"Computed output: {std}")
-            lines.append(f"Final answer: {std}")
-            lines.append(f"\\boxed{{{std}}}")
-            return {
-                "answer": std,
-                "lines": lines,
-                "rule_source": "standard_arithmetic_fallback",
-                "training_category": "equations_transformation.standard_arithmetic_fallback",
-                "metadata": {
-                    "target_operator_seen_in_examples": False,
-                    "uses_fallback_inference": True,
-                    "target_operator": q_op,
-                },
-            }
-
-        lines.append("No valid target output could be computed.")
-        lines.append("Final answer: nan")
         return {
-            "answer": None,
-            "lines": lines,
-            "rule_source": "failed",
-            "training_category": "equations_transformation.failed",
+            "answer": answer,
+            "debug": lines,
+            "trace": lines,
+            "solution": "\n".join(lines),
+            "rule_source": rule_source,
+            "training_category": "equations_transformation.full_trace",
             "metadata": {
-                "target_operator_seen_in_examples": False,
-                "uses_fallback_inference": True,
-                "target_operator": q_op,
+                "target_operator_seen_in_examples": not fallback,
+                "uses_fallback_inference": fallback,
+                "target_operator": target_operator,
+                "selected_rule": self._hypothesis_name(selected) if selected else None,
+                "search_space": "sign_normalization + rev_ops/rev_result/operation",
+                "search_policy": "ordered_first_match" if self.config.stop_after_first_match else "exhaustive_all_candidates",
             },
         }
 
     @staticmethod
-    def _standard_arithmetic(q_a: str, q_op: str, q_b: str) -> Optional[str]:
-        try:
-            a, b = int(q_a), int(q_b)
-            if q_op == "+":
-                return str(a + b)
-            if q_op == "-":
-                return str(a - b)
-            if q_op == "*":
-                return str(a * b)
-            if q_op == "/" and b != 0:
-                return str(a // b)
-            if q_op == "%" and b != 0:
-                return str(a % b)
-            if q_op == "**":
-                return str(a**b)
-        except Exception:
-            return None
-        return None
-
-    @staticmethod
-    def _failure(reason: str) -> Dict[str, Any]:
-        lines = [
-            "We need to infer the hidden equation transformation by matching examples.",
-            f"Solver failed: {reason}",
-            "Final answer: nan",
-        ]
-        return {
-            "answer": None,
-            "debug": lines,
-            "trace": lines,
-            "solution": "\n".join(lines),
-            "rule_source": "failed",
-            "training_category": "equations_transformation.failed",
-            "metadata": {},
-        }
+    def _failure(message: str) -> Dict[str, Any]:
+        lines = ["Failed to solve", message, "Final answer: nan"]
+        return {"answer": "nan", "debug": lines, "trace": lines, "solution": "\n".join(lines)}
