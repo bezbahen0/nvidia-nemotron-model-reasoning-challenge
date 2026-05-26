@@ -979,7 +979,7 @@ class ASTBruteForceSolver:
     def _render_header(self, examples: List[Example], target_expr: str) -> List[str]:
         lines = [
             "We need to infer only the rule needed for the target equation.",
-            "The output is judged only by the final answer, so this solver uses target-first family search instead of solving every operator in the prompt.",
+            "This solver uses target-first family search instead of solving every operator in the prompt.",
             "The trace below is written so the chosen rule and final answer can be replayed from the prompt and this text.",
             "",
             "Examples",
@@ -1012,9 +1012,9 @@ class ASTBruteForceSolver:
         lines.append("Family order:")
         for i, (_, label, ops) in enumerate(family_order, 1):
             lines.append(f"{i}. {label}: operation order inside family = " + ", ".join(ops))
-        lines.append(f"Maximum family blocks per operator: {len(family_order)}")
-        lines.append(f"Equivalent candidate space still covered: 4 transforms * {sum(len(x[2]) for x in family_order)} operations = {4 * sum(len(x[2]) for x in family_order)} transform-operation candidates")
-        lines.append("")
+        #lines.append(f"Maximum family blocks per operator: {len(family_order)}")
+        #lines.append(f"Equivalent candidate space still covered: 4 transforms * {sum(len(x[2]) for x in family_order)} operations = {4 * sum(len(x[2]) for x in family_order)} transform-operation candidates")
+        #lines.append("")
         return lines
 
     def _render_output_normalization_for_ops(
@@ -1068,18 +1068,12 @@ class ASTBruteForceSolver:
             lines.append("examples: " + "; ".join(f"{ex.a} {op} {ex.b} -> raw {ex.raw_out}, normalized {ex.norm_out}" for ex in group))
             lines.append(f"family blocks reached by ordered search: {len(attempts)} out of {total_family_blocks} possible")
             lines.append("selection policy for this operator: first passing family block wins; inside that block, transform order wins before operation order")
-            if selected:
-                lines.append(f"selected rule: {self._hypothesis_name(selected)}")
-                lines.append(f"search stopped after this family block; lower-priority family blocks not tested: {total_family_blocks - len(attempts)}")
-            else:
-                lines.append("selected rule: none")
 
             for attempt in attempts:
-                    status = "PASS" if attempt["passes"] else "FAIL"
                     selected_here = attempt.get("selected_hypothesis")
                     mark = " SELECTED" if selected_here and selected_here == selected else ""
                     lines.append(
-                        f"Family block {attempt['index']:02d}: {status}{mark}: {attempt['family_label']}"
+                        f"Family block {attempt['index']:02d}: {attempt['family_label']}"
                     )
                     lines.append("  operation order inside this family: " + ", ".join(attempt.get("op_order", [])))
                     batch_results: Dict[Tuple[bool, bool], FamilyResult] = attempt["batch_family_results"]
@@ -1121,6 +1115,12 @@ class ASTBruteForceSolver:
                         )
                     else:
                         lines.append("  family block has no full match for any transform pair")
+            if selected:
+                lines.append(f"selected rule: {self._hypothesis_name(selected)}")
+                lines.append(f"Stop search: lower-priority family blocks are not tested.")
+            else:
+                lines.append("selected rule: none")
+                
             lines.append("")
         return lines
 
@@ -1155,7 +1155,6 @@ class ASTBruteForceSolver:
         ]
         for detail in step.lines:
             lines.append(f"  {detail}")
-        lines.append(f"Computed output: {step.final_output}")
         lines.append(f"Final answer: {step.final_output}")
         return step.final_output, lines
 
@@ -1170,7 +1169,6 @@ class ASTBruteForceSolver:
         ]
         for detail in step.lines:
             lines.append(f"  {detail}")
-        lines.append(f"Computed output: {step.final_output}")
         lines.append(f"Final answer: {step.final_output}")
         return step.final_output, lines
 
@@ -1186,7 +1184,6 @@ class ASTBruteForceSolver:
         ]
         for detail in step.lines:
             lines.append(f"  {detail}")
-        lines.append(f"Computed output: {step.final_output}")
         lines.append(f"Final answer: {step.final_output}")
         return step.final_output, lines
 
