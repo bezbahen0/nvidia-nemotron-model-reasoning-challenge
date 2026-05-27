@@ -2,7 +2,6 @@ import re
 from typing import List, Tuple, Dict, Optional
 
 from src.solvers.equations.ast_brute_force import ASTBruteForceSolver
-from src.solvers.equations.pseudo_math import PseudoMathStringSolver
 from src.solvers.equations.cryptarithm import CryptarithmSolver
 
 class BaseEquationSolver:
@@ -15,7 +14,6 @@ class BaseEquationSolver:
         # Initialize the pool of available solvers
         self.ast_solver = ASTBruteForceSolver()
         self.csp_solver = CryptarithmSolver()
-        self.string_solver = PseudoMathStringSolver()
 
     def _extract_sections(self, text: str) -> Tuple[str, str]:
         pattern = r"few examples:?\s*(.*?)\s*now, d[e]?termine the result for:\s*(.*)"
@@ -46,8 +44,6 @@ class BaseEquationSolver:
             return self.ast_solver.solve(examples, target)
         elif task_type == "cryptarithm":
             return self.csp_solver.solve(examples, target)
-        elif task_type == "string":
-            return self.string_solver.solve(examples, target)
             
         return None
 
@@ -76,8 +72,6 @@ class BaseEquationSolver:
             result = self.ast_solver.solve(examples, target)
         elif task_type == "cryptarithm":
             result = self.csp_solver.solve(examples, target)
-        elif task_type == "string":
-            result = self.string_solver.solve(examples, target)
         else:
             cot += ["I can't solve this type of problem"]
             return "\n".join(cot)

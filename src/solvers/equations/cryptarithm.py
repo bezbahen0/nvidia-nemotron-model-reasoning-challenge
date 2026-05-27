@@ -871,3 +871,1149 @@ class CryptarithmSolver:
             "stats": self.stats.__dict__,
             "elapsed_seconds": round(time.time() - started, 4),
         }
+
+
+# ============================================================================
+# Replay-CoT version
+# ============================================================================
+# The original class above is kept as a compatibility baseline.  The class below
+# preserves its CSP/rule-search coverage, but replaces the compact post-hoc trace
+# with deterministic replay events and a numeral-equations-style renderer.
+
+from dataclasses import asdict
+
+BaseCryptarithmSolver = CryptarithmSolver
+
+
+@dataclass
+class ReplayConfig(SolverConfig):
+    """Configuration for replay-complete cryptarithm CoT generation.
+
+    The defaults intentionally keep all domain-changing operations and all branch
+    decisions, while skipping no-change projections.  No-change projections can be
+    enabled for maximal audit/debug mode, but they are usually not helpful for
+    training and make the CoT much longer.
+    """
+
+    # Disable legacy truncation semantics.  They are kept only for compatibility
+    # with code that still reads these fields.
+    max_trace_lines: int = 10_000_000
+    max_trace_chars: int = 1_000_000_000
+    max_digit_lines_shown: int = 10_000_000
+
+    # Replay rendering controls.
+    include_no_change_events: bool = False
+    include_failed_attempt_events: bool = False
+    max_projection_blocks: int = 10_000_000
+    max_structural_tests_per_operator: int = 10_000_000
+
+    # Optimization controls.
+    use_support_cache: bool = True
+    # v2: reduce real projection work by using exact/full projections directly
+    # when their local scope is already small; otherwise run only a small
+    # dominance-aware modular cascade instead of low1, low2, ..., lowK.
+    projection_strategy: str = "adaptive"  # "legacy" or "adaptive"
+    exact_dominates_modular_space: int = 1_000
+    modular_anchor_ks: Tuple[int, ...] = (1, 2, -1)  # -1 means max_k
+
+    # v2 renderer controls.  Supported projection + update is enough to replay
+    # the state transition from the previous blocks, so current domains are off
+    # by default to save tokens.
+    compact_structural_matching: bool = True
+    compact_projection_blocks: bool = True
+    show_current_domains: bool = False
+    show_projection_reason: bool = False
+
+
+@dataclass
+class ReplayEvent:
+    kind: str
+    title: str
+    label: str = ""
+    constraint: str = ""
+    before: Optional[Dict[str, Tuple[int, ...]]] = None
+    supported: Optional[Dict[str, Tuple[int, ...]]] = None
+    after: Optional[Dict[str, Tuple[int, ...]]] = None
+    changes: Optional[Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]]] = None
+    decision: str = ""
+    reason: str = ""
+    count: Optional[int] = None
+    meta: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class ReplayTrace:
+    config: ReplayConfig
+    events: List[ReplayEvent] = field(default_factory=list)
+    legacy_lines: List[str] = field(default_factory=list)
+    last_reject: str = ""
+
+    def add(self, line: str) -> None:
+        # Compatibility for inherited code paths.  These lines are not truncated.
+        line = str(line).strip()
+        if line:
+            self.legacy_lines.append(line)
+
+    def add_event(self, event: ReplayEvent) -> None:
+        self.events.append(event)
+        if event.decision == "reject" or "contradiction" in event.kind.lower() or "reject" in event.kind.lower():
+            self.last_reject = event.reason or event.title or event.label
+
+    def extend(self, other: "ReplayTrace") -> None:
+        self.events.extend(other.events)
+        self.legacy_lines.extend(other.legacy_lines)
+        if other.last_reject:
+            self.last_reject = other.last_reject
+
+    def finish(self) -> List[ReplayEvent]:
+        return list(self.events)
+
+    def reject_reason(self) -> str:
+        return self.last_reject or "no supported continuation"
+
+
+class CryptarithmReplaySolver(BaseCryptarithmSolver):
+    """Coverage-preserving cryptarithm solver with replay-complete CoT (v2.1 causal replay renderer).
+
+    Design goals:
+      * keep the same rule/CSP search space as cryptarithm(4).py;
+      * record every state-changing local projection on the successful path;
+      * record branch/rule accept-reject decisions in deterministic order;
+      * avoid raw combinatorial tuple dumps by logging supported projections;
+      * keep answer extraction API compatible with the old solver.
+    """
+
+    def __init__(self, config: Optional[SolverConfig] = None):
+        if config is None:
+            config = ReplayConfig()
+        super().__init__(config)
+        self._support_cache: Dict[Tuple[str, Tuple[Tuple[str, Tuple[int, ...]], ...]], Tuple[bool, Dict[str, Tuple[int, ...]], int]] = {}
+
+    # ------------------------------------------------------------------
+    # Small helpers
+    # ------------------------------------------------------------------
+
+    def _cfg(self, name: str, default: Any) -> Any:
+        return getattr(self.config, name, default)
+
+    @staticmethod
+    def _snapshot_scope(domains: Domains, scope: Sequence[str]) -> Dict[str, Tuple[int, ...]]:
+        return {ch: tuple(sorted(domains[ch])) for ch in dict.fromkeys(scope)}
+
+    @staticmethod
+    def _changes(before: Dict[str, Tuple[int, ...]], after: Dict[str, Tuple[int, ...]]) -> Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]]:
+        return {ch: (before[ch], after[ch]) for ch in before if before[ch] != after.get(ch, ())}
+
+    def _support_key(self, label: str, domains: Domains, scope: Sequence[str]) -> Tuple[str, Tuple[Tuple[str, Tuple[int, ...]], ...]]:
+        ordered = tuple((ch, tuple(sorted(domains[ch]))) for ch in dict.fromkeys(scope))
+        return (label, ordered)
+
+    @staticmethod
+    def _domain_space(domains: Domains, scope: Sequence[str], cap: int = 10_000_000) -> int:
+        """Approximate local search size for a support projection.
+
+        This intentionally ignores AllDifferent permutations and uses the product
+        of domain sizes.  It is a safe cheap upper-ish signal for deciding whether
+        a full projection can dominate the modular low-k cascade.
+        """
+        total = 1
+        for ch in dict.fromkeys(scope):
+            total *= max(1, len(domains[ch]))
+            if total > cap:
+                return total
+        return total
+
+    def _rule_family_order(self) -> List[Tuple[str, List[str]]]:
+        return [
+            ("concat", ["cat"]),
+            ("add_offset", ["add", "add1", "addm1"]),
+            ("abs_sub", ["abs", "sub"]),
+            ("mul_offset", ["mul", "mul1", "mulm1"]),
+        ]
+
+    def _rule_sort_key(self, rule: Rule) -> Tuple[int, int, str]:
+        family_rank = {name: i for i, (_, names) in enumerate(self._rule_family_order()) for name in names}
+        return (family_rank.get(rule.name, 99), 0 if rule.orientation == "std" else 1, rule.name)
+
+
+    @staticmethod
+    def extract_answer(cot_text: Any) -> str:
+        text = "" if cot_text is None else str(cot_text)
+        # Prefer explicit line-based answers.  Cryptarithm answers may themselves
+        # contain braces such as "}", so a naive \boxed{...} regex can truncate.
+        for pattern in [
+            r"(?im)^\s*Final answer\s*:\s*(\S+)\s*$",
+            r"(?im)^\s*Computed output\s*:\s*(\S+)\s*$",
+            r"(?im)^\s*Answer\s*:\s*(\S+)\s*$",
+        ]:
+            m = re.search(pattern, text)
+            if m:
+                ans = m.group(1).strip()
+                return "nan" if ans.lower() in {"nan", "none", "<no", "<invalid>"} else ans
+        # Last-resort boxed parsing for non-brace answers only.
+        m = re.search(r"\\boxed\{([^{}\s]+)\}", text)
+        if m:
+            ans = m.group(1).strip()
+            return "nan" if ans.lower() in {"nan", "none"} else ans
+        return "nan"
+
+    # ------------------------------------------------------------------
+    # Public API override
+    # ------------------------------------------------------------------
+
+    def solve(self, examples_text: Any, target_text: Optional[Any] = None, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
+        self.stats = Stats()
+        # dynamic stats; Stats is intentionally not slotted.
+        self.stats.support_cache_hits = 0
+        self.stats.replay_events = 0
+        self._support_cache = {}
+        self._deadline = time.time() + (timeout_seconds or self.config.timeout_seconds)
+        started = time.time()
+
+        try:
+            full_text = str(examples_text) if target_text is None else f"{examples_text}\n{target_text}"
+            examples_source = str(examples_text) if target_text is not None else full_text
+            equations, known_ops = self._parse_examples(examples_source)
+            target = self._parse_target(full_text if target_text is None else str(target_text), known_ops)
+
+            if not equations:
+                return self._failure("no examples were parsed", started)
+            if target is None:
+                return self._failure("target expression could not be parsed", started)
+
+            target_expr, target_left, target_op, target_right = target
+            symbols = self._symbols(equations, target_left, target_right)
+            if len(symbols) > 10:
+                return self._failure(f"too many distinct symbols: {len(symbols)} > 10", started)
+
+            by_op: Dict[str, List[Equation]] = {}
+            for eq in equations:
+                by_op.setdefault(eq.op, []).append(eq)
+
+            candidates, reject_summary = self._operation_candidates(by_op)
+            # Use the same rule ordering in solving and in CoT rendering.
+            for op in list(candidates):
+                candidates[op] = sorted(candidates[op], key=self._rule_sort_key)
+
+            if any(not cands for cands in candidates.values()):
+                bad = [op for op, cands in candidates.items() if not cands][0]
+                return self._failure(f"no structural rule remains for operator {repr(bad)}", started)
+            if target_op not in candidates:
+                return self._failure(f"target operator {repr(target_op)} was not seen in examples", started)
+
+            domains: Domains = {s: set(range(10)) for s in symbols}
+            ordered_ops = sorted(candidates, key=lambda op: (0 if op == target_op else 1, len(candidates[op]), -len(by_op[op]), op))
+            trace = ReplayTrace(self.config if isinstance(self.config, ReplayConfig) else ReplayConfig())
+            trace.add_event(
+                ReplayEvent(
+                    kind="RULE_ORDER",
+                    title="Rule-combo search order",
+                    decision="order",
+                    meta={"ordered_ops": tuple(ordered_ops), "target_op": target_op},
+                )
+            )
+            assignment, combo = self._search_rules(ordered_ops, candidates, equations, domains, {}, trace, 0)
+
+            if assignment is None or combo is None:
+                return self._failure("no rule/map combination satisfies all examples", started)
+
+            answer, target_error, target_a, target_b, target_value = self._encode_target(
+                target_left, target_op, target_right, combo[target_op], assignment
+            )
+            events = trace.finish()
+            self.stats.replay_events = len(events)
+            solution_lines = self._render_replay_solution(
+                equations=equations,
+                target_expr=target_expr,
+                target_left=target_left,
+                target_op=target_op,
+                target_right=target_right,
+                candidates=candidates,
+                reject_summary=reject_summary,
+                combo=combo,
+                assignment=assignment,
+                events=events,
+                answer=answer,
+                target_error=target_error,
+                target_a=target_a,
+                target_b=target_b,
+                target_value=target_value,
+                ordered_ops=ordered_ops,
+                symbols=symbols,
+            )
+            return {
+                "answer": answer,
+                "solution": "\n".join(solution_lines),
+                "debug": solution_lines,
+                "trace": solution_lines,
+                "events": [asdict(e) for e in events],
+                "mapping": assignment,
+                "rules": {op: self._rule_name(rule) for op, rule in combo.items()},
+                "stats": self.stats.__dict__,
+                "elapsed_seconds": round(time.time() - started, 4),
+                "training_category": "cryptarithm.replay_hybrid",
+            }
+        except TimeoutError:
+            return self._failure("solver timeout", started)
+        except Exception as exc:
+            return self._failure(f"execution error: {type(exc).__name__}: {exc}", started)
+
+    # ------------------------------------------------------------------
+    # CSP engine with replay events
+    # ------------------------------------------------------------------
+
+    def _leading_zero(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains, trace: ReplayTrace) -> bool:
+        scope: List[str] = []
+        terms: List[str] = []
+        for eq in equations:
+            rule = combo.get(eq.op)
+            if rule is None:
+                continue
+            for term in (eq.left, eq.right, eq.result):
+                if len(term) <= 1:
+                    continue
+                lead = term[-1] if rule.reverse else term[0]
+                scope.append(lead)
+                terms.append(f"{repr(lead)} is leading digit of {repr(term)}")
+        scope = list(dict.fromkeys(scope))
+        if not scope:
+            return True
+        before = self._snapshot_scope(domains, scope)
+        reason = "; ".join(terms)
+        for lead in scope:
+            if 0 in domains[lead]:
+                domains[lead].remove(0)
+                if not domains[lead]:
+                    after = self._snapshot_scope(domains, scope)
+                    trace.add_event(ReplayEvent(
+                        kind="NO_LEADING_ZERO",
+                        title="No-leading-zero block",
+                        constraint="multi-digit numbers cannot start with 0",
+                        before=before,
+                        after=after,
+                        changes=self._changes(before, after),
+                        decision="reject",
+                        reason=f"domain({repr(lead)}) became empty after removing 0",
+                    ))
+                    return False
+        after = self._snapshot_scope(domains, scope)
+        changes = self._changes(before, after)
+        if changes:
+            self.stats.domain_reductions += len(changes)
+            trace.add_event(ReplayEvent(
+                kind="NO_LEADING_ZERO",
+                title="No-leading-zero block",
+                constraint="multi-digit numbers cannot start with 0",
+                before=before,
+                after=after,
+                changes=changes,
+                decision="keep",
+                reason=reason,
+            ))
+        elif self._cfg("include_no_change_events", False):
+            trace.add_event(ReplayEvent(
+                kind="NO_LEADING_ZERO",
+                title="No-leading-zero block",
+                constraint="multi-digit numbers cannot start with 0",
+                before=before,
+                after=after,
+                changes={},
+                decision="no-change",
+                reason=reason,
+            ))
+        return True
+
+    def _alldifferent(self, domains: Domains, trace: ReplayTrace) -> bool:
+        scope = sorted(domains)
+        before = self._snapshot_scope(domains, scope)
+        singles = [next(iter(v)) for v in domains.values() if len(v) == 1]
+        if len(singles) != len(set(singles)):
+            trace.add_event(ReplayEvent(
+                kind="ALLDIFFERENT",
+                title="AllDifferent block",
+                constraint="fixed digits must be unique",
+                before=before,
+                after=before,
+                changes={},
+                decision="reject",
+                reason="two symbols are fixed to the same digit",
+            ))
+            return False
+        fixed = set(singles)
+        for ch, vals in domains.items():
+            if len(vals) == 1:
+                continue
+            vals.difference_update(fixed)
+            if not vals:
+                after = self._snapshot_scope(domains, scope)
+                trace.add_event(ReplayEvent(
+                    kind="ALLDIFFERENT",
+                    title="AllDifferent block",
+                    constraint="remove fixed digits from every other symbol domain",
+                    before=before,
+                    after=after,
+                    changes=self._changes(before, after),
+                    decision="reject",
+                    reason=f"domain({repr(ch)}) became empty",
+                ))
+                return False
+        after = self._snapshot_scope(domains, scope)
+        changes = self._changes(before, after)
+        if changes:
+            self.stats.domain_reductions += len(changes)
+            trace.add_event(ReplayEvent(
+                kind="ALLDIFFERENT",
+                title="AllDifferent block",
+                constraint="remove fixed digits from every other symbol domain",
+                before=before,
+                after=after,
+                changes=changes,
+                decision="keep",
+                reason="fixed digits cannot be reused",
+            ))
+        elif self._cfg("include_no_change_events", False):
+            trace.add_event(ReplayEvent(
+                kind="ALLDIFFERENT",
+                title="AllDifferent block",
+                constraint="remove fixed digits from every other symbol domain",
+                before=before,
+                after=after,
+                changes={},
+                decision="no-change",
+                reason="no fixed digit can prune another domain",
+            ))
+        return True
+
+    def _project_replay(
+        self,
+        domains: Domains,
+        scope: Sequence[str],
+        predicate: Callable[[Assignment], bool],
+        label: str,
+        trace: ReplayTrace,
+        constraint: str,
+        kind: str,
+    ) -> Optional[bool]:
+        scope = list(dict.fromkeys(scope))
+        before = self._snapshot_scope(domains, scope)
+        key = self._support_key(label, domains, scope)
+        if self._cfg("use_support_cache", True) and key in self._support_cache:
+            ok, supported_tuple, count = self._support_cache[key]
+            self.stats.support_cache_hits += 1
+            supported = {ch: set(vals) for ch, vals in supported_tuple.items()}
+        else:
+            ok, supported, count = self._supports(scope, domains, predicate)
+            if self._cfg("use_support_cache", True):
+                self._support_cache[key] = (ok, {ch: tuple(sorted(vals)) for ch, vals in supported.items()}, count)
+
+        if not ok:
+            trace.add_event(ReplayEvent(
+                kind=kind,
+                title="Projection block",
+                label=label,
+                constraint=constraint,
+                before=before,
+                supported={ch: tuple() for ch in scope},
+                after=before,
+                changes={},
+                decision="reject",
+                reason="no supported local digit assignment",
+                count=0,
+            ))
+            return None
+
+        for ch, allowed in supported.items():
+            domains[ch].intersection_update(allowed)
+            if not domains[ch]:
+                after = self._snapshot_scope(domains, scope)
+                trace.add_event(ReplayEvent(
+                    kind=kind,
+                    title="Projection block",
+                    label=label,
+                    constraint=constraint,
+                    before=before,
+                    supported={c: tuple(sorted(v)) for c, v in supported.items()},
+                    after=after,
+                    changes=self._changes(before, after),
+                    decision="reject",
+                    reason=f"domain({repr(ch)}) became empty",
+                    count=count,
+                ))
+                return None
+
+        after = self._snapshot_scope(domains, scope)
+        changes = self._changes(before, after)
+        if changes:
+            self.stats.domain_reductions += len(changes)
+            trace.add_event(ReplayEvent(
+                kind=kind,
+                title="Projection block",
+                label=label,
+                constraint=constraint,
+                before=before,
+                supported={c: tuple(sorted(v)) for c, v in supported.items()},
+                after=after,
+                changes=changes,
+                decision="keep",
+                reason="supported projection narrows at least one domain",
+                count=count,
+            ))
+            return True
+        if self._cfg("include_no_change_events", False):
+            trace.add_event(ReplayEvent(
+                kind=kind,
+                title="Projection block",
+                label=label,
+                constraint=constraint,
+                before=before,
+                supported={c: tuple(sorted(v)) for c, v in supported.items()},
+                after=after,
+                changes={},
+                decision="no-change",
+                reason="supported projection equals current domains",
+                count=count,
+            ))
+        return False
+
+    def _project(
+        self,
+        domains: Domains,
+        scope: Sequence[str],
+        predicate: Callable[[Assignment], bool],
+        label: str,
+        trace: ReplayTrace,
+    ) -> Optional[bool]:
+        return self._project_replay(domains, scope, predicate, label, trace, constraint=label, kind="PROJECTION")
+
+    def _modular_project(self, eq: Equation, rule: Rule, domains: Domains, trace: ReplayTrace) -> Optional[bool]:
+        if rule.name not in {"add", "add1", "addm1", "mul", "mul1", "mulm1"}:
+            return False
+
+        max_k = max(len(eq.left), len(eq.right), len(eq.result))
+        full_scope = list(dict.fromkeys(eq.left + eq.right + eq.result))
+
+        # v2 real optimization: if the exact/full projection scope is already
+        # small, do not run the dominated low1..lowK modular cascade.  The caller
+        # will run _exact_project immediately after this method, which is a
+        # stronger constraint than every modular suffix check.
+        if self._cfg("projection_strategy", "adaptive") == "adaptive":
+            if self._domain_space(domains, full_scope) <= int(self._cfg("exact_dominates_modular_space", 120_000)):
+                trace.add_event(ReplayEvent(
+                    kind="MODULAR_SKIP",
+                    title="Modular cascade skipped",
+                    decision="skip",
+                    reason="exact full projection has small enough scope and dominates all low-k modular projections",
+                    meta={"equation": eq.display(), "rule": self._rule_name(rule), "space": self._domain_space(domains, full_scope)},
+                )) if self._cfg("include_no_change_events", False) else None
+                return False
+
+            ks: List[int] = []
+            for raw_k in self._cfg("modular_anchor_ks", (1, -1)):
+                k = max_k if int(raw_k) == -1 else int(raw_k)
+                if 1 <= k <= max_k and k not in ks:
+                    ks.append(k)
+        else:
+            ks = list(range(1, max_k + 1))
+
+        any_changed = False
+        for k in ks:
+            left = self._suffix(eq.left, k, rule.reverse)
+            right = self._suffix(eq.right, k, rule.reverse)
+            res = self._suffix(eq.result, k, rule.reverse)
+            scope = list(dict.fromkeys(left + right + res))
+            mod = 10**k
+
+            def pred(local: Assignment, left=left, right=right, res=res, mod=mod) -> bool:
+                value = rule.func(self._number(left, local, rule.reverse), self._number(right, local, rule.reverse))
+                return value is not None and value % mod == self._number(res, local, rule.reverse) % mod
+
+            label = f"column match {eq.display()} low{k} via {self._rule_name(rule)}"
+            if self._cfg("compact_projection_blocks", True):
+                constraint = f"low{k}: rule({repr(left)}, {repr(right)}) ≡ {repr(res)} mod {mod}; dominates lower low-k checks when k is maximal"
+            else:
+                constraint = (
+                    f"low{k} suffix: rule({repr(left)}, {repr(right)}) ≡ {repr(res)} (mod {mod}); "
+                    f"full formula: {self._constraint_formula(eq, rule)}"
+                )
+            changed = self._project_replay(domains, scope, pred, label, trace, constraint=constraint, kind="COLUMN_PROJECT")
+            if changed is None:
+                return None
+            any_changed = any_changed or changed
+        return any_changed
+
+    def _exact_project(self, eq: Equation, rule: Rule, domains: Domains, trace: ReplayTrace) -> Optional[bool]:
+        scope = list(dict.fromkeys(eq.left + eq.right + eq.result))
+        label = f"full match {eq.display()} via {self._rule_name(rule)}"
+        return self._project_replay(
+            domains,
+            scope,
+            lambda local: self._equation_matches(eq, rule, local),
+            label,
+            trace,
+            constraint=self._constraint_formula(eq, rule),
+            kind="FULL_PROJECT",
+        )
+
+    def _solve_digits(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains, trace: ReplayTrace) -> Optional[Assignment]:
+        if time.time() > self._deadline:
+            raise TimeoutError("timeout")
+        unresolved = [ch for ch, vals in domains.items() if len(vals) > 1]
+        if not unresolved:
+            assignment = {ch: next(iter(vals)) for ch, vals in domains.items()}
+            if self._verify_assignment(equations, combo, assignment):
+                trace.add_event(ReplayEvent(
+                    kind="MAP_ACCEPT",
+                    title="Digit map accepted",
+                    decision="keep",
+                    reason="all domains are singleton and every example verifies",
+                    meta={"assignment": tuple(sorted(assignment.items()))},
+                ))
+                return assignment
+            trace.add_event(ReplayEvent(
+                kind="MAP_REJECT",
+                title="Digit map rejected",
+                decision="reject",
+                reason="singleton domains do not verify every example",
+                meta={"assignment": tuple(sorted(assignment.items()))},
+            ))
+            return None
+
+        symbol = min(unresolved, key=lambda ch: (len(domains[ch]), ch))
+        trace.add_event(ReplayEvent(
+            kind="BRANCH_SELECT",
+            title="Branch symbol selection",
+            decision="select",
+            reason=f"choose smallest domain, then symbol order: {repr(symbol)} in {self._dom(domains[symbol])}",
+            meta={"symbol": symbol, "domain": tuple(sorted(domains[symbol]))},
+        ))
+        for digit in sorted(domains[symbol]):
+            self.stats.digit_branches += 1
+            old_domain = tuple(sorted(domains[symbol]))
+            new_domain = (digit,)
+            branch_domains = self._copy_domains(domains)
+            branch_domains[symbol] = {digit}
+            branch_trace = ReplayTrace(self.config if isinstance(self.config, ReplayConfig) else ReplayConfig())
+            branch_trace.add_event(ReplayEvent(
+                kind="DIGIT_TRY",
+                title="Digit branch",
+                before={symbol: old_domain},
+                after={symbol: new_domain},
+                changes={symbol: (old_domain, new_domain)},
+                decision="try",
+                reason=f"set {repr(symbol)}={digit}",
+                meta={"symbol": symbol, "digit": digit},
+            ))
+            if self._propagate(equations, combo, branch_domains, branch_trace):
+                found = self._solve_digits(equations, combo, branch_domains, branch_trace)
+                if found is not None:
+                    trace.extend(branch_trace)
+                    return found
+                reject_reason = branch_trace.reject_reason()
+            else:
+                reject_reason = branch_trace.reject_reason()
+            failure_event = branch_trace.events[-1] if branch_trace.events else None
+            trace.add_event(ReplayEvent(
+                kind="DIGIT_REJECT",
+                title="Digit branch rejected",
+                label=(failure_event.label if failure_event else ""),
+                constraint=(failure_event.constraint if failure_event else ""),
+                before=(failure_event.before if failure_event else None),
+                supported=(failure_event.supported if failure_event else None),
+                after=(failure_event.after if failure_event else None),
+                changes=(failure_event.changes if failure_event else None),
+                count=(failure_event.count if failure_event else None),
+                decision="reject",
+                reason=f"{repr(symbol)}={digit}: {reject_reason}",
+                meta={"symbol": symbol, "digit": digit, "failure_kind": failure_event.kind if failure_event else None},
+            ))
+            if self._cfg("include_failed_attempt_events", False):
+                trace.extend(branch_trace)
+        return None
+
+    def _search_rules(
+        self,
+        ordered_ops: Sequence[str],
+        candidates: Dict[str, List[Rule]],
+        equations: Sequence[Equation],
+        domains: Domains,
+        combo: Dict[str, Rule],
+        trace: ReplayTrace,
+        index: int,
+    ) -> Tuple[Optional[Assignment], Optional[Dict[str, Rule]]]:
+        if time.time() > self._deadline:
+            raise TimeoutError("timeout")
+        if index == len(ordered_ops):
+            domains2 = self._copy_domains(domains)
+            trace2 = ReplayTrace(self.config if isinstance(self.config, ReplayConfig) else ReplayConfig())
+            trace2.add_event(ReplayEvent(
+                kind="COMBO_PROPAGATE",
+                title="Rule combo propagation",
+                decision="try",
+                reason="all operators have candidate rules; start digit-domain solving",
+                meta={"combo": tuple(sorted((op, self._rule_name(rule)) for op, rule in combo.items()))},
+            ))
+            if not self._propagate(equations, combo, domains2, trace2):
+                failure_event = trace2.events[-1] if trace2.events else None
+                trace.add_event(ReplayEvent(
+                    kind="COMBO_REJECT",
+                    title="Rule combo rejected",
+                    label=(failure_event.label if failure_event else ""),
+                    constraint=(failure_event.constraint if failure_event else ""),
+                    before=(failure_event.before if failure_event else None),
+                    supported=(failure_event.supported if failure_event else None),
+                    after=(failure_event.after if failure_event else None),
+                    changes=(failure_event.changes if failure_event else None),
+                    count=(failure_event.count if failure_event else None),
+                    decision="reject",
+                    reason=trace2.reject_reason(),
+                    meta={"combo": tuple(sorted((op, self._rule_name(rule)) for op, rule in combo.items())), "failure_kind": failure_event.kind if failure_event else None},
+                ))
+                if self._cfg("include_failed_attempt_events", False):
+                    trace.extend(trace2)
+                return None, None
+            assignment = self._solve_digits(equations, combo, domains2, trace2)
+            if assignment is not None:
+                trace.extend(trace2)
+                trace.add_event(ReplayEvent(
+                    kind="COMBO_ACCEPT",
+                    title="Rule combo selected",
+                    decision="keep",
+                    reason="this is the first rule combo whose digit map verifies all examples",
+                    meta={"combo": tuple(sorted((op, self._rule_name(rule)) for op, rule in combo.items()))},
+                ))
+                return assignment, dict(combo)
+            trace.add_event(ReplayEvent(
+                kind="COMBO_REJECT",
+                title="Rule combo rejected",
+                decision="reject",
+                reason=trace2.reject_reason(),
+                meta={"combo": tuple(sorted((op, self._rule_name(rule)) for op, rule in combo.items()))},
+            ))
+            if self._cfg("include_failed_attempt_events", False):
+                trace.extend(trace2)
+            return None, None
+
+        op = ordered_ops[index]
+        for rule in candidates[op]:
+            self.stats.rule_hypotheses += 1
+            combo2 = dict(combo)
+            combo2[op] = rule
+            domains2 = self._copy_domains(domains)
+            trace2 = ReplayTrace(self.config if isinstance(self.config, ReplayConfig) else ReplayConfig())
+            trace2.add_event(ReplayEvent(
+                kind="RULE_TRY",
+                title="Rule candidate",
+                decision="try",
+                reason=f"operator {repr(op)} -> {self._rule_name(rule)}",
+                meta={"op": op, "rule": self._rule_name(rule), "depth": index},
+            ))
+            if self._propagate(equations, combo2, domains2, trace2):
+                assignment, solved_combo = self._search_rules(ordered_ops, candidates, equations, domains2, combo2, trace2, index + 1)
+                if assignment is not None and solved_combo is not None:
+                    trace.extend(trace2)
+                    return assignment, solved_combo
+                reject_reason = trace2.reject_reason()
+            else:
+                reject_reason = trace2.reject_reason()
+            failure_event = trace2.events[-1] if trace2.events else None
+            trace.add_event(ReplayEvent(
+                kind="RULE_REJECT",
+                title="Rule candidate rejected",
+                label=(failure_event.label if failure_event else ""),
+                constraint=(failure_event.constraint if failure_event else ""),
+                before=(failure_event.before if failure_event else None),
+                supported=(failure_event.supported if failure_event else None),
+                after=(failure_event.after if failure_event else None),
+                changes=(failure_event.changes if failure_event else None),
+                count=(failure_event.count if failure_event else None),
+                decision="reject",
+                reason=f"operator {repr(op)} -> {self._rule_name(rule)}: {reject_reason}",
+                meta={"op": op, "rule": self._rule_name(rule), "depth": index, "failure_kind": failure_event.kind if failure_event else None},
+            ))
+            if self._cfg("include_failed_attempt_events", False):
+                trace.extend(trace2)
+        return None, None
+
+    # ------------------------------------------------------------------
+    # Replay renderer
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _domain_text_map(domains: Optional[Dict[str, Tuple[int, ...]]]) -> str:
+        if not domains:
+            return "none"
+        pieces = []
+        for ch, vals in domains.items():
+            if tuple(vals) == tuple(range(10)):
+                txt = "{0..9}"
+            else:
+                txt = "{" + ",".join(str(v) for v in vals) + "}"
+            pieces.append(f"D[{repr(ch)}]={txt}")
+        return "; ".join(pieces)
+
+    @staticmethod
+    def _changes_text(changes: Optional[Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]]]) -> str:
+        if not changes:
+            return "none"
+        pieces = []
+        for ch, (before, after) in changes.items():
+            b = "{" + ",".join(str(v) for v in before) + "}"
+            a = "{" + ",".join(str(v) for v in after) + "}"
+            if before == tuple(range(10)):
+                b = "{0..9}"
+            if after == tuple(range(10)):
+                a = "{0..9}"
+            pieces.append(f"D[{repr(ch)}]: {b} -> {a}")
+        return "; ".join(pieces)
+
+    def _structural_reason(self, rule: Rule, eq: Equation) -> str:
+        if eq.has_sign and not rule.signed:
+            return f"signed output is present, but {self._rule_name(rule)} is unsigned -> no"
+        possible = self._possible_result_lengths(rule, eq)
+        actual = len(eq.result)
+        lengths = "{" + ",".join(str(x) for x in sorted(possible)) + "}"
+        if actual in possible:
+            return f"lengths {len(eq.left)} and {len(eq.right)} can produce result length in {lengths}; actual length {actual} -> possible"
+        return f"lengths {len(eq.left)} and {len(eq.right)} can produce result length in {lengths}; actual length {actual} -> no"
+
+    def _family_structural_summary(self, rules: Sequence[Rule], eqs: Sequence[Equation]) -> Dict[str, Any]:
+        kept: List[Rule] = []
+        rejected: Dict[str, List[Rule]] = {}
+        reason_examples: Dict[str, List[str]] = {}
+        for rule in sorted(rules, key=self._rule_sort_key):
+            ok, reason = self._structural_status(rule, eqs)
+            if ok:
+                kept.append(rule)
+            else:
+                rejected.setdefault(reason, []).append(rule)
+                if reason not in reason_examples:
+                    # Keep only one representative local calculation per reason.
+                    details = []
+                    for eq in eqs:
+                        detail = self._structural_reason(rule, eq)
+                        if "-> no" in detail or "unsigned -> no" in detail:
+                            details.append(detail)
+                    reason_examples[reason] = details[:2] or [self._structural_reason(rule, eqs[0])]
+        return {"kept": kept, "rejected": rejected, "reason_examples": reason_examples}
+
+    def _render_structural_matching(self, by_op: Dict[str, List[Equation]], candidates: Dict[str, List[Rule]], combo: Dict[str, Rule]) -> List[str]:
+        lines: List[str] = ["Rule matching"]
+        compact = self._cfg("compact_structural_matching", True)
+        for op in sorted(by_op):
+            eqs = by_op[op]
+            lines.append(f"Operator {repr(op)}")
+            lines.append("examples: " + "; ".join(eq.display() for eq in eqs))
+            lens = sorted({(len(eq.left), len(eq.right), len(eq.result), eq.has_sign) for eq in eqs})
+            sig = "; ".join(f"{a}+{b}->len {r}, signed={sgn}" for a, b, r, sgn in lens)
+            lines.append(f"structural signature: {sig}")
+            lines.append("selection policy: structural filtering keeps rule groups; rule-combo search later chooses the first globally consistent combo")
+            block_idx = 1
+            for family, names in self._rule_family_order():
+                family_rules = [r for r in self.rules if r.name in names]
+                if not family_rules:
+                    continue
+                lines.append(f"Family block {block_idx}: {family}")
+                if compact:
+                    summary = self._family_structural_summary(family_rules, eqs)
+                    kept = summary["kept"]
+                    rejected = summary["rejected"]
+                    if kept:
+                        lines.append("  kept candidates: " + ", ".join(self._rule_name(r) for r in kept))
+                    else:
+                        lines.append("  kept candidates: none")
+                    if rejected:
+                        rej_parts = []
+                        for reason, rules in sorted(rejected.items()):
+                            rej_parts.append(f"{reason}: " + ", ".join(self._rule_name(r) for r in rules))
+                        lines.append("  rejected candidates: " + "; ".join(rej_parts))
+                        # Representative local calculations preserve replayability without repeating
+                        # the same length/sign proof for every isomorphic rule.
+                        for reason, details in sorted(summary["reason_examples"].items()):
+                            lines.append(f"  representative {reason} check:")
+                            for detail in details:
+                                lines.append(f"    {detail}")
+                    else:
+                        lines.append("  rejected candidates: none")
+                    lines.append(f"  decision: {'at least one candidate remains' if kept else 'no candidate in this family remains'}")
+                else:
+                    kept_any = False
+                    for rule in sorted(family_rules, key=self._rule_sort_key):
+                        ok, reason = self._structural_status(rule, eqs)
+                        row_details = [self._structural_reason(rule, eq) for eq in eqs]
+                        verdict = "keep" if ok else f"reject ({reason})"
+                        if ok:
+                            kept_any = True
+                        lines.append(f"  test {self._rule_name(rule)}: {verdict}")
+                        for detail in row_details:
+                            lines.append(f"    {detail}")
+                    lines.append(f"  decision: {'at least one candidate remains' if kept_any else 'no candidate in this family remains'}")
+                block_idx += 1
+            surviving = candidates.get(op, [])
+            if surviving:
+                lines.append("surviving after structural filtering: " + ", ".join(self._rule_name(r) for r in surviving))
+                lines.append("final rule is selected later by rule-combo search")
+            else:
+                lines.append("surviving after structural filtering: none")
+            lines.append("")
+        return lines
+
+    def _format_replay_event(self, event: ReplayEvent, block_num: int) -> List[str]:
+        lines: List[str] = []
+        kind = event.kind
+        if kind == "RULE_ORDER":
+            ordered = event.meta.get("ordered_ops", ()) if event.meta else ()
+            lines.append(f"Rule-combo order: " + ", ".join(repr(op) for op in ordered))
+            return lines
+        if kind == "RULE_TRY":
+            lines.append(f"Combo block {block_num}: try {event.reason}")
+            return lines
+        if kind == "RULE_REJECT":
+            lines.append(f"Combo block {block_num}: reject {event.reason}")
+            if event.label or event.constraint:
+                lines.append("  rejecting local operation:")
+                if event.label:
+                    lines.append(f"    label: {event.label}")
+                if event.constraint:
+                    lines.append(f"    formula: {event.constraint}")
+                if self._cfg("show_current_domains", False):
+                    lines.append(f"    current local domains: {self._domain_text_map(event.before)}")
+                if event.supported is not None:
+                    count = "unknown" if event.count is None else str(event.count)
+                    lines.append(f"    supported projection ({count} supports): {self._domain_text_map(event.supported)}")
+                lines.append(f"    apply update: {self._changes_text(event.changes)}")
+            return lines
+        if kind == "COMBO_PROPAGATE":
+            combo = event.meta.get("combo", ()) if event.meta else ()
+            combo_text = "; ".join(f"{repr(op)}->{rule}" for op, rule in combo)
+            lines.append(f"Combo block {block_num}: all operators assigned; start digit-domain solving")
+            lines.append(f"  combo: {combo_text}")
+            return lines
+        if kind == "COMBO_REJECT":
+            combo = event.meta.get("combo", ()) if event.meta else ()
+            combo_text = "; ".join(f"{repr(op)}->{rule}" for op, rule in combo)
+            lines.append(f"Combo block {block_num}: reject combo {combo_text}")
+            lines.append(f"  reason: {event.reason}")
+            if event.label or event.constraint:
+                lines.append("  rejecting local operation:")
+                if event.label:
+                    lines.append(f"    label: {event.label}")
+                if event.constraint:
+                    lines.append(f"    formula: {event.constraint}")
+                if self._cfg("show_current_domains", False):
+                    lines.append(f"    current local domains: {self._domain_text_map(event.before)}")
+                if event.supported is not None:
+                    count = "unknown" if event.count is None else str(event.count)
+                    lines.append(f"    supported projection ({count} supports): {self._domain_text_map(event.supported)}")
+                lines.append(f"    apply update: {self._changes_text(event.changes)}")
+            return lines
+        if kind == "COMBO_ACCEPT":
+            combo = event.meta.get("combo", ()) if event.meta else ()
+            combo_text = "; ".join(f"{repr(op)}->{rule}" for op, rule in combo)
+            lines.append(f"Combo block {block_num}: selected combo {combo_text}")
+            lines.append(f"  decision: {event.reason}")
+            return lines
+        if kind in {"NO_LEADING_ZERO", "ALLDIFFERENT"}:
+            lines.append(f"{event.title} {block_num}")
+            lines.append(f"  constraint: {event.constraint}")
+            if event.reason:
+                lines.append(f"  reason: {event.reason}")
+            if self._cfg("show_current_domains", False):
+                lines.append(f"  current domains: {self._domain_text_map(event.before)}")
+            lines.append(f"  apply update: {self._changes_text(event.changes)}")
+            lines.append(f"  decision: {event.decision}")
+            return lines
+        if kind in {"COLUMN_PROJECT", "FULL_PROJECT", "PROJECTION"}:
+            lines.append(f"Projection block {block_num}")
+            if event.label:
+                lines.append(f"  label: {event.label}")
+            if event.constraint:
+                lines.append(f"  formula: {event.constraint}")
+            if self._cfg("show_current_domains", False):
+                lines.append(f"  current local domains: {self._domain_text_map(event.before)}")
+            if event.supported is not None:
+                count = "unknown" if event.count is None else str(event.count)
+                lines.append(f"  supported projection ({count} supports): {self._domain_text_map(event.supported)}")
+            lines.append(f"  apply update: {self._changes_text(event.changes)}")
+            if event.reason and self._cfg("show_projection_reason", False):
+                lines.append(f"  reason: {event.reason}")
+            lines.append(f"  decision: {event.decision}")
+            return lines
+        if kind == "BRANCH_SELECT":
+            lines.append(f"Branch block {block_num}: choose symbol")
+            lines.append(f"  reason: {event.reason}")
+            return lines
+        if kind == "DIGIT_TRY":
+            lines.append(f"Branch block {block_num}: try {event.reason}")
+            lines.append(f"  apply update: {self._changes_text(event.changes)}")
+            lines.append("  decision: propagate this assignment")
+            return lines
+        if kind == "DIGIT_REJECT":
+            lines.append(f"Branch block {block_num}: reject {event.reason}")
+            if event.label or event.constraint:
+                lines.append("  rejecting local operation:")
+                if event.label:
+                    lines.append(f"    label: {event.label}")
+                if event.constraint:
+                    lines.append(f"    formula: {event.constraint}")
+                if self._cfg("show_current_domains", False):
+                    lines.append(f"    current local domains: {self._domain_text_map(event.before)}")
+                if event.supported is not None:
+                    count = "unknown" if event.count is None else str(event.count)
+                    lines.append(f"    supported projection ({count} supports): {self._domain_text_map(event.supported)}")
+                lines.append(f"    apply update: {self._changes_text(event.changes)}")
+            return lines
+        if kind == "MAP_ACCEPT":
+            assignment = event.meta.get("assignment", ()) if event.meta else ()
+            lines.append(f"Map block {block_num}: digit map accepted")
+            lines.append("  map: " + "; ".join(f"{repr(ch)}={d}" for ch, d in assignment))
+            lines.append(f"  decision: {event.reason}")
+            return lines
+        if kind == "MAP_REJECT":
+            lines.append(f"Map block {block_num}: reject candidate map")
+            lines.append(f"  reason: {event.reason}")
+            return lines
+        lines.append(f"Replay block {block_num}: {event.kind}: {event.title}")
+        if event.reason:
+            lines.append(f"  reason: {event.reason}")
+        if event.decision:
+            lines.append(f"  decision: {event.decision}")
+        return lines
+
+    def _render_replay_solution(
+        self,
+        equations: Sequence[Equation],
+        target_expr: str,
+        target_left: str,
+        target_op: str,
+        target_right: str,
+        candidates: Dict[str, List[Rule]],
+        reject_summary: Dict[str, Dict[str, int]],
+        combo: Dict[str, Rule],
+        assignment: Assignment,
+        events: Sequence[ReplayEvent],
+        answer: Optional[str],
+        target_error: Optional[str],
+        target_a: int,
+        target_b: int,
+        target_value: Optional[int],
+        ordered_ops: Sequence[str],
+        symbols: Sequence[str],
+    ) -> List[str]:
+        lines: List[str] = []
+        add = lines.append
+        by_op: Dict[str, List[Equation]] = {}
+        for eq in equations:
+            by_op.setdefault(eq.op, []).append(eq)
+
+        add("Search setup")
+        add("Each visible non-operator symbol is a digit variable.")
+        add("The digit map is injective: different symbols denote different decimal digits.")
+        add("Each operator has one selected arithmetic rule, shared by all examples using that operator.")
+        add("A candidate is valid only if the same digit map and selected operator rules reproduce every visible output.")
+        add("")
+
+        add("Examples")
+        for i, eq in enumerate(equations, 1):
+            add(f"{i}. {eq.display()}")
+        add(f"Target: {target_expr}")
+        add("")
+
+        add("Parsed equations")
+        for i, eq in enumerate(equations, 1):
+            expected = f"{eq.op}{eq.result}" if eq.has_sign else eq.result
+            add(f"{i}. left={eq.left}, op={repr(eq.op)}, right={eq.right}, output={expected}, signed_output={eq.has_sign}")
+        add("")
+
+        add("Symbols")
+        add("Digit symbols: " + ", ".join(repr(ch) for ch in symbols))
+        add("Operator symbols: " + ", ".join(repr(op) for op in sorted(by_op)))
+        add("AllDifferent: every listed digit symbol must take a different digit.")
+        add("")
+
+        add("Search axes")
+        add("- read direction: std reads symbols left-to-right; rev reads symbols right-to-left")
+        add("- arithmetic family: concat, add/add1/addm1, abs/sub, mul/mul1/mulm1")
+        add("- digit map: injective assignment from visible digit symbols to 0..9")
+        add("- output encoding: signed rules show a negative result by prefixing the operator symbol")
+        add("Rule-combo order: " + ", ".join(repr(op) for op in ordered_ops))
+        add("")
+
+        lines.extend(self._render_structural_matching(by_op, candidates, combo))
+
+        add("Local replay steps")
+        add("Replay convention: a projection block is one local solver operation; replay it by intersecting the current domains with the shown supported projection, then applying the shown update.")
+        add("Branch blocks explicitly assign one digit and then run the following propagation blocks.")
+        add("Only local operations that change state, reject a branch/combo, or select a branch are shown; current domains are reconstructed from earlier updates unless audit mode enables them.")
+        projection_count = 0
+        for idx, event in enumerate(events, 1):
+            if event.kind in {"COLUMN_PROJECT", "FULL_PROJECT", "PROJECTION"}:
+                projection_count += 1
+                if projection_count > self._cfg("max_projection_blocks", 10_000_000):
+                    add(f"... remaining projection blocks omitted by max_projection_blocks={self._cfg('max_projection_blocks', 10_000_000)}")
+                    break
+            for line in self._format_replay_event(event, idx):
+                add(line)
+        add("")
+
+        add("Selected digit map")
+        add("; ".join(f"{repr(ch)}={assignment[ch]}" for ch in sorted(assignment)))
+        add("")
+
+        add("Verify selected rules")
+        for op in sorted(by_op):
+            rule = combo[op]
+            add(f"Operator {repr(op)} uses {self._rule_name(rule)}")
+            for eq in by_op[op]:
+                a = self._number(eq.left, assignment, rule.reverse)
+                b = self._number(eq.right, assignment, rule.reverse)
+                op_text, value = self._operation_line(rule, a, b)
+                encoded = None if value is None else self._encode_value(value, eq.op, rule, assignment)
+                expected = f"{eq.op}{eq.result}" if eq.has_sign else eq.result
+                status = "MATCH" if encoded == expected else "WRONG"
+                add(f"- {eq.display()}")
+                add(f"  decode {eq.left}->{a}, {eq.right}->{b}")
+                add(f"  apply rule: {op_text}")
+                add(f"  encode result: {encoded}")
+                add(f"  compare visible output: produced {encoded} vs expected {expected} -> {status}")
+        add("")
+
+        add("Target")
+        target_rule = combo[target_op]
+        add(f"Target operator {repr(target_op)} was found in the examples.")
+        add(f"Use selected rule: {self._rule_name(target_rule)}")
+        add(f"Replay the rule on target {target_left}{target_op}{target_right}:")
+        add(f"  decode {target_left}->{target_a}, {target_right}->{target_b}")
+        if target_error or answer is None or target_value is None:
+            add(f"  apply rule: {target_error or 'invalid target'}")
+            add("Computed output: nan")
+            add("Final answer: nan")
+        else:
+            operation, _ = self._operation_line(target_rule, target_a, target_b)
+            add(f"  apply rule: {operation}")
+            add(f"  encode {target_value}: {answer}")
+            add(f"Computed output: {answer}")
+            add(f"Final answer: {answer}")
+            add(f"\\boxed{{{answer}}}")
+        return lines
+
+    def _failure(self, reason: str, started: float) -> Dict[str, Any]:
+        lines = [
+            "Search setup",
+            "Each visible non-operator symbol is a digit variable; the digit map is injective; each operator has one selected arithmetic rule.",
+            f"Solver failed: {reason}",
+            "Final answer: nan",
+        ]
+        return {
+            "answer": None,
+            "solution": "\n".join(lines),
+            "debug": lines,
+            "trace": lines,
+            "events": [],
+            "stats": self.stats.__dict__,
+            "elapsed_seconds": round(time.time() - started, 4),
+        }
+
+
+# Backward-compatible default name.  Existing evaluation code can still import
+# CryptarithmSolver from this file.
+CryptarithmSolver = CryptarithmReplaySolver
