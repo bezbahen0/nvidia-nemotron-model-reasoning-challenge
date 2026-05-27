@@ -6,7 +6,7 @@ import pandas as pd
 from transformers import AutoTokenizer
 
 from src.augmentation.equations.cryptarithm_generator import CryptarithmTaskGenerator
-from src.augmentation.equations.ast_brute_force_generator import ASTBruteForceTaskGenerator
+from src.augmentation.equations.numeral_equations_augment import NumeralEquationAugmentGenerator
 from src.augmentation.bit_manipulation import BitMatchingAugmentGenerator
 from src.augmentation.encryption import EncryptionTaskGenerator
 from src.metric import verify
@@ -76,7 +76,6 @@ def main():
     
     multipliers = {
         "cryptarithm": 3.5,
-        "numeral equations": 2.0,
         "encryption": 1.0,
     }
 
@@ -94,18 +93,28 @@ def main():
     logger.info(equations_cryptarithm_dataset.task_mode.value_counts(normalize=True))
     logger.info(f'Accuracy: {equations_cryptarithm_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean()}')
 
-    equations_ast_generator = ASTBruteForceTaskGenerator(seed=args.seed)
+    # Numeral equations
+    # Instead of generating new full AST brute-force tasks, derive small Alice-style
+    # subtasks from existing solver CoTs: family matching and rule application.
+    numeral_equations_augment_generator = NumeralEquationAugmentGenerator(seed=args.seed)
 
-    equations_ast_dataset = equations_ast_generator.generate_dataset(
-        num_samples=int(len(data[data.label == "numeral equations"]) * multipliers["numeral equations"]),
-        nb_workers=24,
-        progress_bar=False,
-        label="numeral equations"
+    numeral_equations_aug_dataset = numeral_equations_augment_generator.generate_dataset(
+        source_data=data[data.label == "numeral equations"].copy(),
+        sample_frac=1.0,
+        only_solver_correct=False,
     )
-    logger.info("\nNumeric equations generator:")
-    logger.info(equations_ast_dataset.columns.tolist())
-    logger.info(equations_ast_dataset.task_mode.value_counts(normalize=True))
-    logger.info(f'Accuracy: {equations_ast_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean()}')
+    logger.info("\nNumeral equations augmenter:")
+    logger.info(numeral_equations_aug_dataset.columns.tolist())
+    logger.info(numeral_equations_aug_dataset.task_mode.value_counts(normalize=True))
+    logger.info(f"Generated rows: {len(numeral_equations_aug_dataset)}")
+    logger.info(
+        f"Source solver correct rate: "
+        f"{numeral_equations_aug_dataset['source_solver_correct'].mean() if len(numeral_equations_aug_dataset) else 0.0}"
+    )
+    logger.info(
+        f'Accuracy: '
+        f'{numeral_equations_aug_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean() if len(numeral_equations_aug_dataset) else 0.0}'
+    )
 
 
     # Encryption
@@ -129,7 +138,7 @@ def main():
     )
 
 
-    data_gen = pd.concat([equations_cryptarithm_dataset, equations_ast_dataset, encryption_gen_dataset, bit_mp_gen_dataset])
+    data_gen = pd.concat([equations_cryptarithm_dataset, numeral_equations_aug_dataset, encryption_gen_dataset, bit_mp_gen_dataset])
     data_gen = data_gen[["prompt","answer","label","generated_cot","computed_answer"]]
     data_gen["source"] = len(data_gen) * ["generated"]
     data_gen["id"] = data_gen.apply(make_generated_id, axis=1)
