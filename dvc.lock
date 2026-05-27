@@ -1,10 +1,10 @@
 schema: '2.0'
 stages:
   generate_cot:
-    cmd: "python -m src.generate_cot --train_path data/raw/train.csv --output_path
-      data/solved/train-cot.csv\n"
+    cmd: "python -m src.generate_cot --train_path /kaggle/input/nvidia-nemotron-3-reasoning-challenge/train.csv
+      --output_path data/solved/train-cot.csv\n"
     deps:
-    - path: data/raw/train.csv
+    - path: /kaggle/input/nvidia-nemotron-3-reasoning-challenge/train.csv
       hash: md5
       md5: d8c87be98a92c6b5398427fc2f02e35a
       size: 3069304
@@ -14,14 +14,14 @@ stages:
       size: 5634
     - path: src/solvers
       hash: md5
-      md5: a17003d82a97f228e30c446b6ee12867.dir
-      size: 268435
+      md5: b94e785d0d0bf2950a270bf5403841e0.dir
+      size: 357042
       nfiles: 22
     outs:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: 8b5f1a9fa5f067525df912ce695f671c
-      size: 16996305
+      md5: 77320708e8331b08020d0d4f59cf0eb6
+      size: 32139069
   split_data:
     cmd: "python -m src.split_data --data_path data/solved/train-cot.csv --train_path
       data/prepared/train_stratified.csv --seed 31231 --val_path data/prepared/val_stratified.csv
@@ -29,8 +29,8 @@ stages:
     deps:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: 8b5f1a9fa5f067525df912ce695f671c
-      size: 16996305
+      md5: 77320708e8331b08020d0d4f59cf0eb6
+      size: 32139069
     - path: src/split_data.py
       hash: md5
       md5: 76996cca37670c38647a078f69767e18
@@ -42,12 +42,12 @@ stages:
     outs:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 3026ce9140869cce486b0c11696f9218
-      size: 15301153
+      md5: ac03c4365a854087190fee22cc43d3f3
+      size: 28943482
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 7891e94d9a995f2de1efa9e24127698c
-      size: 1700551
+      md5: 559693220787112909f34baf45959147
+      size: 3201324
   prepare_data:
     cmd: "python -m src.prepare_dataset --data_path data/prepared/train_stratified.csv
       --output_path data/generated/train_with_syntetic.csv --seed 31231 --tokenizer_path
@@ -55,12 +55,12 @@ stages:
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: 3026ce9140869cce486b0c11696f9218
-      size: 15301153
+      md5: ac03c4365a854087190fee22cc43d3f3
+      size: 28943482
     - path: src/prepare_dataset.py
       hash: md5
-      md5: 88b14a204347710cfde0b1c6fbc5bcc7
-      size: 5671
+      md5: 6bf1adc0586ebb9a14531715ae9e929c
+      size: 6531
     params:
       params.yaml:
         model.id: 
@@ -69,8 +69,8 @@ stages:
     outs:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 33973c1dd3e67de978ad8b318b9e7746
-      size: 22894589
+      md5: 115c7da96966b581529093a2b4ffda5f
+      size: 38528786
   base_sft_train:
     cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.13_base_sft_train
       --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
