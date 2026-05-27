@@ -107,7 +107,7 @@ class PseudoMathStringSolver:
                 cot.append(f"Alternating the characters of '{q_a}' and '{q_b}' gives '{ans}'.")
             elif best_pattern == 'subtraction':
                 cot.append(f"Removing the digits of '{q_b}' from '{q_a}' leaves '{ans}'.")
-
+            cot.append(f"Final answer: {ans}")
             return {"answer": ans, "debug": cot}
 
         cot.append("None of the standard string manipulation rules match all the provided examples.")

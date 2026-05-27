@@ -134,6 +134,5 @@ class BaseEquationSolver:
 
         
         cot += result["debug"]
-        #cot.append(f"\nFinal answer: {result['answer']}")
 
         return "\n".join(cot)
