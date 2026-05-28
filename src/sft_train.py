@@ -1035,8 +1035,6 @@ def main():
         report_to="wandb",
         run_name=f"{args.wandb_run_basename}-SFT-{args.data}-ep{args.epochs}-lr{args.lr}-{args.loss_impl}"
     )
-    
-    training_args.group_by_length = True
 
     train_telemetry_output_dir = os.path.join(args.output_dir, "train_telemetry")
     eval_telemetry_output_dir = os.path.join(args.output_dir, "eval_telemetry")
