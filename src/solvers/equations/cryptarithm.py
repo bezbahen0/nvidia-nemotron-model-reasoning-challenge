@@ -2017,3 +2017,442 @@ class CryptarithmReplaySolver(BaseCryptarithmSolver):
 # Backward-compatible default name.  Existing evaluation code can still import
 # CryptarithmSolver from this file.
 CryptarithmSolver = CryptarithmReplaySolver
+
+
+# ============================================================================
+# v2.2 refinements
+# ============================================================================
+# v2.2 keeps the v2.1 search behaviour but makes the training CoT less
+# solver-jargony and adds one safe real optimization: concat is projected as
+# positional equalities instead of through generic support enumeration.
+
+@dataclass
+class ReplayConfigV22(ReplayConfig):
+    # Renderer: support counts are useful for audit/debug but add little value to
+    # training CoT.  The supported projection itself remains visible and is the
+    # replay-complete local operation.
+    show_support_counts: bool = False
+
+    # Real optimization: cat/rev_cat is a deterministic positional constraint.
+    # It should not enumerate assignments through the generic support projector.
+    cat_as_positional_equalities: bool = True
+
+
+_BaseCryptarithmReplaySolverV21 = CryptarithmReplaySolver
+
+
+class CryptarithmReplaySolver(_BaseCryptarithmReplaySolverV21):
+    """Replay solver v2.2.
+
+    Changes from v2.1:
+      * structural filtering is phrased as structural elimination/pre-checks,
+        not as final rule rejection;
+      * low-k modular formulas no longer mention noisy dominance/support-count
+        internals in training CoT;
+      * branch ordering stays deterministic and does not surface support-count
+        heuristics;
+      * cat/rev_cat uses direct positional constraints instead of generic
+        support enumeration.
+    """
+
+    def __init__(self, config: Optional[SolverConfig] = None):
+        if config is None:
+            config = ReplayConfigV22()
+        super().__init__(config)
+
+    # ------------------------------------------------------------------
+    # Real optimization: cat as positional equalities
+    # ------------------------------------------------------------------
+
+    def _cat_expected_output(self, eq: Equation, rule: Rule) -> str:
+        # Under std/cat, encoded output must be left followed by right.
+        # Under rev/cat, numbers are read right-to-left and the result is encoded
+        # right-to-left, so the visible output must be right followed by left.
+        return (eq.right + eq.left) if rule.reverse else (eq.left + eq.right)
+
+    def _cat_project(self, eq: Equation, rule: Rule, domains: Domains, trace: ReplayTrace) -> Optional[bool]:
+        scope = list(dict.fromkeys(eq.left + eq.right + eq.result))
+        before = self._snapshot_scope(domains, scope)
+        expected = self._cat_expected_output(eq, rule)
+        observed = eq.result
+        label = f"positional concat {eq.display()} via {self._rule_name(rule)}"
+
+        if len(expected) != len(observed):
+            constraint = (
+                f"{self._rule_name(rule)} requires visible output {repr(expected)} "
+                f"with length {len(expected)}, but observed {repr(observed)} has length {len(observed)}"
+            )
+            trace.add_event(ReplayEvent(
+                kind="FULL_PROJECT",
+                title="Projection block",
+                label=label,
+                constraint=constraint,
+                before=before,
+                supported={ch: tuple() for ch in scope},
+                after=before,
+                changes={},
+                decision="reject",
+                reason="concat positional length mismatch",
+                count=0,
+            ))
+            return None
+
+        mismatches = [(i, exp, obs) for i, (exp, obs) in enumerate(zip(expected, observed), 1) if exp != obs]
+        if mismatches:
+            i, exp, obs = mismatches[0]
+            constraint = (
+                f"{self._rule_name(rule)} requires visible output {repr(expected)}; "
+                f"observed {repr(observed)}. At position {i}, expected symbol {repr(exp)} "
+                f"but observed {repr(obs)}. Since the digit map is injective, two different "
+                f"symbols cannot stand for the same digit."
+            )
+            trace.add_event(ReplayEvent(
+                kind="FULL_PROJECT",
+                title="Projection block",
+                label=label,
+                constraint=constraint,
+                before=before,
+                supported={ch: tuple() for ch in scope},
+                after=before,
+                changes={},
+                decision="reject",
+                reason="concat positional mismatch",
+                count=0,
+            ))
+            return None
+
+        if self._cfg("include_no_change_events", False):
+            constraint = f"{self._rule_name(rule)} requires visible output {repr(expected)}, matching observed output"
+            trace.add_event(ReplayEvent(
+                kind="FULL_PROJECT",
+                title="Projection block",
+                label=label,
+                constraint=constraint,
+                before=before,
+                supported=before,
+                after=before,
+                changes={},
+                decision="no-change",
+                reason="concat positional equalities are already satisfied",
+                count=None,
+            ))
+        return False
+
+    def _exact_project(self, eq: Equation, rule: Rule, domains: Domains, trace: ReplayTrace) -> Optional[bool]:
+        if rule.name == "cat" and self._cfg("cat_as_positional_equalities", True):
+            return self._cat_project(eq, rule, domains, trace)
+        return super()._exact_project(eq, rule, domains, trace)
+
+    # ------------------------------------------------------------------
+    # Cleaner modular projection wording
+    # ------------------------------------------------------------------
+
+    def _modular_project(self, eq: Equation, rule: Rule, domains: Domains, trace: ReplayTrace) -> Optional[bool]:
+        if rule.name not in {"add", "add1", "addm1", "mul", "mul1", "mulm1"}:
+            return False
+
+        max_k = max(len(eq.left), len(eq.right), len(eq.result))
+        full_scope = list(dict.fromkeys(eq.left + eq.right + eq.result))
+
+        if self._cfg("projection_strategy", "adaptive") == "adaptive":
+            if self._domain_space(domains, full_scope) <= int(self._cfg("exact_dominates_modular_space", 120_000)):
+                if self._cfg("include_no_change_events", False):
+                    trace.add_event(ReplayEvent(
+                        kind="MODULAR_SKIP",
+                        title="Modular cascade skipped",
+                        decision="skip",
+                        reason="full projection has small enough scope, so separate suffix projections are unnecessary",
+                        meta={"equation": eq.display(), "rule": self._rule_name(rule), "space": self._domain_space(domains, full_scope)},
+                    ))
+                return False
+
+            ks: List[int] = []
+            for raw_k in self._cfg("modular_anchor_ks", (1, -1)):
+                k = max_k if int(raw_k) == -1 else int(raw_k)
+                if 1 <= k <= max_k and k not in ks:
+                    ks.append(k)
+        else:
+            ks = list(range(1, max_k + 1))
+
+        any_changed = False
+        for k in ks:
+            left = self._suffix(eq.left, k, rule.reverse)
+            right = self._suffix(eq.right, k, rule.reverse)
+            res = self._suffix(eq.result, k, rule.reverse)
+            scope = list(dict.fromkeys(left + right + res))
+            mod = 10**k
+
+            def pred(local: Assignment, left=left, right=right, res=res, mod=mod) -> bool:
+                value = rule.func(self._number(left, local, rule.reverse), self._number(right, local, rule.reverse))
+                return value is not None and value % mod == self._number(res, local, rule.reverse) % mod
+
+            label = f"suffix projection {eq.display()} low{k} via {self._rule_name(rule)}"
+            if self._cfg("compact_projection_blocks", True):
+                constraint = f"low{k} suffix constraint: rule({repr(left)}, {repr(right)}) mod {mod} = {repr(res)}"
+            else:
+                constraint = (
+                    f"low{k} suffix: rule({repr(left)}, {repr(right)}) ≡ {repr(res)} (mod {mod}); "
+                    f"full formula: {self._constraint_formula(eq, rule)}"
+                )
+            changed = self._project_replay(domains, scope, pred, label, trace, constraint=constraint, kind="COLUMN_PROJECT")
+            if changed is None:
+                return None
+            any_changed = any_changed or changed
+        return any_changed
+
+    # ------------------------------------------------------------------
+    # Structural matching phrased as grouped structural pre-checks
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _set_text(values: Iterable[Any]) -> str:
+        vals = sorted(set(values))
+        return "{" + ",".join(str(v) for v in vals) + "}"
+
+    def _observed_signature_line(self, eqs: Sequence[Equation]) -> str:
+        groups: Dict[Tuple[int, int], Dict[str, Set[Any]]] = {}
+        for eq in eqs:
+            key = (len(eq.left), len(eq.right))
+            groups.setdefault(key, {"lengths": set(), "signed": set()})
+            groups[key]["lengths"].add(len(eq.result))
+            groups[key]["signed"].add(eq.has_sign)
+        parts = []
+        for (ll, rr), data in sorted(groups.items()):
+            signed_vals = "{" + ",".join("True" if x else "False" for x in sorted(data["signed"])) + "}"
+            parts.append(f"{ll}+{rr} -> output lengths {self._set_text(data['lengths'])}, signed outputs {signed_vals}")
+        return "; ".join(parts)
+
+    def _family_reason_details(self, reason: str, rules: Sequence[Rule], eqs: Sequence[Equation]) -> List[str]:
+        rep = sorted(rules, key=self._rule_sort_key)[0]
+        if reason == "sign":
+            return ["signed output is present in the examples, but these rules are unsigned."]
+
+        lines: List[str] = []
+        grouped: Dict[Tuple[int, int], Set[int]] = {}
+        for eq in eqs:
+            grouped.setdefault((len(eq.left), len(eq.right)), set()).add(len(eq.result))
+        for (ll, rr), observed in sorted(grouped.items()):
+            # Build a small synthetic equation carrying the same operand lengths so
+            # _possible_result_lengths can be used without depending on symbols.
+            fake = Equation(raw="", left="A" * ll, right="B" * rr, op="?", result="R", has_sign=False)
+            possible = self._possible_result_lengths(rep, fake)
+            fam = rep.name
+            if rep.name == "cat":
+                capability = "concat"
+            elif rep.name.startswith("add"):
+                capability = "this add-offset rule"
+            elif rep.name.startswith("mul"):
+                capability = "this mul-offset rule"
+            elif rep.name in {"abs", "sub"}:
+                capability = "this abs/sub rule"
+            else:
+                capability = fam
+            lines.append(
+                f"for {ll}+{rr} operands, {capability} can produce output lengths {self._set_text(possible)}; observed lengths are {self._set_text(observed)}"
+            )
+        return lines
+
+    def _family_structural_summary(self, rules: Sequence[Rule], eqs: Sequence[Equation]) -> Dict[str, Any]:
+        kept: List[Rule] = []
+        eliminated: Dict[str, List[Rule]] = {}
+        reason_details: Dict[str, List[str]] = {}
+        for rule in sorted(rules, key=self._rule_sort_key):
+            ok, reason = self._structural_status(rule, eqs)
+            if ok:
+                kept.append(rule)
+            else:
+                eliminated.setdefault(reason, []).append(rule)
+        for reason, rs in eliminated.items():
+            reason_details[reason] = self._family_reason_details(reason, rs, eqs)
+        return {"kept": kept, "eliminated": eliminated, "reason_details": reason_details}
+
+    def _render_structural_matching(self, by_op: Dict[str, List[Equation]], candidates: Dict[str, List[Rule]], combo: Dict[str, Rule]) -> List[str]:
+        lines: List[str] = ["Rule matching"]
+        compact = self._cfg("compact_structural_matching", True)
+        for op in sorted(by_op):
+            eqs = by_op[op]
+            lines.append(f"Operator {repr(op)}")
+            lines.append("examples: " + "; ".join(eq.display() for eq in eqs))
+            lines.append(f"structural signature: {self._observed_signature_line(eqs)}")
+            lines.append("selection policy: these blocks perform only structural pre-checks; digit consistency is checked later by rule-combo search")
+            block_idx = 1
+            for family, names in self._rule_family_order():
+                family_rules = [r for r in self.rules if r.name in names]
+                if not family_rules:
+                    continue
+                lines.append(f"Family block {block_idx}: {family}")
+                if compact:
+                    summary = self._family_structural_summary(family_rules, eqs)
+                    kept = summary["kept"]
+                    eliminated = summary["eliminated"]
+                    if kept:
+                        lines.append("  kept after structural test: " + ", ".join(self._rule_name(r) for r in kept))
+                    else:
+                        lines.append("  kept after structural test: none")
+                    if eliminated:
+                        elim_parts = []
+                        for reason, rules in sorted(eliminated.items()):
+                            elim_parts.append(f"{reason}: " + ", ".join(self._rule_name(r) for r in rules))
+                        lines.append("  eliminated by structural test: " + "; ".join(elim_parts))
+                        for reason, details in sorted(summary["reason_details"].items()):
+                            lines.append(f"  {reason} detail:")
+                            for detail in details:
+                                lines.append(f"    {detail}")
+                    else:
+                        lines.append("  eliminated by structural test: none")
+                    lines.append(f"  decision: {'family remains' if kept else 'no candidate in this family remains'}")
+                else:
+                    kept_any = False
+                    for rule in sorted(family_rules, key=self._rule_sort_key):
+                        ok, reason = self._structural_status(rule, eqs)
+                        row_details = [self._structural_reason(rule, eq) for eq in eqs]
+                        verdict = "keep" if ok else f"eliminate by structural test ({reason})"
+                        if ok:
+                            kept_any = True
+                        lines.append(f"  test {self._rule_name(rule)}: {verdict}")
+                        for detail in row_details:
+                            lines.append(f"    {detail}")
+                    lines.append(f"  decision: {'family remains' if kept_any else 'no candidate in this family remains'}")
+                block_idx += 1
+            surviving = candidates.get(op, [])
+            if surviving:
+                lines.append("surviving after structural filtering: " + ", ".join(self._rule_name(r) for r in surviving))
+                lines.append("final rule is selected later by rule-combo search")
+            else:
+                lines.append("surviving after structural filtering: none")
+            lines.append("")
+        return lines
+
+    def _format_replay_event(self, event: ReplayEvent, block_num: int) -> List[str]:
+        lines = super()._format_replay_event(event, block_num)
+        if not self._cfg("show_support_counts", False):
+            lines = [re.sub(r"supported projection \((?:unknown|\d+) supports\):", "supported projection:", line) for line in lines]
+        return lines
+
+
+# Backward-compatible alias used by some training scripts.
+CryptarithmSolverReplay = CryptarithmReplaySolver
+
+# Export v2.2 class under the historical solver name expected by harnesses.
+CryptarithmSolver = CryptarithmReplaySolver
+
+# ============================================================================
+# v2.3 refinements
+# ============================================================================
+# v2.3 keeps v2.2 search behaviour, but makes rejected-candidate replay causal:
+# candidate is tested first, the local projection/check is shown next, and the
+# reject decision is printed only after the empty/contradictory result.
+
+@dataclass
+class ReplayConfigV23(ReplayConfigV22):
+    # No search changes in v2.3; this flag only documents the renderer contract.
+    causal_reject_blocks: bool = True
+
+
+_BaseCryptarithmReplaySolverV22 = CryptarithmReplaySolver
+
+
+class CryptarithmReplaySolver(_BaseCryptarithmReplaySolverV22):
+    """Replay solver v2.3.
+
+    Changes from v2.2:
+      * rejected rule/combo/branch blocks are rendered in causal order:
+        test candidate -> projection/check -> result -> reject decision;
+      * no candidate is described as rejected before the shown local computation
+        has produced the contradiction or empty supported projection.
+    """
+
+    def __init__(self, config: Optional[SolverConfig] = None):
+        if config is None:
+            config = ReplayConfigV23()
+        super().__init__(config)
+
+    @staticmethod
+    def _split_decision_reason(reason: str) -> Tuple[str, str]:
+        text = str(reason or "").strip()
+        if ":" in text:
+            head, tail = text.split(":", 1)
+            return head.strip(), tail.strip()
+        return text, text
+
+    def _support_line(self, event: ReplayEvent, indent: str) -> Optional[str]:
+        if event.supported is None:
+            return None
+        if self._cfg("show_support_counts", False):
+            count = "unknown" if event.count is None else str(event.count)
+            return f"{indent}supported projection ({count} supports): {self._domain_text_map(event.supported)}"
+        return f"{indent}supported projection: {self._domain_text_map(event.supported)}"
+
+    @staticmethod
+    def _is_empty_supported_projection(event: ReplayEvent) -> bool:
+        if event.supported is None:
+            return False
+        return all(len(tuple(vals)) == 0 for vals in event.supported.values())
+
+    def _render_local_check(self, event: ReplayEvent, indent: str = "  ", result_override: Optional[str] = None) -> List[str]:
+        lines: List[str] = []
+        title = "Projection check" if event.supported is not None else "Local check"
+        lines.append(f"{indent}{title}")
+        if event.label:
+            lines.append(f"{indent}  label: {event.label}")
+        if event.constraint:
+            lines.append(f"{indent}  formula: {event.constraint}")
+        if self._cfg("show_current_domains", False):
+            lines.append(f"{indent}  current local domains: {self._domain_text_map(event.before)}")
+        support_line = self._support_line(event, indent + "  ")
+        if support_line:
+            lines.append(support_line)
+        lines.append(f"{indent}  apply update: {self._changes_text(event.changes)}")
+        if result_override is not None:
+            result = result_override
+        elif self._is_empty_supported_projection(event):
+            result = event.reason or "no supported local digit assignment"
+        else:
+            result = event.reason or event.decision or "local check failed"
+        if result:
+            lines.append(f"{indent}  result: {result}")
+        return lines
+
+    def _format_replay_event(self, event: ReplayEvent, block_num: int) -> List[str]:
+        if not self._cfg("causal_reject_blocks", True):
+            return super()._format_replay_event(event, block_num)
+
+        if event.kind == "RULE_REJECT":
+            candidate, failure = self._split_decision_reason(event.reason)
+            lines: List[str] = [f"Combo block {block_num}: test {candidate}"]
+            if event.label or event.constraint or event.supported is not None:
+                lines.extend(self._render_local_check(event, indent="  ", result_override=failure))
+            else:
+                lines.append(f"  result: {failure}")
+            lines.append(f"  decision: reject {candidate}")
+            return lines
+
+        if event.kind == "COMBO_REJECT":
+            combo = event.meta.get("combo", ()) if event.meta else ()
+            combo_text = "; ".join(f"{repr(op)}->{rule}" for op, rule in combo)
+            lines = [f"Combo block {block_num}: test combo {combo_text}"]
+            if event.label or event.constraint or event.supported is not None:
+                lines.extend(self._render_local_check(event, indent="  "))
+            else:
+                lines.append(f"  result: {event.reason}")
+            lines.append(f"  decision: reject combo {combo_text}")
+            return lines
+
+        if event.kind == "DIGIT_REJECT":
+            branch, failure = self._split_decision_reason(event.reason)
+            lines = [f"Branch block {block_num}: test {branch}"]
+            if event.label or event.constraint or event.supported is not None:
+                lines.extend(self._render_local_check(event, indent="  ", result_override=failure))
+            else:
+                lines.append(f"  result: {failure}")
+            lines.append(f"  decision: reject {branch}")
+            return lines
+
+        # For non-reject events, keep v2.2 behaviour, including removal of
+        # support counts from training CoT by default.
+        return super()._format_replay_event(event, block_num)
+
+
+# Backward-compatible aliases.
+CryptarithmSolverReplay = CryptarithmReplaySolver
+CryptarithmSolver = CryptarithmReplaySolver
