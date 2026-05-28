@@ -194,23 +194,85 @@ class CryptarithmAugmentGenerator:
         return m.group(1).strip() if m else ""
 
     @staticmethod
+    def _domain_update_pattern() -> re.Pattern[str]:
+        # Domain tokens can contain symbols such as ] or a quote, for example:
+        #   D[']']: {1,2,3} -> {1,2}
+        #   D["'" ] is not produced, but D["'"] is.
+        # A simple D\[[^\]]+\] regex breaks on D[']'], so parse quoted
+        # symbol literals inside D[...] explicitly.
+        return re.compile(
+            r"(D\[(?:'[^']*'|\"[^\"]*\"|[^\]]+)\])"
+            r"\s*:\s*"
+            r"(\{[^{}]*\})"
+            r"\s*->\s*"
+            r"(\{[^{}]*\})"
+        )
+
+    @staticmethod
     def _extract_updates(update_text: str) -> List[str]:
         update_text = (update_text or "").strip()
         if not update_text or update_text.lower() == "none":
             return []
-        # Split on semicolons immediately before the next D[...].
-        parts = re.split(r";\s*(?=D\[)", update_text)
-        return [p.strip() for p in parts if p.strip()]
+        pattern = CryptarithmAugmentGenerator._domain_update_pattern()
+        return [
+            f"{m.group(1)}: {m.group(2)} -> {m.group(3)}"
+            for m in pattern.finditer(update_text)
+        ]
 
     @staticmethod
     def _current_domains_from_update(update_text: str) -> List[str]:
         rows: List[str] = []
-        for item in CryptarithmAugmentGenerator._extract_updates(update_text):
-            # D['x']: {before} -> {after}
-            m = re.match(r"(D\[[^\]]+\]):\s*(.*?)\s*->\s*(.*)$", item)
-            if m:
-                rows.append(f"{m.group(1)}={m.group(2).strip()}")
+        pattern = CryptarithmAugmentGenerator._domain_update_pattern()
+        for m in pattern.finditer(update_text or ""):
+            # D['x']: {before} -> {after}  ==>  D['x']={before}
+            rows.append(f"{m.group(1)}={m.group(2).strip()}")
         return rows
+
+
+    @staticmethod
+    def _domain_values_to_set(text: str) -> set[int]:
+        text = (text or "").strip()
+        if text == "{0..9}":
+            return set(range(10))
+        if not (text.startswith("{") and text.endswith("}")):
+            return set()
+        body = text[1:-1].strip()
+        if not body:
+            return set()
+        out: set[int] = set()
+        for part in body.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ".." in part:
+                lo, hi = part.split("..", 1)
+                out.update(range(int(lo), int(hi) + 1))
+            else:
+                out.add(int(part))
+        return out
+
+    @staticmethod
+    def _set_to_domain_values(values: Iterable[int]) -> str:
+        vals = sorted(set(int(v) for v in values))
+        if vals == list(range(10)):
+            return "{0..9}"
+        return "{" + ",".join(str(v) for v in vals) + "}"
+
+    @staticmethod
+    def _removed_digits_from_update(update_text: str) -> set[int]:
+        """Return digits removed by an apply-update line.
+
+        This is primarily used to make AllDifferent subtasks self-contained:
+        if an AllDifferent block updates D[x]: {1,2,9} -> {1,2}, then 9 is
+        the fixed digit that must be removed from non-fixed domains.
+        """
+        removed: set[int] = set()
+        pattern = CryptarithmAugmentGenerator._domain_update_pattern()
+        for m in pattern.finditer(update_text or ""):
+            before = CryptarithmAugmentGenerator._domain_values_to_set(m.group(2))
+            after = CryptarithmAugmentGenerator._domain_values_to_set(m.group(3))
+            removed.update(before - after)
+        return removed
 
     @staticmethod
     def _remove_lines(block_text: str, prefixes: Sequence[str]) -> str:
@@ -378,22 +440,56 @@ class CryptarithmAugmentGenerator:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _domain_block_start_pattern() -> re.Pattern[str]:
+        # Domain-propagation examples may start only at one of these local
+        # state-transition blocks.  A Branch block is included only when it is
+        # an explicit assignment, not when it merely chooses a symbol.
+        return re.compile(
+            r"(?m)^(No-leading-zero block|Projection block|AllDifferent block)\s+(\d+)"
+            r"|^(Branch block)\s+(\d+):\s+try set\s+(.+)$"
+        )
+
+    @staticmethod
+    def _major_replay_header_pattern() -> re.Pattern[str]:
+        # Hard boundary for one local domain-propagation task.  The previous
+        # extractor stopped only at the next domain block, which allowed a
+        # Projection/AllDifferent block to swallow following Combo/Map/Branch
+        # search-flow blocks.  That breaks the locality of the subtask.
+        return re.compile(
+            r"(?m)^(?:"
+            r"No-leading-zero block\s+\d+"
+            r"|Projection block\s+\d+"
+            r"|AllDifferent block\s+\d+"
+            r"|Branch block\s+\d+:"
+            r"|Combo block\s+\d+:"
+            r"|Map block\s+\d+:"
+            r"|Selected digit map"
+            r"|Verify selected rules"
+            r"|Target"
+            r")(?=\s|$)"
+        )
+
+    @staticmethod
+    def _next_major_header_start(local: str, start: int) -> int:
+        # Return the start index of the first major header after `start`.
+        # Skip the header at `start` itself.
+        pattern = CryptarithmAugmentGenerator._major_replay_header_pattern()
+        for m in pattern.finditer(local, pos=start + 1):
+            return m.start()
+        return len(local)
+
+    @staticmethod
     def _extract_domain_blocks(cot: str) -> List[Dict[str, Any]]:
         local = CryptarithmAugmentGenerator._section(cot, r"^Local replay steps\s*$", r"^Selected digit map\s*$")
         if not local:
             return []
-        starts = list(
-            re.finditer(
-                r"(?m)^(No-leading-zero block|Projection block|AllDifferent block)\s+(\d+)|^(Branch block)\s+(\d+):\s+try set\s+(.+)$",
-                local,
-            )
-        )
+        starts = list(CryptarithmAugmentGenerator._domain_block_start_pattern().finditer(local))
         blocks: List[Dict[str, Any]] = []
-        for i, m in enumerate(starts):
+        for m in starts:
             start = m.start()
-            end = starts[i + 1].start() if i + 1 < len(starts) else len(local)
+            end = CryptarithmAugmentGenerator._next_major_header_start(local, start)
             raw = local[start:end].rstrip()
-            first = raw.splitlines()[0].strip()
+            first = raw.splitlines()[0].strip() if raw.splitlines() else ""
             if first.startswith("No-leading-zero"):
                 kind = "no_leading_zero"
                 num = int(re.search(r"block\s+(\d+)", first).group(1))
@@ -416,6 +512,13 @@ class CryptarithmAugmentGenerator:
             # For prompt, remove apply update and decision so the model has to produce them.
             prompt_block = CryptarithmAugmentGenerator._remove_lines(raw, ["apply update:", "decision:"])
             current_domains = CryptarithmAugmentGenerator._current_domains_from_update(update)
+            fixed_digits_to_remove: List[int] = []
+            if kind == "alldifferent":
+                fixed_digits_to_remove = sorted(CryptarithmAugmentGenerator._removed_digits_from_update(update))
+                # If we cannot reconstruct which fixed digits caused the update,
+                # the task would not be self-contained.  Do not emit it.
+                if not fixed_digits_to_remove:
+                    continue
             blocks.append(
                 {
                     "number": num,
@@ -423,6 +526,7 @@ class CryptarithmAugmentGenerator:
                     "block_text": raw,
                     "prompt_block": prompt_block,
                     "current_domains": current_domains,
+                    "fixed_digits_to_remove": fixed_digits_to_remove,
                     "answer": "contradiction" if answer == "contradiction" else "keep",
                 }
             )
@@ -449,6 +553,14 @@ class CryptarithmAugmentGenerator:
             "Local operation:",
             item.get("prompt_block", ""),
         ]
+        if item.get("kind") == "alldifferent" and item.get("fixed_digits_to_remove"):
+            prompt_lines.extend(
+                [
+                    "",
+                    "Fixed digits to remove from non-fixed domains:",
+                    self._set_to_domain_values(item["fixed_digits_to_remove"]),
+                ]
+            )
         if item.get("current_domains"):
             prompt_lines.extend(["", "Current domains needed for the update:"])
             prompt_lines.extend(item["current_domains"])
