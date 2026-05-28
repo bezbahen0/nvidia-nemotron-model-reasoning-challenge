@@ -5,7 +5,7 @@ import pandas as pd
 
 from transformers import AutoTokenizer
 
-#from src.augmentation.equations.cryptarithm_generator import CryptarithmTaskGenerator
+from src.augmentation.equations.cryptarithm_augment import CryptarithmAugmentGenerator
 from src.augmentation.equations.numeral_equations_augment import NumeralEquationAugmentGenerator
 from src.augmentation.bit_manipulation import BitMatchingAugmentGenerator
 from src.augmentation.encryption import EncryptionTaskGenerator
@@ -75,23 +75,33 @@ def main():
     )
     
     multipliers = {
-        "cryptarithm": 3.5,
         "encryption": 1.0,
     }
 
-    ## Equations
-    #equations_cryptarithm_generator = CryptarithmTaskGenerator(seed=args.seed)
-#
-    #equations_cryptarithm_dataset = equations_cryptarithm_generator.generate_dataset(
-    #    num_samples=int(len(data[data.label == "cryptarithm"]) * multipliers["cryptarithm"]),
-    #    mode="random",
-    #    nb_workers=24,
-    #    progress_bar=False,
-    #)
-    #logger.info("\nCryptarithm generator:")
-    #logger.info(equations_cryptarithm_dataset.columns.tolist())
-    #logger.info(equations_cryptarithm_dataset.task_mode.value_counts(normalize=True))
-    #logger.info(f'Accuracy: {equations_cryptarithm_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean()}')
+    # Cryptarithm
+    # Instead of generating random full cryptarithm tasks, derive local Alice-style
+    # subtasks from existing replay CoTs: rule filtering, candidate checks,
+    # domain propagation, rule verification, and target application.
+    cryptarithm_augment_generator = CryptarithmAugmentGenerator(seed=args.seed)
+
+    cryptarithm_aug_dataset = cryptarithm_augment_generator.generate_dataset(
+        source_data=data[data.label == "cryptarithm"].copy(),
+        sample_frac=1.0,
+        only_solver_correct=False,
+    )
+    logger.info("\nCryptarithm augmenter:")
+    logger.info(cryptarithm_aug_dataset.columns.tolist())
+    if len(cryptarithm_aug_dataset) and "task_mode" in cryptarithm_aug_dataset.columns:
+        logger.info(cryptarithm_aug_dataset.task_mode.value_counts(normalize=True))
+    logger.info(f"Generated rows: {len(cryptarithm_aug_dataset)}")
+    logger.info(
+        f"Source solver correct rate: "
+        f"{cryptarithm_aug_dataset['source_solver_correct'].mean() if len(cryptarithm_aug_dataset) and 'source_solver_correct' in cryptarithm_aug_dataset.columns else 0.0}"
+    )
+    logger.info(
+        f'Accuracy: '
+        f'{cryptarithm_aug_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean() if len(cryptarithm_aug_dataset) else 0.0}'
+    )
 
     # Numeral equations
     # Instead of generating new full AST brute-force tasks, derive small Alice-style
@@ -138,8 +148,7 @@ def main():
     )
 
 
-    #data_gen = pd.concat([equations_cryptarithm_dataset, numeral_equations_aug_dataset, encryption_gen_dataset, bit_mp_gen_dataset])
-    data_gen = pd.concat([numeral_equations_aug_dataset, encryption_gen_dataset, bit_mp_gen_dataset])
+    data_gen = pd.concat([cryptarithm_aug_dataset, numeral_equations_aug_dataset, encryption_gen_dataset, bit_mp_gen_dataset])
     
     data_gen = data_gen[["prompt","answer","label","generated_cot","computed_answer"]]
     data_gen["source"] = len(data_gen) * ["generated"]
