@@ -439,6 +439,13 @@ class CryptarithmSolver:
         if kind in {"NO_LEADING_ZERO", "ALLDIFFERENT"}:
             lines.append(f"{event.title} {block_num}")
             lines.append(f"  constraint: {event.constraint}")
+            if kind == "ALLDIFFERENT" and event.meta:
+                hall_symbols = event.meta.get("hall_symbols")
+                hall_digits = event.meta.get("hall_digits")
+                if hall_symbols is not None and hall_digits is not None:
+                    sym_text = "{" + ",".join(repr(ch) for ch in hall_symbols) + "}"
+                    digit_text = "{" + ",".join(str(d) for d in hall_digits) + "}"
+                    lines.append(f"  Hall set: symbols {sym_text}; union digits {digit_text}")
             if event.reason:
                 lines.append(f"  reason: {event.reason}")
             if self._cfg("show_current_domains", False):
@@ -691,10 +698,29 @@ class CryptarithmSolver:
         return result.get("solution", "")
 
     def _alldifferent(self, domains: Domains, trace: ReplayTrace) -> bool:
+        """Enforce injective digit mapping with singleton and Hall-set pruning.
+
+        Hall rule: for any symbol subset S, let U be the union of their current
+        domains.  If |U| < |S|, injectivity is impossible.  If |U| == |S|,
+        digits in U are reserved for S and can be removed from all symbols
+        outside S.  With at most 10 symbols this exhaustive subset scan is cheap,
+        deterministic, and gives replayable pruning blocks.
+        """
+        from itertools import combinations
+
         scope = sorted(domains)
+
+        # 1) Singleton conflict: two already-fixed symbols cannot share a digit.
         before = self._snapshot_scope(domains, scope)
-        singles = [next(iter(v)) for v in domains.values() if len(v) == 1]
-        if len(singles) != len(set(singles)):
+        fixed_by_digit: Dict[int, List[str]] = {}
+        for ch in scope:
+            vals = domains[ch]
+            if len(vals) == 1:
+                fixed_by_digit.setdefault(next(iter(vals)), []).append(ch)
+        duplicate_fixed = {d: syms for d, syms in fixed_by_digit.items() if len(syms) > 1}
+        if duplicate_fixed:
+            witness_digit = sorted(duplicate_fixed)[0]
+            witness_symbols = tuple(sorted(duplicate_fixed[witness_digit]))
             trace.add_event(ReplayEvent(
                 kind="ALLDIFFERENT",
                 title="AllDifferent block",
@@ -703,53 +729,163 @@ class CryptarithmSolver:
                 after=before,
                 changes={},
                 decision="reject",
-                reason="two symbols are fixed to the same digit",
+                reason=(
+                    f"fixed digit {witness_digit} is assigned to multiple symbols "
+                    f"{', '.join(repr(ch) for ch in witness_symbols)}"
+                ),
+                meta={"duplicate_digit": witness_digit, "duplicate_symbols": witness_symbols},
             ))
             return False
-        fixed = set(singles)
-        for ch, vals in domains.items():
-            if len(vals) == 1:
-                continue
-            vals.difference_update(fixed)
-            if not vals:
-                after = self._snapshot_scope(domains, scope)
+
+        # 2) Standard singleton elimination.
+        fixed = set(fixed_by_digit)
+        if fixed:
+            before = self._snapshot_scope(domains, scope)
+            for ch in scope:
+                vals = domains[ch]
+                if len(vals) == 1:
+                    continue
+                vals.difference_update(fixed)
+                if not vals:
+                    after = self._snapshot_scope(domains, scope)
+                    trace.add_event(ReplayEvent(
+                        kind="ALLDIFFERENT",
+                        title="AllDifferent block",
+                        constraint="remove fixed digits from every other symbol domain",
+                        before=before,
+                        after=after,
+                        changes=self._changes(before, after),
+                        decision="reject",
+                        reason=f"domain({repr(ch)}) became empty",
+                        meta={"fixed_digits": tuple(sorted(fixed))},
+                    ))
+                    return False
+            after = self._snapshot_scope(domains, scope)
+            changes = self._changes(before, after)
+            if changes:
+                self.stats.domain_reductions += len(changes)
                 trace.add_event(ReplayEvent(
                     kind="ALLDIFFERENT",
                     title="AllDifferent block",
                     constraint="remove fixed digits from every other symbol domain",
                     before=before,
                     after=after,
-                    changes=self._changes(before, after),
-                    decision="reject",
-                    reason=f"domain({repr(ch)}) became empty",
+                    changes=changes,
+                    decision="keep",
+                    reason="fixed digits cannot be reused",
+                    meta={"fixed_digits": tuple(sorted(fixed))},
                 ))
-                return False
-        after = self._snapshot_scope(domains, scope)
-        changes = self._changes(before, after)
-        if changes:
-            self.stats.domain_reductions += len(changes)
-            trace.add_event(ReplayEvent(
-                kind="ALLDIFFERENT",
-                title="AllDifferent block",
-                constraint="remove fixed digits from every other symbol domain",
-                before=before,
-                after=after,
-                changes=changes,
-                decision="keep",
-                reason="fixed digits cannot be reused",
-            ))
-        elif self._cfg("include_no_change_events", False):
-            trace.add_event(ReplayEvent(
-                kind="ALLDIFFERENT",
-                title="AllDifferent block",
-                constraint="remove fixed digits from every other symbol domain",
-                before=before,
-                after=after,
-                changes={},
-                decision="no-change",
-                reason="no fixed digit can prune another domain",
-            ))
-        return True
+
+        # 3) Hall-set propagation.  Repeat inside this call because one Hall
+        #    pruning may expose another before the next equation projection.
+        emitted_no_change = False
+        while True:
+            hall_changed = False
+            n = len(scope)
+            for size in range(2, n + 1):
+                for hall_symbols in combinations(scope, size):
+                    union_digits: Set[int] = set()
+                    for ch in hall_symbols:
+                        union_digits.update(domains[ch])
+
+                    # Hall violation: too few distinct digits remain for this subset.
+                    if len(union_digits) < size:
+                        before = self._snapshot_scope(domains, scope)
+                        trace.add_event(ReplayEvent(
+                            kind="ALLDIFFERENT",
+                            title="AllDifferent Hall block",
+                            constraint="Hall set under injective digit map",
+                            before=before,
+                            after=before,
+                            changes={},
+                            decision="reject",
+                            reason=(
+                                f"{size} symbols have only {len(union_digits)} possible distinct digits; "
+                                "injective assignment is impossible"
+                            ),
+                            meta={
+                                "hall_symbols": tuple(hall_symbols),
+                                "hall_digits": tuple(sorted(union_digits)),
+                                "hall_symbol_count": size,
+                                "hall_digit_count": len(union_digits),
+                            },
+                        ))
+                        return False
+
+                    # Proper Hall set: these digits are reserved for this subset.
+                    # size == n has no outside symbols to prune, but is still useful
+                    # for contradiction detection above.
+                    if len(union_digits) != size or size == n:
+                        continue
+
+                    outside = [ch for ch in scope if ch not in hall_symbols]
+                    before = self._snapshot_scope(domains, scope)
+                    for ch in outside:
+                        domains[ch].difference_update(union_digits)
+                        if not domains[ch]:
+                            after = self._snapshot_scope(domains, scope)
+                            trace.add_event(ReplayEvent(
+                                kind="ALLDIFFERENT",
+                                title="AllDifferent Hall block",
+                                constraint="Hall set under injective digit map",
+                                before=before,
+                                after=after,
+                                changes=self._changes(before, after),
+                                decision="reject",
+                                reason=(
+                                    f"Hall digits {self._dom(union_digits)} are reserved for "
+                                    f"{tuple(hall_symbols)}, leaving domain({repr(ch)}) empty"
+                                ),
+                                meta={
+                                    "hall_symbols": tuple(hall_symbols),
+                                    "hall_digits": tuple(sorted(union_digits)),
+                                    "hall_symbol_count": size,
+                                    "hall_digit_count": len(union_digits),
+                                },
+                            ))
+                            return False
+                    after = self._snapshot_scope(domains, scope)
+                    changes = self._changes(before, after)
+                    if changes:
+                        self.stats.domain_reductions += len(changes)
+                        trace.add_event(ReplayEvent(
+                            kind="ALLDIFFERENT",
+                            title="AllDifferent Hall block",
+                            constraint="Hall set under injective digit map",
+                            before=before,
+                            after=after,
+                            changes=changes,
+                            decision="keep",
+                            reason=(
+                                f"{size} symbols have exactly {size} possible digits, so "
+                                "those digits are reserved for that symbol set"
+                            ),
+                            meta={
+                                "hall_symbols": tuple(hall_symbols),
+                                "hall_digits": tuple(sorted(union_digits)),
+                                "hall_symbol_count": size,
+                                "hall_digit_count": len(union_digits),
+                            },
+                        ))
+                        hall_changed = True
+                        break
+                if hall_changed:
+                    break
+            if not hall_changed:
+                if self._cfg("include_no_change_events", False) and not emitted_no_change:
+                    before = self._snapshot_scope(domains, scope)
+                    trace.add_event(ReplayEvent(
+                        kind="ALLDIFFERENT",
+                        title="AllDifferent block",
+                        constraint="singleton and Hall-set pruning under injective digit map",
+                        before=before,
+                        after=before,
+                        changes={},
+                        decision="no-change",
+                        reason="no fixed digit or Hall set can prune another domain",
+                    ))
+                    emitted_no_change = True
+                return True
 
     @staticmethod
     @staticmethod
