@@ -29,9 +29,9 @@ class SolverConfig:
     modular_anchor_ks: Any = (1, 2, -1)
     compact_structural_matching: Any = True
     compact_projection_blocks: Any = True
-    show_current_domains: Any = False
+    show_current_domains: Any = True
     show_projection_reason: Any = False
-    show_support_counts: Any = False
+    show_support_counts: Any = True
     cat_as_positional_equalities: Any = True
     causal_reject_blocks: Any = True
     show_projection_derivation: Any = True
@@ -41,9 +41,19 @@ class SolverConfig:
     max_exact_witness_count: Any = 6
     use_rule_specific_exact_projection: Any = True
     max_rule_specific_variables: Any = 8
-    max_transition_values_shown: Any = 12
+    max_transition_values_shown: Any = 10000000
     skip_modular_when_rule_specific_exact: Any = True
     show_exact_first_skip_events: Any = False
+    include_ambiguity_audit: Any = True
+    max_audit_solutions: Any = 100000
+    max_audit_rule_combos: Any = 100000
+    max_audit_target_outputs_shown: Any = 16
+    audit_stop_after_distinct_target_outputs: Any = 2
+    # Full CoT/audit is always enabled in this build; these are pruning knobs, not modes.
+    use_bounds_sign_structural_pruning: Any = True
+    use_target_no_leading_zero: Any = True
+    use_column_tuple_branching: Any = True
+    max_column_branch_tuples: Any = 24
 
 @dataclass(frozen=True)
 class Equation:
@@ -78,6 +88,7 @@ class Stats:
     digit_branches: int = 0
     domain_reductions: int = 0
     support_checks: int = 0
+    tuple_branches: int = 0
 
 
 @dataclass
@@ -122,6 +133,37 @@ class ReplayTrace:
 
     def finish(self) -> List[ReplayEvent]:
         return list(self.events)
+
+    def reject_reason(self) -> str:
+        return self.last_reject or "no supported continuation"
+
+
+class SilentReplayTrace:
+    """Trace sink for exhaustive audits.
+
+    It accepts the same minimal calls used by propagation, but does not retain
+    event bodies.  This keeps ambiguity audits from consuming memory or
+    contaminating the train-style replay trace.
+    """
+
+    def __init__(self) -> None:
+        self.events: List[ReplayEvent] = []
+        self.notes: List[str] = []
+        self.last_reject = ""
+
+    def add(self, line: str) -> None:
+        return None
+
+    def add_event(self, event: ReplayEvent) -> None:
+        if event.decision == "reject" or "contradiction" in event.kind.lower() or "reject" in event.kind.lower():
+            self.last_reject = event.reason or event.title or event.label
+
+    def extend(self, other: Any) -> None:
+        if getattr(other, "last_reject", ""):
+            self.last_reject = other.last_reject
+
+    def finish(self) -> List[ReplayEvent]:
+        return []
 
     def reject_reason(self) -> str:
         return self.last_reject or "no supported continuation"
@@ -200,13 +242,23 @@ class CryptarithmSolver:
                     meta={"ordered_ops": tuple(ordered_ops), "target_op": target_op},
                 )
             )
-            assignment, combo = self._search_rules(ordered_ops, candidates, equations, domains, {}, trace, 0)
+            assignment, combo = self._search_rules(ordered_ops, candidates, equations, domains, {}, trace, 0, target_context=(target_left, target_op, target_right))
 
             if assignment is None or combo is None:
                 return self._failure("no rule/map combination satisfies all examples", started)
 
             answer, target_error, target_a, target_b, target_value = self._encode_target(
                 target_left, target_op, target_right, combo[target_op], assignment
+            )
+            audit_result = self._audit_target_outputs(
+                ordered_ops=ordered_ops,
+                candidates=candidates,
+                equations=equations,
+                initial_domains=domains,
+                target_left=target_left,
+                target_op=target_op,
+                target_right=target_right,
+                selected_answer=answer,
             )
             events = trace.finish()
             self.stats.replay_events = len(events)
@@ -228,6 +280,7 @@ class CryptarithmSolver:
                 target_value=target_value,
                 ordered_ops=ordered_ops,
                 symbols=symbols,
+                audit_result=audit_result,
             )
             return {
                 "answer": answer,
@@ -237,6 +290,7 @@ class CryptarithmSolver:
                 "events": [asdict(e) for e in events],
                 "mapping": assignment,
                 "rules": {op: self._rule_name(rule) for op, rule in combo.items()},
+                "audit": audit_result,
                 "stats": self.stats.__dict__,
                 "elapsed_seconds": round(time.time() - started, 4),
                 "training_category": "cryptarithm.final_replay",
@@ -457,6 +511,26 @@ class CryptarithmSolver:
             lines.append(f"Branch block {block_num}: choose symbol")
             lines.append(f"  reason: {event.reason}")
             return lines
+        if kind == "TUPLE_BRANCH_SELECT":
+            lines.append(f"Branch block {block_num}: choose column tuple relation")
+            if event.label:
+                lines.append(f"  label: {event.label}")
+            if event.constraint:
+                lines.append(f"  formula: {event.constraint}")
+            lines.append(f"  reason: {event.reason}")
+            if event.meta:
+                tuples = event.meta.get("tuples", ())
+                if tuples:
+                    rendered = []
+                    for tup in tuples:
+                        rendered.append("{" + ", ".join(f"{repr(ch)}={d}" for ch, d in tup) + "}")
+                    lines.append("  branch tuples: " + "; ".join(rendered))
+            return lines
+        if kind == "TUPLE_TRY":
+            lines.append(f"Branch block {block_num}: try tuple {event.reason}")
+            lines.append(f"  apply update: {self._changes_text(event.changes)}")
+            lines.append("  decision: propagate this tuple assignment")
+            return lines
         if kind == "DIGIT_TRY":
             lines.append(f"Branch block {block_num}: try {event.reason}")
             lines.append(f"  apply update: {self._changes_text(event.changes)}")
@@ -541,7 +615,7 @@ class CryptarithmSolver:
                 lines.append(f"  decision: reject combo {combo_text}")
                 return lines
 
-            if event.kind == "DIGIT_REJECT":
+            if event.kind in {"DIGIT_REJECT", "TUPLE_REJECT"}:
                 branch, failure = self._split_decision_reason(event.reason)
                 lines = [f"Branch block {block_num}: test {branch}"]
                 if event.label or event.constraint or event.supported is not None:
@@ -572,6 +646,7 @@ class CryptarithmSolver:
         target_value: Optional[int],
         ordered_ops: Sequence[str],
         symbols: Sequence[str],
+        audit_result: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         lines: List[str] = []
         add = lines.append
@@ -617,7 +692,10 @@ class CryptarithmSolver:
         add("Local replay steps")
         add("Replay convention: a projection block is one local solver operation; rule-specific exact full projections are used instead of low-k suffix projection cascades.")
         add("Branch blocks explicitly assign one digit and then run the following propagation blocks.")
-        add("Only local operations that change state, reject a branch/combo, or select a branch are shown; current domains are reconstructed from earlier updates unless audit mode enables them.")
+        if self._cfg("show_current_domains", False):
+            add("Only local operations that change state, reject a branch/combo, or select a branch are shown; each local pruning block prints its current local domains before the update.")
+        else:
+            add("Only local operations that change state, reject a branch/combo, or select a branch are shown; current domains are reconstructed from earlier updates.")
         projection_count = 0
         for idx, event in enumerate(events, 1):
             if event.kind in {"COLUMN_PROJECT", "FULL_PROJECT", "PROJECTION"}:
@@ -651,6 +729,32 @@ class CryptarithmSolver:
                 add(f"  encode result: {encoded}")
                 add(f"  compare visible output: produced {encoded} vs expected {expected} -> {status}")
         add("")
+
+        if audit_result and audit_result.get("enabled"):
+            add("Ambiguity audit")
+            add("Audit scope: all structurally kept rule combos and all digit maps satisfying the training examples.")
+            add(f"Rule combos tested: {audit_result.get('rule_combos_tested', 0)}")
+            add(f"Valid rule combos found: {audit_result.get('valid_rule_combos', 0)}")
+            add(f"Valid complete solutions found: {audit_result.get('valid_complete_solutions', 0)}")
+            outputs = audit_result.get("target_outputs", ())
+            if outputs:
+                max_shown = int(self._cfg("max_audit_target_outputs_shown", 16))
+                shown = tuple(outputs[:max_shown])
+                shown_outputs = ", ".join(repr(x) for x in shown)
+                suffix = "" if len(outputs) <= max_shown else f", ... {len(outputs) - max_shown} more"
+                add(f"Target outputs found: {{{shown_outputs}{suffix}}}")
+            else:
+                add("Target outputs found: none")
+            selected_output = audit_result.get("selected_output", "nan")
+            add(f"Selected solution output: {repr(selected_output)}")
+            outputs_count = len(outputs)
+            if audit_result.get("complete") or outputs_count > 1:
+                add(f"decision: {audit_result.get('decision', 'audit complete')}")
+                if not audit_result.get("complete"):
+                    add(f"audit stopped early: {audit_result.get('stopped_reason', 'unknown stop reason')}")
+            else:
+                add(f"decision: audit incomplete — {audit_result.get('stopped_reason', 'unknown stop reason')}")
+            add("")
 
         add("Target")
         target_rule = combo[target_op]
@@ -1460,6 +1564,35 @@ class CryptarithmSolver:
         rep = sorted(rules, key=self._rule_sort_key)[0]
         if reason == "sign":
             return ["signed output is present in the examples, but these rules are unsigned."]
+        if reason == "concat positional":
+            lines: List[str] = []
+            for rule in sorted(rules, key=self._rule_sort_key):
+                for eq in eqs:
+                    expected = self._cat_expected_output(eq, rule)
+                    observed = eq.result
+                    if len(expected) == len(observed) and expected != observed:
+                        mismatch = next(
+                            (idx, exp, obs)
+                            for idx, (exp, obs) in enumerate(zip(expected, observed), 1)
+                            if exp != obs
+                        )
+                        idx, exp, obs = mismatch
+                        lines.append(
+                            f"{self._rule_name(rule)} on {eq.display()} requires visible output {expected!r}; "
+                            f"observed {observed!r}; first mismatch at position {idx}: expected {exp!r}, observed {obs!r}. "
+                            "Because the digit map is injective, different visible symbols cannot be identified."
+                        )
+                        break
+            return lines or ["concat visible output does not match the positional symbol pattern required by these rules."]
+        if reason in {"value range", "signed value range", "unsigned value range"}:
+            lines: List[str] = []
+            for rule in sorted(rules, key=self._rule_sort_key):
+                for eq in eqs:
+                    ok, why = self._bounds_sign_status(rule, eq)
+                    if not ok and why == reason:
+                        lines.append(self._bounds_sign_reason(rule, eq))
+                        break
+            return lines or ["numeric value range cannot overlap the visible output range with the required sign."]
 
         lines: List[str] = []
         grouped: Dict[Tuple[int, int], Set[int]] = {}
@@ -1581,6 +1714,84 @@ class CryptarithmSolver:
                 changes={},
                 decision="no-change",
                 reason=reason,
+            ))
+        return True
+
+    def _target_leading_zero(
+        self,
+        target_left: str,
+        target_op: str,
+        target_right: str,
+        combo: Dict[str, Rule],
+        domains: Domains,
+        trace: ReplayTrace,
+    ) -> bool:
+        """Apply the same no-leading-zero convention to target operands.
+
+        This is rule-orientation dependent: std reads the visible first symbol as
+        the leading digit, while rev reads the visible last symbol as the leading
+        digit.  The target has no known result yet, so only target operands are
+        constrained here.
+        """
+        if not self._cfg("use_target_no_leading_zero", True):
+            return True
+        rule = combo.get(target_op)
+        if rule is None:
+            return True
+        scope: List[str] = []
+        terms: List[str] = []
+        for term in (target_left, target_right):
+            if len(term) <= 1:
+                continue
+            lead = term[-1] if rule.reverse else term[0]
+            scope.append(lead)
+            terms.append(f"{repr(lead)} is leading digit of target operand {repr(term)} under {self._rule_name(rule)}")
+        scope = list(dict.fromkeys(scope))
+        if not scope:
+            return True
+        before = self._snapshot_scope(domains, scope)
+        for lead in scope:
+            if 0 in domains[lead]:
+                domains[lead].remove(0)
+                if not domains[lead]:
+                    after = self._snapshot_scope(domains, scope)
+                    trace.add_event(ReplayEvent(
+                        kind="NO_LEADING_ZERO",
+                        title="Target no-leading-zero block",
+                        constraint="target operands use the same no-leading-zero convention as training operands",
+                        before=before,
+                        after=after,
+                        changes=self._changes(before, after),
+                        decision="reject",
+                        reason=f"domain({repr(lead)}) became empty after removing 0",
+                    ))
+                    return False
+        after = self._snapshot_scope(domains, scope)
+        changes = self._changes(before, after)
+        if changes:
+            self.stats.domain_reductions += len(changes)
+            trace.add_event(ReplayEvent(
+                kind="NO_LEADING_ZERO",
+                title="Target no-leading-zero block",
+                constraint="target operands use the same no-leading-zero convention as training operands",
+                before=before,
+                after=after,
+                changes=changes,
+                decision="keep",
+                reason="; ".join(terms),
+                meta={"target_terms": (target_left, target_right), "target_op": target_op, "rule": self._rule_name(rule)},
+            ))
+        elif self._cfg("include_no_change_events", False):
+            trace.add_event(ReplayEvent(
+                kind="NO_LEADING_ZERO",
+                title="Target no-leading-zero block",
+                constraint="target operands use the same no-leading-zero convention as training operands",
+                before=before,
+                after=after,
+                changes={},
+                decision="no-change",
+                reason="; ".join(terms),
+                meta={"target_terms": (target_left, target_right), "target_op": target_op, "rule": self._rule_name(rule)},
             ))
         return True
 
@@ -1934,11 +2145,15 @@ class CryptarithmSolver:
             return "addition check: keep assignments satisfying the displayed sum formula"
         return "local support check: keep injective assignments satisfying the displayed formula"
 
-    def _propagate(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains, trace: Trace) -> bool:
+    def _propagate(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains, trace: Trace, target_context: Optional[Tuple[str, str, str]] = None) -> bool:
         while True:
             before = {ch: tuple(sorted(vals)) for ch, vals in domains.items()}
             if not self._leading_zero(equations, combo, domains, trace):
                 return False
+            if target_context is not None:
+                target_left, target_op, target_right = target_context
+                if not self._target_leading_zero(target_left, target_op, target_right, combo, domains, trace):
+                    return False
             if not self._alldifferent(domains, trace):
                 return False
             for eq in equations:
@@ -2098,6 +2313,166 @@ class CryptarithmSolver:
         family_rank = {name: i for i, (_, names) in enumerate(self._rule_family_order()) for name in names}
         return (family_rank.get(rule.name, 99), 0 if rule.orientation == "std" else 1, rule.name)
 
+    def _audit_target_outputs(
+        self,
+        ordered_ops: Sequence[str],
+        candidates: Dict[str, List[Rule]],
+        equations: Sequence[Equation],
+        initial_domains: Domains,
+        target_left: str,
+        target_op: str,
+        target_right: str,
+        selected_answer: Optional[str],
+    ) -> Dict[str, Any]:
+        """Exhaustively audit whether the target output is invariant.
+
+        The main solver deliberately stops at the first valid solution.  This
+        audit is a separate silent search over every structurally kept rule
+        combo and every digit map that satisfies the training examples.  It is
+        allowed to stop early only when it can already prove ambiguity, or when
+        explicit audit limits/timeouts are hit; incomplete audits are rendered
+        as incomplete rather than as uniqueness proofs.
+        """
+        selected_output = selected_answer if selected_answer is not None else "nan"
+        result: Dict[str, Any] = {
+            "enabled": bool(self._cfg("include_ambiguity_audit", True)),
+            "complete": False,
+            "stopped_reason": "not run",
+            "rule_combos_tested": 0,
+            "valid_rule_combos": 0,
+            "valid_complete_solutions": 0,
+            "target_outputs": tuple(),
+            "selected_output": selected_output,
+            "decision": "audit not run",
+        }
+        if not result["enabled"]:
+            return result
+
+        max_solutions = int(self._cfg("max_audit_solutions", 100000))
+        max_rule_combos = int(self._cfg("max_audit_rule_combos", 100000))
+        stop_after_outputs = int(self._cfg("audit_stop_after_distinct_target_outputs", 2))
+        target_outputs: Set[str] = set()
+        valid_rule_combos: Set[Tuple[Tuple[str, str], ...]] = set()
+        previous_stats = dict(self.stats.__dict__)
+        stopped = {"reason": "exhausted"}
+
+        def finish(complete: bool, reason: str) -> Dict[str, Any]:
+            # Restore main-solve stats: the audit is intentionally silent and
+            # should not make replay statistics look larger than the printed
+            # replay path.  Then add explicit audit counters.
+            self.stats.__dict__.clear()
+            self.stats.__dict__.update(previous_stats)
+            self.stats.audit_rule_combos_tested = result["rule_combos_tested"]
+            self.stats.audit_valid_rule_combos = len(valid_rule_combos)
+            self.stats.audit_valid_complete_solutions = result["valid_complete_solutions"]
+            self.stats.audit_distinct_target_outputs = len(target_outputs)
+
+            outputs = tuple(sorted(target_outputs))
+            result.update({
+                "complete": complete,
+                "stopped_reason": reason,
+                "valid_rule_combos": len(valid_rule_combos),
+                "target_outputs": outputs,
+            })
+            if len(outputs) > 1:
+                result["decision"] = "ambiguous item: multiple target outputs are consistent with the training examples"
+            elif not complete:
+                result["decision"] = "target-output uniqueness was not proven"
+            elif len(outputs) == 0:
+                result["decision"] = "no valid complete solution was found during audit"
+            else:
+                only = outputs[0]
+                if only == selected_output:
+                    result["decision"] = "target output is unique over all valid complete solutions"
+                else:
+                    result["decision"] = "audit found one target output, but it differs from the selected solution output"
+            return result
+
+        def should_stop_after_output() -> bool:
+            if stop_after_outputs <= 0:
+                return False
+            if len(target_outputs) >= stop_after_outputs:
+                stopped["reason"] = f"found {len(target_outputs)} distinct target outputs; ambiguity is already proven"
+                return True
+            return False
+
+        def record_solution(combo: Dict[str, Rule], assignment: Assignment) -> bool:
+            if not self._verify_assignment(equations, combo, assignment):
+                return True
+            answer, _, _, _, _ = self._encode_target(target_left, target_op, target_right, combo[target_op], assignment)
+            target_outputs.add(answer if answer is not None else "nan")
+            result["valid_complete_solutions"] += 1
+            combo_key = tuple(sorted((op, self._rule_name(rule)) for op, rule in combo.items()))
+            valid_rule_combos.add(combo_key)
+            if result["valid_complete_solutions"] >= max_solutions:
+                stopped["reason"] = f"reached max_audit_solutions={max_solutions} before exhaustive audit"
+                return False
+            if should_stop_after_output():
+                return False
+            return True
+
+        def enumerate_digit_maps(combo: Dict[str, Rule], domains: Domains) -> bool:
+            if time.time() > self._deadline:
+                raise TimeoutError("audit timeout")
+            unresolved = [ch for ch, vals in domains.items() if len(vals) > 1]
+            if not unresolved:
+                assignment = {ch: next(iter(vals)) for ch, vals in domains.items()}
+                return record_solution(combo, assignment)
+
+            tuple_branch = self._select_column_tuple_branch(equations, combo, domains)
+            if tuple_branch is not None:
+                for tuple_assignment in tuple_branch["tuples"]:
+                    applied = self._apply_tuple_to_domains(domains, tuple_assignment)
+                    if applied is None:
+                        continue
+                    branch_domains, _changes = applied
+                    if self._propagate(equations, combo, branch_domains, SilentReplayTrace(), (target_left, target_op, target_right)):
+                        if not enumerate_digit_maps(combo, branch_domains):
+                            return False
+                return True
+
+            symbol = min(unresolved, key=lambda ch: (len(domains[ch]), ch))
+            for digit in sorted(domains[symbol]):
+                branch_domains = self._copy_domains(domains)
+                branch_domains[symbol] = {digit}
+                if self._propagate(equations, combo, branch_domains, SilentReplayTrace(), (target_left, target_op, target_right)):
+                    if not enumerate_digit_maps(combo, branch_domains):
+                        return False
+            return True
+
+        def search_rule_combos(index: int, combo: Dict[str, Rule], domains: Domains) -> bool:
+            if time.time() > self._deadline:
+                raise TimeoutError("audit timeout")
+            if index == len(ordered_ops):
+                result["rule_combos_tested"] += 1
+                if result["rule_combos_tested"] > max_rule_combos:
+                    stopped["reason"] = f"reached max_audit_rule_combos={max_rule_combos} before exhaustive audit"
+                    return False
+                combo_domains = self._copy_domains(domains)
+                if not self._propagate(equations, combo, combo_domains, SilentReplayTrace(), (target_left, target_op, target_right)):
+                    return True
+                return enumerate_digit_maps(combo, combo_domains)
+
+            op = ordered_ops[index]
+            for rule in candidates[op]:
+                combo2 = dict(combo)
+                combo2[op] = rule
+                domains2 = self._copy_domains(domains)
+                if self._propagate(equations, combo2, domains2, SilentReplayTrace(), (target_left, target_op, target_right)):
+                    if not search_rule_combos(index + 1, combo2, domains2):
+                        return False
+            return True
+
+        try:
+            completed = search_rule_combos(0, {}, self._copy_domains(initial_domains))
+            if completed:
+                return finish(True, "exhausted all structurally kept rule combos and digit maps")
+            return finish(False, stopped["reason"])
+        except TimeoutError:
+            return finish(False, "audit timeout before exhaustive proof")
+        except Exception as exc:
+            return finish(False, f"audit error: {type(exc).__name__}: {exc}")
+
     def _search_rules(
         self,
         ordered_ops: Sequence[str],
@@ -2107,6 +2482,7 @@ class CryptarithmSolver:
         combo: Dict[str, Rule],
         trace: ReplayTrace,
         index: int,
+        target_context: Optional[Tuple[str, str, str]] = None,
     ) -> Tuple[Optional[Assignment], Optional[Dict[str, Rule]]]:
         if time.time() > self._deadline:
             raise TimeoutError("timeout")
@@ -2120,7 +2496,7 @@ class CryptarithmSolver:
                 reason="all operators have candidate rules; start digit-domain solving",
                 meta={"combo": tuple(sorted((op, self._rule_name(rule)) for op, rule in combo.items()))},
             ))
-            if not self._propagate(equations, combo, domains2, trace2):
+            if not self._propagate(equations, combo, domains2, trace2, target_context):
                 failure_event = trace2.events[-1] if trace2.events else None
                 trace.add_event(ReplayEvent(
                     kind="COMBO_REJECT",
@@ -2139,7 +2515,7 @@ class CryptarithmSolver:
                 if self._cfg("include_failed_attempt_events", False):
                     trace.extend(trace2)
                 return None, None
-            assignment = self._solve_digits(equations, combo, domains2, trace2)
+            assignment = self._solve_digits(equations, combo, domains2, trace2, target_context)
             if assignment is not None:
                 trace.extend(trace2)
                 trace.add_event(ReplayEvent(
@@ -2175,8 +2551,8 @@ class CryptarithmSolver:
                 reason=f"operator {repr(op)} -> {self._rule_name(rule)}",
                 meta={"op": op, "rule": self._rule_name(rule), "depth": index},
             ))
-            if self._propagate(equations, combo2, domains2, trace2):
-                assignment, solved_combo = self._search_rules(ordered_ops, candidates, equations, domains2, combo2, trace2, index + 1)
+            if self._propagate(equations, combo2, domains2, trace2, target_context):
+                assignment, solved_combo = self._search_rules(ordered_ops, candidates, equations, domains2, combo2, trace2, index + 1, target_context)
                 if assignment is not None and solved_combo is not None:
                     trace.extend(trace2)
                     return assignment, solved_combo
@@ -2213,7 +2589,223 @@ class CryptarithmSolver:
     def _snapshot_scope(domains: Domains, scope: Sequence[str]) -> Dict[str, Tuple[int, ...]]:
         return {ch: tuple(sorted(domains[ch])) for ch in dict.fromkeys(scope)}
 
-    def _solve_digits(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains, trace: ReplayTrace) -> Optional[Assignment]:
+    def _enumerate_local_digit_tuples(
+        self,
+        symbols: Sequence[str],
+        domains: Domains,
+        predicate: Callable[[Assignment], bool],
+        max_tuples: int,
+    ) -> List[Tuple[Tuple[str, int], ...]]:
+        ordered = list(dict.fromkeys(symbols))
+        out: List[Tuple[Tuple[str, int], ...]] = []
+        local: Assignment = {}
+        used: Set[int] = set()
+
+        def bt(i: int) -> None:
+            if len(out) > max_tuples:
+                return
+            if i == len(ordered):
+                if predicate(local):
+                    out.append(tuple((ch, local[ch]) for ch in ordered))
+                return
+            ch = ordered[i]
+            for digit in sorted(domains[ch]):
+                if digit in used:
+                    continue
+                local[ch] = digit
+                used.add(digit)
+                bt(i + 1)
+                used.remove(digit)
+                del local[ch]
+
+        bt(0)
+        # De-duplicate; a local assignment can be supported by multiple hidden carry values/cases.
+        seen: Set[Tuple[Tuple[str, int], ...]] = set()
+        uniq: List[Tuple[Tuple[str, int], ...]] = []
+        for tup in out:
+            if tup not in seen:
+                seen.add(tup)
+                uniq.append(tup)
+        return uniq
+
+    def _column_tuple_candidates_for_eq(
+        self,
+        eq: Equation,
+        rule: Rule,
+        domains: Domains,
+        max_tuples: int,
+    ) -> List[Dict[str, Any]]:
+        if not self._cfg("use_column_tuple_branching", True):
+            return []
+        a_syms = self._low_to_high_symbols(eq.left, rule)
+        b_syms = self._low_to_high_symbols(eq.right, rule)
+        r_syms = self._low_to_high_symbols(eq.result, rule)
+        candidates: List[Dict[str, Any]] = []
+
+        def add_candidate(label: str, constraint: str, symbols: Sequence[str], pred: Callable[[Assignment], bool]) -> None:
+            scope = [s for s in dict.fromkeys(symbols) if s is not None]
+            if not scope or not any(len(domains[s]) > 1 for s in scope):
+                return
+            product_space = 1
+            for s in scope:
+                product_space *= len(domains[s])
+            tuples = self._enumerate_local_digit_tuples(scope, domains, pred, max_tuples + 1)
+            if not tuples or len(tuples) > max_tuples:
+                return
+            # Branching is useful only if the relation is stricter than the raw domain product.
+            if len(tuples) >= product_space:
+                return
+            candidates.append({
+                "label": label,
+                "constraint": constraint,
+                "symbols": tuple(scope),
+                "tuples": tuple(tuples),
+                "tuple_count": len(tuples),
+                "product_space": product_space,
+            })
+
+        # Addition columns.  Column 0 has fixed carry-in 0; later columns allow both carry states.
+        if rule.name in {"add", "add1", "addm1"}:
+            delta = 1 if rule.name == "add1" else -1 if rule.name == "addm1" else 0
+            max_col = max(len(a_syms), len(b_syms), len(r_syms))
+            for col in range(max_col):
+                a = a_syms[col] if col < len(a_syms) else None
+                b = b_syms[col] if col < len(b_syms) else None
+                r = r_syms[col] if col < len(r_syms) else None
+                syms = [x for x in (a, b, r) if x is not None]
+                carry_values = (0,) if col == 0 else (0, 1)
+                def pred(local: Assignment, a=a, b=b, r=r, col=col, carry_values=carry_values) -> bool:
+                    av = 0 if a is None else local[a]
+                    bv = 0 if b is None else local[b]
+                    rv = 0 if r is None else local[r]
+                    for carry in carry_values:
+                        total = av + bv + carry + (delta if col == 0 else 0)
+                        if total >= 0 and total % 10 == rv:
+                            return True
+                    return False
+                extra = f" + {delta}" if col == 0 and delta else ""
+                add_candidate(
+                    f"column {col} tuple relation for {eq.display()} via {self._rule_name(rule)}",
+                    f"column {col}: a_digit+b_digit+carry{extra} = result_digit mod 10",
+                    syms,
+                    pred,
+                )
+            return candidates
+
+        # Multiplication: use low column only, where carry-in is definitely 0.
+        if rule.name in {"mul", "mul1", "mulm1"}:
+            delta = 1 if rule.name == "mul1" else -1 if rule.name == "mulm1" else 0
+            if a_syms and b_syms:
+                a, b = a_syms[0], b_syms[0]
+                r = r_syms[0] if r_syms else None
+                syms = [x for x in (a, b, r) if x is not None]
+                def pred(local: Assignment, a=a, b=b, r=r) -> bool:
+                    total = local[a] * local[b] + delta
+                    if total < 0:
+                        return False
+                    rv = 0 if r is None else local[r]
+                    return total % 10 == rv
+                extra = f" + {delta}" if delta else ""
+                add_candidate(
+                    f"low-column tuple relation for {eq.display()} via {self._rule_name(rule)}",
+                    f"column 0: a0*b0{extra} = result0 mod 10",
+                    syms,
+                    pred,
+                )
+            return candidates
+
+        # Subtraction: low column has borrow-in 0.  For signed outputs A-B=-R, use B-A=R.
+        if rule.name == "sub":
+            minuend = b_syms if eq.has_sign else a_syms
+            subtrahend = a_syms if eq.has_sign else b_syms
+            if minuend or subtrahend or r_syms:
+                m = minuend[0] if minuend else None
+                sub = subtrahend[0] if subtrahend else None
+                r = r_syms[0] if r_syms else None
+                syms = [x for x in (m, sub, r) if x is not None]
+                def pred(local: Assignment, m=m, sub=sub, r=r) -> bool:
+                    mv = 0 if m is None else local[m]
+                    sv = 0 if sub is None else local[sub]
+                    rv = 0 if r is None else local[r]
+                    raw = mv - sv
+                    digit = raw + 10 if raw < 0 else raw
+                    return digit == rv
+                rewrite = "B-A=R" if eq.has_sign else "A-B=R"
+                add_candidate(
+                    f"low-column tuple relation for {eq.display()} via {self._rule_name(rule)}",
+                    f"column 0 subtraction after rewrite {rewrite}: minuend0-subtrahend0 = result0 mod 10",
+                    syms,
+                    pred,
+                )
+            return candidates
+
+        # Absolute difference: low column can come from A-B=R or B-A=R.
+        if rule.name == "abs":
+            if a_syms or b_syms or r_syms:
+                a = a_syms[0] if a_syms else None
+                b = b_syms[0] if b_syms else None
+                r = r_syms[0] if r_syms else None
+                syms = [x for x in (a, b, r) if x is not None]
+                def pred(local: Assignment, a=a, b=b, r=r) -> bool:
+                    av = 0 if a is None else local[a]
+                    bv = 0 if b is None else local[b]
+                    rv = 0 if r is None else local[r]
+                    raw1 = av - bv
+                    raw2 = bv - av
+                    d1 = raw1 + 10 if raw1 < 0 else raw1
+                    d2 = raw2 + 10 if raw2 < 0 else raw2
+                    return d1 == rv or d2 == rv
+                add_candidate(
+                    f"low-column tuple relation for {eq.display()} via {self._rule_name(rule)}",
+                    "column 0 abs split: either A-B=R or B-A=R modulo 10",
+                    syms,
+                    pred,
+                )
+            return candidates
+
+        return candidates
+
+    def _select_column_tuple_branch(
+        self,
+        equations: Sequence[Equation],
+        combo: Dict[str, Rule],
+        domains: Domains,
+    ) -> Optional[Dict[str, Any]]:
+        max_tuples = int(self._cfg("max_column_branch_tuples", 24))
+        if max_tuples <= 0:
+            return None
+        candidates: List[Dict[str, Any]] = []
+        for eq in equations:
+            rule = combo.get(eq.op)
+            if rule is None:
+                continue
+            candidates.extend(self._column_tuple_candidates_for_eq(eq, rule, domains, max_tuples))
+        if not candidates:
+            return None
+        # Prefer the smallest relation, then the relation that fixes more unresolved symbols.
+        candidates.sort(key=lambda c: (c["tuple_count"], -sum(1 for s in c["symbols"] if len(domains[s]) > 1), c["label"]))
+        return candidates[0]
+
+    def _apply_tuple_to_domains(
+        self,
+        domains: Domains,
+        tuple_assignment: Sequence[Tuple[str, int]],
+    ) -> Optional[Tuple[Domains, Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]]]]:
+        branch_domains = self._copy_domains(domains)
+        changes: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
+        for ch, digit in tuple_assignment:
+            if digit not in branch_domains[ch]:
+                return None
+            before = tuple(sorted(branch_domains[ch]))
+            after = (digit,)
+            branch_domains[ch] = {digit}
+            if before != after:
+                changes[ch] = (before, after)
+        if not changes:
+            return None
+        return branch_domains, changes
+
+    def _solve_digits(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains, trace: ReplayTrace, target_context: Optional[Tuple[str, str, str]] = None) -> Optional[Assignment]:
         if time.time() > self._deadline:
             raise TimeoutError("timeout")
         unresolved = [ch for ch, vals in domains.items() if len(vals) > 1]
@@ -2235,6 +2827,73 @@ class CryptarithmSolver:
                 reason="singleton domains do not verify every example",
                 meta={"assignment": tuple(sorted(assignment.items()))},
             ))
+            return None
+
+        tuple_branch = self._select_column_tuple_branch(equations, combo, domains)
+        if tuple_branch is not None:
+            tuple_items = tuple(tuple(t) for t in tuple_branch["tuples"])
+            trace.add_event(ReplayEvent(
+                kind="TUPLE_BRANCH_SELECT",
+                title="Column tuple branch selection",
+                label=tuple_branch["label"],
+                constraint=tuple_branch["constraint"],
+                decision="select",
+                reason=(
+                    f"choose smallest local column relation: {tuple_branch['tuple_count']} tuples "
+                    f"instead of raw domain product {tuple_branch['product_space']}"
+                ),
+                meta={
+                    "symbols": tuple_branch["symbols"],
+                    "tuple_count": tuple_branch["tuple_count"],
+                    "product_space": tuple_branch["product_space"],
+                    "tuples": tuple_items,
+                },
+            ))
+            for idx, tuple_assignment in enumerate(tuple_branch["tuples"], 1):
+                applied = self._apply_tuple_to_domains(domains, tuple_assignment)
+                if applied is None:
+                    continue
+                self.stats.tuple_branches += 1
+                branch_domains, changes = applied
+                tuple_text = "{" + ", ".join(f"{repr(ch)}={digit}" for ch, digit in tuple_assignment) + "}"
+                branch_trace = ReplayTrace(self.config)
+                branch_trace.add_event(ReplayEvent(
+                    kind="TUPLE_TRY",
+                    title="Column tuple branch",
+                    label=tuple_branch["label"],
+                    constraint=tuple_branch["constraint"],
+                    before={ch: before for ch, (before, _after) in changes.items()},
+                    after={ch: after for ch, (_before, after) in changes.items()},
+                    changes=changes,
+                    decision="try",
+                    reason=tuple_text,
+                    meta={"tuple_index": idx, "tuple": tuple(tuple_assignment)},
+                ))
+                if self._propagate(equations, combo, branch_domains, branch_trace, target_context):
+                    found = self._solve_digits(equations, combo, branch_domains, branch_trace, target_context)
+                    if found is not None:
+                        trace.extend(branch_trace)
+                        return found
+                    reject_reason = branch_trace.reject_reason()
+                else:
+                    reject_reason = branch_trace.reject_reason()
+                failure_event = branch_trace.events[-1] if branch_trace.events else None
+                trace.add_event(ReplayEvent(
+                    kind="TUPLE_REJECT",
+                    title="Column tuple branch rejected",
+                    label=(failure_event.label if failure_event else tuple_branch["label"]),
+                    constraint=(failure_event.constraint if failure_event else tuple_branch["constraint"]),
+                    before=(failure_event.before if failure_event else None),
+                    supported=(failure_event.supported if failure_event else None),
+                    after=(failure_event.after if failure_event else None),
+                    changes=(failure_event.changes if failure_event else None),
+                    count=(failure_event.count if failure_event else None),
+                    decision="reject",
+                    reason=f"{tuple_text}: {reject_reason}",
+                    meta={"tuple_index": idx, "tuple": tuple(tuple_assignment), "failure_kind": failure_event.kind if failure_event else None},
+                ))
+                if self._cfg("include_failed_attempt_events", False):
+                    trace.extend(branch_trace)
             return None
 
         symbol = min(unresolved, key=lambda ch: (len(domains[ch]), ch))
@@ -2262,8 +2921,8 @@ class CryptarithmSolver:
                 reason=f"set {repr(symbol)}={digit}",
                 meta={"symbol": symbol, "digit": digit},
             ))
-            if self._propagate(equations, combo, branch_domains, branch_trace):
-                found = self._solve_digits(equations, combo, branch_domains, branch_trace)
+            if self._propagate(equations, combo, branch_domains, branch_trace, target_context):
+                found = self._solve_digits(equations, combo, branch_domains, branch_trace, target_context)
                 if found is not None:
                     trace.extend(branch_trace)
                     return found
@@ -2344,15 +3003,100 @@ class CryptarithmSolver:
             count=1,
         )
 
+    def _result_value_interval(self, eq: Equation) -> Tuple[int, int]:
+        lo, hi = self._bounds(len(eq.result))
+        if eq.has_sign:
+            return -hi, -lo
+        return lo, hi
+
+    @staticmethod
+    def _intervals_overlap(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
+        return max(a[0], b[0]) <= min(a[1], b[1])
+
+    def _rule_value_interval(self, rule: Rule, eq: Equation) -> Tuple[int, int]:
+        lo_l, hi_l = self._bounds(len(eq.left))
+        lo_r, hi_r = self._bounds(len(eq.right))
+        if rule.name == "cat":
+            return self._bounds(len(eq.left) + len(eq.right))
+        if rule.name in {"add", "add1", "addm1"}:
+            delta = 1 if rule.name == "add1" else -1 if rule.name == "addm1" else 0
+            lo, hi = lo_l + lo_r + delta, hi_l + hi_r + delta
+            if rule.name == "addm1":
+                lo = max(0, lo)
+            return lo, hi
+        if rule.name in {"mul", "mul1", "mulm1"}:
+            delta = 1 if rule.name == "mul1" else -1 if rule.name == "mulm1" else 0
+            lo, hi = lo_l * lo_r + delta, hi_l * hi_r + delta
+            if rule.name == "mulm1":
+                lo = max(0, lo)
+            return lo, hi
+        if rule.name == "sub":
+            return lo_l - hi_r, hi_l - lo_r
+        # abs(A-B): the lower bound is 0 iff the operand intervals overlap;
+        # otherwise it is the distance between the closest endpoints.
+        if self._intervals_overlap((lo_l, hi_l), (lo_r, hi_r)):
+            lo = 0
+        else:
+            lo = min(abs(lo_l - hi_r), abs(lo_r - hi_l))
+        hi = max(abs(a - b) for a in (lo_l, hi_l) for b in (lo_r, hi_r))
+        return lo, hi
+
+    def _bounds_sign_status(self, rule: Rule, eq: Equation) -> Tuple[bool, str]:
+        """Reject structurally impossible numeric ranges/signs before digit search."""
+        if not self._cfg("use_bounds_sign_structural_pruning", True):
+            return True, "keep"
+        if rule.name == "cat":
+            return True, "keep"
+        value_interval = self._rule_value_interval(rule, eq)
+        output_interval = self._result_value_interval(eq)
+        if rule.signed:
+            if eq.has_sign:
+                feasible = (value_interval[0] < 0) and self._intervals_overlap(value_interval, output_interval)
+                return (True, "keep") if feasible else (False, "signed value range")
+            feasible = (value_interval[1] >= 0) and self._intervals_overlap(value_interval, output_interval)
+            return (True, "keep") if feasible else (False, "unsigned value range")
+        feasible = self._intervals_overlap(value_interval, output_interval)
+        return (True, "keep") if feasible else (False, "value range")
+
+    def _bounds_sign_reason(self, rule: Rule, eq: Equation) -> str:
+        value_interval = self._rule_value_interval(rule, eq)
+        output_interval = self._result_value_interval(eq)
+        sign_text = "signed" if eq.has_sign else "unsigned"
+        return (
+            f"bounds/sign check for {self._rule_name(rule)} on {eq.display()}: "
+            f"rule value range [{value_interval[0]},{value_interval[1]}], "
+            f"visible {sign_text} output range [{output_interval[0]},{output_interval[1]}]; "
+            "ranges do not overlap with the required sign -> no"
+        )
+
     def _structural_reason(self, rule: Rule, eq: Equation) -> str:
         if eq.has_sign and not rule.signed:
             return f"signed output is present, but {self._rule_name(rule)} is unsigned -> no"
         possible = self._possible_result_lengths(rule, eq)
         actual = len(eq.result)
         lengths = "{" + ",".join(str(x) for x in sorted(possible)) + "}"
-        if actual in possible:
-            return f"lengths {len(eq.left)} and {len(eq.right)} can produce result length in {lengths}; actual length {actual} -> possible"
-        return f"lengths {len(eq.left)} and {len(eq.right)} can produce result length in {lengths}; actual length {actual} -> no"
+        if actual not in possible:
+            return f"lengths {len(eq.left)} and {len(eq.right)} can produce result length in {lengths}; actual length {actual} -> no"
+        if rule.name == "cat":
+            expected = self._cat_expected_output(eq, rule)
+            observed = eq.result
+            if expected == observed:
+                return f"concat positional check requires visible output {expected!r}; observed {observed!r} -> possible"
+            mismatch = next(
+                (idx, exp, obs)
+                for idx, (exp, obs) in enumerate(zip(expected, observed), 1)
+                if exp != obs
+            )
+            idx, exp, obs = mismatch
+            return (
+                f"concat positional check requires visible output {expected!r}; observed {observed!r}; "
+                f"first mismatch at position {idx}: expected {exp!r}, observed {obs!r}; "
+                "injective digit map forbids identifying different symbols -> no"
+            )
+        bounds_ok, _ = self._bounds_sign_status(rule, eq)
+        if not bounds_ok:
+            return self._bounds_sign_reason(rule, eq)
+        return f"lengths {len(eq.left)} and {len(eq.right)} can produce result length in {lengths}; actual length {actual}; bounds/sign ranges overlap -> possible"
 
     def _structural_status(self, rule: Rule, equations: Sequence[Equation]) -> Tuple[bool, str]:
         for eq in equations:
@@ -2365,6 +3109,11 @@ class CryptarithmSolver:
                 if rule.name.startswith("mul"):
                     return False, "product length"
                 return False, "result length"
+            if rule.name == "cat" and self._cat_expected_output(eq, rule) != eq.result:
+                return False, "concat positional"
+            bounds_ok, bounds_reason = self._bounds_sign_status(rule, eq)
+            if not bounds_ok:
+                return False, bounds_reason
         return True, "keep"
 
     def _suffix(self, term: str, k: int, reverse: bool) -> str:
