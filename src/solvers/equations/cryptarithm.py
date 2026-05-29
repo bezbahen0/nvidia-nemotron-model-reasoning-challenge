@@ -2375,6 +2375,64 @@ class CryptarithmReplaySolver(_BaseCryptarithmReplaySolverV22):
             return head.strip(), tail.strip()
         return text, text
 
+    @staticmethod
+    def _parse_operator_rule_fragment(text: str) -> Optional[Tuple[str, str]]:
+        """Parse fragments like "operator '*' -> std/mul".
+
+        This is used only by the renderer to distinguish a local candidate
+        rejection from a prefix rejection caused by a downstream operator.
+        It intentionally accepts quoted operator symbols, including escaped
+        quotes/backslashes, because cryptarithm operators are arbitrary visible
+        symbols.
+        """
+        m = re.search(
+            r"operator\s+((?:'[^']*')|(?:\"[^\"]*\")|\S+)\s*->\s*([a-z]+/[a-z0-9]+)",
+            str(text or ""),
+        )
+        if not m:
+            return None
+        return m.group(1).strip(), m.group(2).strip()
+
+    @staticmethod
+    def _strip_downstream_prefix(text: str) -> str:
+        """Remove the leading "operator X -> rule:" part from a downstream failure."""
+        return re.sub(
+            r"^\s*operator\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*->\s*[a-z]+/[a-z0-9]+\s*:\s*",
+            "",
+            str(text or "").strip(),
+            count=1,
+        )
+
+    def _downstream_failure_info(
+        self,
+        event: ReplayEvent,
+        candidate_text: str,
+        failure_text: str,
+    ) -> Optional[Tuple[str, str, str]]:
+        """Return (failed_op, failed_rule, clean_failure) for downstream rejects.
+
+        RULE_REJECT events can represent two different cases:
+          * local candidate failure: the currently tested operator/rule fails;
+          * prefix failure: the current prefix is tested, then a later operator
+            fails during recursive rule-combo search.
+
+        The search code records both as RULE_REJECT for backward compatibility.
+        This renderer-only helper detects the second case from the textual
+        witness and renders it as a prefix rejection instead of making it look
+        like the current operator was directly disproved by another operator's
+        projection.
+        """
+        tested = self._parse_operator_rule_fragment(candidate_text)
+        failed = self._parse_operator_rule_fragment(failure_text)
+        if not tested or not failed:
+            return None
+        tested_op, tested_rule = tested
+        failed_op, failed_rule = failed
+        if tested_op == failed_op and tested_rule == failed_rule:
+            return None
+        clean_failure = self._strip_downstream_prefix(failure_text) or failure_text
+        return failed_op, failed_rule, clean_failure
+
     def _support_line(self, event: ReplayEvent, indent: str) -> Optional[str]:
         if event.supported is None:
             return None
@@ -2419,7 +2477,21 @@ class CryptarithmReplaySolver(_BaseCryptarithmReplaySolverV22):
 
         if event.kind == "RULE_REJECT":
             candidate, failure = self._split_decision_reason(event.reason)
-            lines: List[str] = [f"Combo block {block_num}: test {candidate}"]
+            downstream = self._downstream_failure_info(event, candidate, failure)
+            if downstream is not None:
+                failed_op, failed_rule, clean_failure = downstream
+                lines: List[str] = [f"Combo block {block_num}: test prefix assignment {candidate}"]
+                lines.append("  Continue rule-combo search for remaining operators.")
+                lines.append("  Downstream check:")
+                lines.append(f"    operator {failed_op} -> {failed_rule}")
+                if event.label or event.constraint or event.supported is not None:
+                    lines.extend(self._render_local_check(event, indent="    ", result_override=clean_failure))
+                else:
+                    lines.append(f"    result: {clean_failure}")
+                lines.append(f"  decision: reject prefix {candidate} because no globally consistent continuation remains")
+                return lines
+
+            lines = [f"Combo block {block_num}: test {candidate}"]
             if event.label or event.constraint or event.supported is not None:
                 lines.extend(self._render_local_check(event, indent="  ", result_override=failure))
             else:
@@ -2454,5 +2526,365 @@ class CryptarithmReplaySolver(_BaseCryptarithmReplaySolverV22):
 
 
 # Backward-compatible aliases.
+CryptarithmSolverReplay = CryptarithmReplaySolver
+CryptarithmSolver = CryptarithmReplaySolver
+
+# ============================================================================
+# v2.5 projection derivation refinements
+# ============================================================================
+# v2.5 keeps v2.4 search/accuracy behaviour, but makes projection blocks less
+# oracle-like.  Each projection event now stores a compact derivation proof:
+# local variables, checked domain space, satisfying tuple count, a few witness
+# tuples, and the union-by-symbol step that yields the supported projection.
+# This is intentionally bounded: it explains how the projection was obtained
+# without dumping every satisfying tuple when the local support set is large.
+
+@dataclass
+class ReplayConfigV25(ReplayConfigV23):
+    # Print a compact derivation section for projection blocks.
+    show_projection_derivation: bool = True
+    # Keep CoT bounded: show at most this many satisfying witness tuples.
+    max_projection_witnesses: int = 8
+    # If true, renderer still shows the full supported projection.  Keep this on
+    # because the supported projection is the replay certificate used by domain
+    # propagation blocks and augmentation.
+    show_supported_projection: bool = True
+    # If true, include local search-space size in every derivation.
+    show_projection_search_space: bool = True
+
+
+_BaseCryptarithmReplaySolverV24 = CryptarithmReplaySolver
+
+
+class CryptarithmReplaySolver(_BaseCryptarithmReplaySolverV24):
+    """Replay solver v2.5.
+
+    Changes from v2.4:
+      * projection events include a compact derivation proof instead of only a
+        bare supported-projection certificate;
+      * derivation proof is collected during the real local support computation,
+        so the CoT describes the actual local computation that produced the
+        projection;
+      * rule-combo prefix-reject rendering from v2.4 is preserved.
+    """
+
+    def __init__(self, config: Optional[SolverConfig] = None):
+        if config is None:
+            config = ReplayConfigV25()
+        super().__init__(config)
+        self._support_cache_v25: Dict[
+            Tuple[str, Tuple[Tuple[str, Tuple[int, ...]], ...]],
+            Tuple[bool, Dict[str, Tuple[int, ...]], int, Tuple[Tuple[Tuple[str, int], ...], ...], int],
+        ] = {}
+
+    def solve(self, examples_text: Any, target_text: Optional[Any] = None, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
+        self._support_cache_v25 = {}
+        return super().solve(examples_text, target_text, timeout_seconds)
+
+    def _supports_with_witnesses(
+        self,
+        scope: Sequence[str],
+        domains: Domains,
+        predicate: Callable[[Assignment], bool],
+        max_witnesses: int,
+    ) -> Tuple[bool, Dict[str, Set[int]], int, List[Dict[str, int]], int]:
+        """Generic local support computation with bounded witness capture.
+
+        This is the same semantic operation as _supports(), but it also captures
+        the first few satisfying injective assignments.  The count is still the
+        exact number of satisfying assignments, and supported[ch] is the exact
+        union of digit values over all satisfying assignments.
+        """
+        self.stats.support_checks += 1
+        ordered = sorted(dict.fromkeys(scope), key=lambda ch: (len(domains[ch]), ch))
+        supported: Dict[str, Set[int]] = {ch: set() for ch in ordered}
+        local: Assignment = {}
+        used: Set[int] = set()
+        witnesses: List[Dict[str, int]] = []
+        count = 0
+        space = 1
+        for ch in ordered:
+            space *= max(1, len(domains[ch]))
+
+        def bt(i: int) -> None:
+            nonlocal count
+            if time.time() > self._deadline:
+                raise TimeoutError("timeout")
+            if i == len(ordered):
+                if predicate(local):
+                    count += 1
+                    for ch, d in local.items():
+                        supported[ch].add(d)
+                    if len(witnesses) < max_witnesses:
+                        witnesses.append({ch: local[ch] for ch in ordered})
+                return
+            ch = ordered[i]
+            for digit in sorted(domains[ch]):
+                if digit in used:
+                    continue
+                local[ch] = digit
+                used.add(digit)
+                bt(i + 1)
+                used.remove(digit)
+                del local[ch]
+
+        bt(0)
+        return count > 0, supported, count, witnesses, space
+
+    def _projection_method_hint(self, kind: str, label: str, constraint: str) -> str:
+        text = f"{kind} {label} {constraint}".lower()
+        if "concat" in text or "/cat" in text:
+            return "positional concat check: compare required output symbols position by position under injective digit mapping"
+        if "low" in text and "mod" in text:
+            return "column modular check: enumerate only the local suffix variables in this column constraint, respecting injective digits"
+        if "abs(" in text:
+            return "absolute-difference check: keep assignments satisfying the displayed abs(A-B)=C formula"
+        if ")-(" in text or "-('" in text or "=-" in text:
+            return "subtraction check: keep assignments satisfying the displayed signed/unsigned difference formula"
+        if "*(" in text or ")*(" in text:
+            return "multiplication check: keep assignments satisfying the displayed product formula"
+        if "+1" in text:
+            return "addition-with-offset check: keep assignments satisfying A+B+1=C"
+        if "-1" in text:
+            return "offset check: keep assignments satisfying the displayed -1 rule formula"
+        if "+" in constraint:
+            return "addition check: keep assignments satisfying the displayed sum formula"
+        return "local support check: keep injective assignments satisfying the displayed formula"
+
+    @staticmethod
+    def _witnesses_to_tuple(witnesses: List[Dict[str, int]]) -> Tuple[Tuple[Tuple[str, int], ...], ...]:
+        return tuple(tuple(sorted(w.items())) for w in witnesses)
+
+    @staticmethod
+    def _witnesses_from_tuple(data: Tuple[Tuple[Tuple[str, int], ...], ...]) -> List[Dict[str, int]]:
+        return [dict(items) for items in data]
+
+    def _project_replay(
+        self,
+        domains: Domains,
+        scope: Sequence[str],
+        predicate: Callable[[Assignment], bool],
+        label: str,
+        trace: ReplayTrace,
+        constraint: str,
+        kind: str,
+    ) -> Optional[bool]:
+        scope = list(dict.fromkeys(scope))
+        before = self._snapshot_scope(domains, scope)
+        max_witnesses = int(self._cfg("max_projection_witnesses", 8))
+        key = self._support_key(label, domains, scope)
+
+        if self._cfg("use_support_cache", True) and key in self._support_cache_v25:
+            ok, supported_tuple, count, witnesses_tuple, space = self._support_cache_v25[key]
+            self.stats.support_cache_hits += 1
+            supported = {ch: set(vals) for ch, vals in supported_tuple.items()}
+            witnesses = self._witnesses_from_tuple(witnesses_tuple)
+        else:
+            ok, supported, count, witnesses, space = self._supports_with_witnesses(scope, domains, predicate, max_witnesses=max_witnesses)
+            if self._cfg("use_support_cache", True):
+                self._support_cache_v25[key] = (
+                    ok,
+                    {ch: tuple(sorted(vals)) for ch, vals in supported.items()},
+                    count,
+                    self._witnesses_to_tuple(witnesses),
+                    space,
+                )
+
+        proof_meta = {
+            "method": self._projection_method_hint(kind, label, constraint),
+            "scope": tuple(scope),
+            "space": space,
+            "satisfying_count": count,
+            "witnesses": tuple(tuple(sorted(w.items())) for w in witnesses),
+            "witness_limit": max_witnesses,
+            "union_supported": tuple((ch, tuple(sorted(vals))) for ch, vals in supported.items()),
+        }
+
+        if not ok:
+            trace.add_event(ReplayEvent(
+                kind=kind,
+                title="Projection block",
+                label=label,
+                constraint=constraint,
+                before=before,
+                supported={ch: tuple() for ch in scope},
+                after=before,
+                changes={},
+                decision="reject",
+                reason="no supported local digit assignment",
+                count=0,
+                meta={"projection_derivation": proof_meta},
+            ))
+            return None
+
+        for ch, allowed in supported.items():
+            domains[ch].intersection_update(allowed)
+            if not domains[ch]:
+                after = self._snapshot_scope(domains, scope)
+                trace.add_event(ReplayEvent(
+                    kind=kind,
+                    title="Projection block",
+                    label=label,
+                    constraint=constraint,
+                    before=before,
+                    supported={c: tuple(sorted(v)) for c, v in supported.items()},
+                    after=after,
+                    changes=self._changes(before, after),
+                    decision="reject",
+                    reason=f"domain({repr(ch)}) became empty",
+                    count=count,
+                    meta={"projection_derivation": proof_meta},
+                ))
+                return None
+
+        after = self._snapshot_scope(domains, scope)
+        changes = self._changes(before, after)
+        if changes:
+            self.stats.domain_reductions += len(changes)
+            trace.add_event(ReplayEvent(
+                kind=kind,
+                title="Projection block",
+                label=label,
+                constraint=constraint,
+                before=before,
+                supported={c: tuple(sorted(v)) for c, v in supported.items()},
+                after=after,
+                changes=changes,
+                decision="keep",
+                reason="supported projection narrows at least one domain",
+                count=count,
+                meta={"projection_derivation": proof_meta},
+            ))
+            return True
+        if self._cfg("include_no_change_events", False):
+            trace.add_event(ReplayEvent(
+                kind=kind,
+                title="Projection block",
+                label=label,
+                constraint=constraint,
+                before=before,
+                supported={c: tuple(sorted(v)) for c, v in supported.items()},
+                after=after,
+                changes={},
+                decision="no-change",
+                reason="supported projection equals current domains",
+                count=count,
+                meta={"projection_derivation": proof_meta},
+            ))
+        return False
+
+    @staticmethod
+    def _tuple_domain_text(items: Tuple[Tuple[str, Tuple[int, ...]], ...]) -> str:
+        pieces: List[str] = []
+        for ch, vals in items:
+            if tuple(vals) == tuple(range(10)):
+                txt = "{0..9}"
+            else:
+                txt = "{" + ",".join(str(v) for v in vals) + "}"
+            pieces.append(f"D[{repr(ch)}]={txt}")
+        return "; ".join(pieces) if pieces else "none"
+
+    @staticmethod
+    def _witness_text(items: Tuple[Tuple[str, int], ...]) -> str:
+        return ", ".join(f"{repr(ch)}={digit}" for ch, digit in items)
+
+    def _render_projection_derivation(self, event: ReplayEvent, indent: str = "  ") -> List[str]:
+        if not self._cfg("show_projection_derivation", True):
+            return []
+        meta = event.meta or {}
+        proof = meta.get("projection_derivation") if isinstance(meta, dict) else None
+        if not isinstance(proof, dict):
+            return []
+
+        lines: List[str] = []
+        lines.append(f"{indent}projection derivation:")
+        method = proof.get("method")
+        if method:
+            lines.append(f"{indent}  method: {method}")
+        if self._cfg("show_projection_search_space", True):
+            scope = proof.get("scope", ())
+            space = proof.get("space", "unknown")
+            if scope:
+                scope_text = ", ".join(f"D[{repr(ch)}]" for ch in scope)
+                lines.append(f"{indent}  local variables: {scope_text}")
+            lines.append(f"{indent}  injective assignments checked: {space}")
+        sat = proof.get("satisfying_count", event.count if event.count is not None else "unknown")
+        lines.append(f"{indent}  satisfying assignments: {sat}")
+        witnesses = proof.get("witnesses", ()) or ()
+        if witnesses:
+            limit = proof.get("witness_limit", len(witnesses))
+            lines.append(f"{indent}  witness assignments shown: {len(witnesses)} of {sat}")
+            for items in witnesses:
+                lines.append(f"{indent}    {self._witness_text(tuple(items))}")
+            if isinstance(sat, int) and sat > len(witnesses):
+                lines.append(f"{indent}    ... {sat - len(witnesses)} more satisfying assignments omitted")
+        else:
+            lines.append(f"{indent}  witness assignments shown: none")
+        union_supported = proof.get("union_supported", ()) or ()
+        if union_supported:
+            lines.append(f"{indent}  union by symbol gives: {self._tuple_domain_text(tuple(union_supported))}")
+        return lines
+
+    def _support_line(self, event: ReplayEvent, indent: str) -> Optional[str]:
+        if not self._cfg("show_supported_projection", True):
+            return None
+        return super()._support_line(event, indent)
+
+    def _render_local_check(self, event: ReplayEvent, indent: str = "  ", result_override: Optional[str] = None) -> List[str]:
+        lines: List[str] = []
+        title = "Projection check" if event.supported is not None else "Local check"
+        lines.append(f"{indent}{title}")
+        if event.label:
+            lines.append(f"{indent}  label: {event.label}")
+        if event.constraint:
+            lines.append(f"{indent}  formula: {event.constraint}")
+        if self._cfg("show_current_domains", False):
+            lines.append(f"{indent}  current local domains: {self._domain_text_map(event.before)}")
+        lines.extend(self._render_projection_derivation(event, indent + "  "))
+        support_line = self._support_line(event, indent + "  ")
+        if support_line:
+            lines.append(support_line)
+        lines.append(f"{indent}  apply update: {self._changes_text(event.changes)}")
+        if result_override is not None:
+            result = result_override
+        elif self._is_empty_supported_projection(event):
+            result = event.reason or "no supported local digit assignment"
+        else:
+            result = event.reason or event.decision or "local check failed"
+        if result:
+            lines.append(f"{indent}  result: {result}")
+        return lines
+
+
+# Backward-compatible aliases for v2.5.
+CryptarithmSolverReplay = CryptarithmReplaySolver
+CryptarithmSolver = CryptarithmReplaySolver
+
+# v2.5.1 renderer hook: include derivation on successful projection blocks too.
+_BaseCryptarithmReplaySolverV25 = CryptarithmReplaySolver
+
+
+class CryptarithmReplaySolver(_BaseCryptarithmReplaySolverV25):
+    def _format_replay_event(self, event: ReplayEvent, block_num: int) -> List[str]:
+        if event.kind in {"COLUMN_PROJECT", "FULL_PROJECT", "PROJECTION"}:
+            lines: List[str] = [f"Projection block {block_num}"]
+            if event.label:
+                lines.append(f"  label: {event.label}")
+            if event.constraint:
+                lines.append(f"  formula: {event.constraint}")
+            if self._cfg("show_current_domains", False):
+                lines.append(f"  current local domains: {self._domain_text_map(event.before)}")
+            lines.extend(self._render_projection_derivation(event, "  "))
+            support_line = self._support_line(event, "  ")
+            if support_line:
+                lines.append(support_line)
+            lines.append(f"  apply update: {self._changes_text(event.changes)}")
+            if event.reason and self._cfg("show_projection_reason", False):
+                lines.append(f"  reason: {event.reason}")
+            lines.append(f"  decision: {event.decision}")
+            return lines
+        return super()._format_replay_event(event, block_num)
+
+
 CryptarithmSolverReplay = CryptarithmReplaySolver
 CryptarithmSolver = CryptarithmReplaySolver
