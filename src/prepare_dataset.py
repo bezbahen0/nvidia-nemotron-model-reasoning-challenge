@@ -121,7 +121,7 @@ def main():
 
     cryptarithm_aug_dataset = cryptarithm_augment_generator.generate_dataset(
         source_data=data[data.label == "cryptarithm"].copy(),
-        sample_frac=0.5,
+        sample_frac=1.0,
         only_solver_correct=False,
     )
     cryptarithm_aug_dataset = with_source(cryptarithm_aug_dataset, "solver")
@@ -181,7 +181,7 @@ def main():
 
         cryptarithm_generated_aug_dataset = cryptarithm_augment_generator.generate_dataset(
             source_data=cryptarithm_generated_full_dataset.copy(),
-            sample_frac=1.0,
+            sample_frac=0.5,
             only_solver_correct=False,
         )
         cryptarithm_generated_aug_dataset = with_source(cryptarithm_generated_aug_dataset, "generated")

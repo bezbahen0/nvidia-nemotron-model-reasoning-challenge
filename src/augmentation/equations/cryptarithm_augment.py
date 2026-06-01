@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import random
 import re
@@ -32,6 +33,22 @@ class CryptarithmAugmentConfig:
     # Store lightweight QA metadata in each generated row. This is useful for
     # filtering training data without reparsing prompts/completions.
     include_quality_metadata: bool = True
+
+    # Balanced extras: these do not change the source solution. They derive
+    # extra local tasks from existing replay evidence so answer labels are less
+    # degenerate inside each subtask type.
+    include_candidate_keep_from_projections: bool = True
+    include_domain_contradictions_from_rejects: bool = True
+    include_contrastive_rule_verification_wrong: bool = True
+    max_synthetic_candidate_keep_per_source: int = 2
+    max_synthetic_domain_contradiction_per_source: int = 10
+    max_contrastive_wrong_verification_per_source: int = 10
+
+    # Optional downsampling after augmentation. It keeps every minority label and
+    # caps majority labels inside binary/multiclass decision modes. This is safer
+    # than fabricating unlimited negatives.
+    balance_answer_labels: bool = True
+    max_answer_label_ratio: float = 2.0
 
 
 class CryptarithmAugmentGenerator:
@@ -627,6 +644,7 @@ class CryptarithmAugmentGenerator:
             "alldifferent": "digit domains are being narrowed by the AllDifferent rule.",
             "branch_assignment": "a branch assignment is being applied to the digit domains.",
             "branch_tuple_assignment": "a tuple branch assignment is being applied to multiple digit domains.",
+            "projection_contradiction": "digit domains are being tested by a local projection step that may have no support.",
         }.get(item["kind"], "digit domains are being narrowed by one local step.")
         prompt_lines = [
             f"In Alice's Wonderland, {kind_intro}",
@@ -899,6 +917,299 @@ class CryptarithmAugmentGenerator:
             extra={"audit_decision": item.get("decision", "")},
         )
 
+
+    # ------------------------------------------------------------------
+    # Balanced / contrastive extraction helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_parsed_equation_operator_map(cot: str) -> Dict[str, str]:
+        """Map rendered equation text to its operator symbol.
+
+        Projection labels are rendered as:
+            label: full match <display> via std/mul
+        The <display> text is the same as Equation.display().  Reconstructing
+        this map lets synthetic candidate-keep tasks name the tested operator
+        without guessing from punctuation.
+        """
+        section = CryptarithmAugmentGenerator._section(cot, r"^Parsed equations\s*$", r"^Symbols\s*$")
+        out: Dict[str, str] = {}
+        if not section:
+            return out
+        pat = re.compile(
+            r"(?m)^\d+\.\s+left=(.*?),\s+op=(.*?),\s+right=(.*?),\s+output=(.*?),\s+signed_output=(True|False)\s*$"
+        )
+        for m in pat.finditer(section):
+            left = m.group(1)
+            op_lit = m.group(2).strip()
+            right = m.group(3)
+            output = m.group(4)
+            try:
+                op = ast.literal_eval(op_lit)
+            except Exception:
+                op = op_lit.strip("'\"")
+            display = f"{left}{op}{right}={output}"
+            out[display] = op
+        return out
+
+    @staticmethod
+    def _projection_check_from_projection_block(block_text: str) -> str:
+        lines = str(block_text or "").splitlines()
+        if lines and lines[0].startswith("Projection block"):
+            lines = lines[1:]
+        kept: List[str] = ["Projection check"]
+        for ln in lines:
+            stripped = ln.strip()
+            if stripped.startswith(("apply update:", "decision:", "result:")):
+                continue
+            if not stripped:
+                continue
+            kept.append("    " + stripped)
+        return "\n".join(kept).strip()
+
+    @staticmethod
+    def _completion_projection_check(
+        block_number: int,
+        operator_text: str,
+        rule: str,
+        projection_block_text: str,
+        answer: str,
+    ) -> str:
+        check = CryptarithmAugmentGenerator._projection_check_from_projection_block(projection_block_text)
+        apply_update = CryptarithmAugmentGenerator._extract_apply_update_line(projection_block_text) or "none"
+        body_lines = []
+        for ln in check.splitlines():
+            if ln == "Projection check":
+                body_lines.append("  Projection check")
+            else:
+                body_lines.append("  " + ln)
+        if answer == "keep":
+            body_lines.append(f"    apply update: {apply_update}")
+            body_lines.append(f"    result: operator {operator_text} -> {rule}: supported local digit assignment exists")
+            body_lines.append(f"  decision: keep operator {operator_text} -> {rule}")
+        else:
+            body_lines.append("    apply update: none")
+            body_lines.append(f"    result: operator {operator_text} -> {rule}: no supported local digit assignment")
+            body_lines.append(f"  decision: reject operator {operator_text} -> {rule}")
+        return f"Combo block {block_number}: test operator {operator_text} -> {rule}\n" + "\n".join(body_lines)
+
+    @staticmethod
+    def _extract_candidate_keep_from_projection_blocks(cot: str, limit: int = 2) -> List[Dict[str, Any]]:
+        """Create real positive candidate-check examples from successful projections.
+
+        These are not fabricated answers: a successful projection block already
+        contains non-empty support and a keep decision.  We reframe at most
+        `limit` of them as local candidate checks so candidate_check is not
+        all-reject.
+        """
+        if limit <= 0:
+            return []
+        eq_to_op = CryptarithmAugmentGenerator._extract_parsed_equation_operator_map(cot)
+        out: List[Dict[str, Any]] = []
+        for block in CryptarithmAugmentGenerator._extract_domain_blocks(cot):
+            if block.get("kind") != "projection":
+                continue
+            raw = block.get("block_text", "")
+            if "decision: keep" not in raw:
+                continue
+            if re.search(r"supported projection\s*\(0 supports\)", raw):
+                continue
+            ml = re.search(r"(?m)^\s*label:\s*full match\s+(.+?)\s+via\s+([a-z]+/[a-z0-9]+)\s*$", raw)
+            if not ml:
+                continue
+            display, rule = ml.group(1).strip(), ml.group(2).strip()
+            op = eq_to_op.get(display)
+            if op is None:
+                continue
+            operator_text = repr(op)
+            block_number = int(block.get("number", len(out) + 1))
+            check_input = CryptarithmAugmentGenerator._projection_check_from_projection_block(raw)
+            full = CryptarithmAugmentGenerator._completion_projection_check(block_number, operator_text, rule, raw, "keep")
+            out.append(
+                {
+                    "number": block_number,
+                    "operator": operator_text,
+                    "rule": rule,
+                    "block_text": full,
+                    "check_input": check_input,
+                    "answer": "keep",
+                    "candidate_check_kind": "projection_keep",
+                    "synthetic_kind": "real_projection_keep",
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
+
+    @staticmethod
+    def _extract_domain_contradictions_from_candidate_rejects(cot: str, limit: int = 2) -> List[Dict[str, Any]]:
+        """Reframe empty-support candidate rejects as domain contradictions.
+
+        A candidate reject with supported projection (0 supports) is exactly a
+        local projection that has no satisfying assignment.  This gives real
+        contradiction examples for domain_propagation without inventing states.
+        """
+        if limit <= 0:
+            return []
+        out: List[Dict[str, Any]] = []
+        for cand in CryptarithmAugmentGenerator._extract_candidate_check_blocks(cot):
+            raw = cand.get("block_text", "")
+            if cand.get("answer") != "reject":
+                continue
+            if not re.search(r"supported projection\s*\(0 supports\)", raw):
+                continue
+            check = cand.get("check_input", "")
+            lines = [f"Projection block {cand.get('number', len(out) + 1)}"]
+            for ln in check.splitlines():
+                stripped = ln.strip()
+                if not stripped or stripped == "Projection check":
+                    continue
+                lines.append("  " + stripped)
+            prompt_block = "\n".join(lines)
+            completion = prompt_block + "\n  apply update: none\n  decision: reject"
+            out.append(
+                {
+                    "number": int(cand.get("number", len(out) + 1)),
+                    "kind": "projection_contradiction",
+                    "block_text": completion,
+                    "prompt_block": prompt_block,
+                    "current_domains": [],
+                    "fixed_digits_to_remove": [],
+                    "alldiff_digits_to_remove": [],
+                    "alldiff_reason_kind": "",
+                    "answer": "contradiction",
+                    "synthetic_kind": "empty_support_projection_contradiction",
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
+
+    @staticmethod
+    def _digit_symbols_from_map(digit_map: str) -> List[str]:
+        symbols: List[str] = []
+        for part in str(digit_map or "").split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            lhs = part.split("=", 1)[0].strip()
+            try:
+                sym = ast.literal_eval(lhs)
+            except Exception:
+                sym = lhs.strip("'\"")
+            if isinstance(sym, str) and len(sym) == 1 and sym not in symbols:
+                symbols.append(sym)
+        return symbols
+
+    @staticmethod
+    def _corrupt_rhs(example: str, symbols: Sequence[str]) -> Optional[Tuple[str, str]]:
+        if "=" not in example:
+            return None
+        lhs, rhs = example.rsplit("=", 1)
+        if not rhs:
+            return None
+        pos = len(rhs) - 1
+        old = rhs[pos]
+        replacement = None
+        for sym in symbols:
+            if sym != old:
+                replacement = sym
+                break
+        if replacement is None:
+            replacement = old + old
+        if len(replacement) == 1:
+            new_rhs = rhs[:pos] + replacement + rhs[pos + 1:]
+        else:
+            new_rhs = rhs + old
+        if new_rhs == rhs:
+            return None
+        return lhs + "=" + new_rhs, new_rhs
+
+    @staticmethod
+    def _make_wrong_verification_item(item: Dict[str, Any], digit_map: str) -> Optional[Dict[str, Any]]:
+        symbols = CryptarithmAugmentGenerator._digit_symbols_from_map(digit_map)
+        corrupted = CryptarithmAugmentGenerator._corrupt_rhs(item.get("example", ""), symbols)
+        if corrupted is None:
+            return None
+        new_example, new_expected = corrupted
+        calc_lines: List[str] = []
+        replaced_compare = False
+        produced = ""
+        for ln in item.get("calc_lines", []):
+            mprod = re.search(r"^encode result:\s*(\S+)\s*$", ln.strip())
+            if mprod:
+                produced = mprod.group(1)
+            if re.search(r"compare visible output:.*->\s*MATCH\s*$", ln):
+                if not produced:
+                    mp = re.search(r"produced\s+(\S+)\s+vs", ln)
+                    produced = mp.group(1) if mp else "<computed>"
+                calc_lines.append(f"compare visible output: produced {produced} vs expected {new_expected} -> WRONG")
+                replaced_compare = True
+            else:
+                calc_lines.append(ln)
+        if not replaced_compare:
+            if not produced:
+                produced = "<computed>"
+            calc_lines.append(f"compare visible output: produced {produced} vs expected {new_expected} -> WRONG")
+        out = dict(item)
+        out["example"] = new_example
+        out["calc_lines"] = calc_lines
+        out["answer"] = "WRONG"
+        out["synthetic_kind"] = "contrastive_wrong_expected_output"
+        return out
+
+    def _make_domain_contradiction_problem(
+        self,
+        source_id: str,
+        prompt: str,
+        source_answer: str,
+        source_solver_correct: bool,
+        item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        prompt_lines = [
+            "In Alice's Wonderland, digit domains are being tested by one local projection step.",
+            "Your task is to apply this local domain operation and decide whether it keeps the state or creates a contradiction.",
+            "If the supported projection is empty, no local digit assignment exists and the state is a contradiction.",
+            "",
+            "Local operation:",
+            item.get("prompt_block", ""),
+            "",
+            "Return the domain updates and finish with:",
+            "Answer: keep or Answer: contradiction",
+        ]
+        self._add_rule_semantics(prompt_lines)
+        completion = item["block_text"].rstrip() + "\nAnswer: " + item["answer"]
+        return self._row(
+            source_id,
+            "domain_propagation_contradiction",
+            f"{item['number']}_{item['kind']}",
+            "cryptarithm_domain_propagation",
+            prompt_lines,
+            completion,
+            item["answer"],
+            prompt,
+            source_answer,
+            source_solver_correct,
+            extra={"block_number": item["number"], "domain_step_kind": item["kind"], "synthetic_kind": item.get("synthetic_kind", "")},
+        )
+
+    def _make_rule_verification_wrong_problem(
+        self,
+        source_id: str,
+        prompt: str,
+        source_answer: str,
+        source_solver_correct: bool,
+        item: Dict[str, Any],
+        idx: int,
+        digit_map: str,
+    ) -> Dict[str, Any]:
+        row = self._make_rule_verification_problem(source_id, prompt, source_answer, source_solver_correct, item, idx, digit_map)
+        row["id"] = self._make_id(source_id, "rule_verification_wrong", f"{idx}_{item['operator']}_{item['example']}")
+        row["answer"] = "WRONG"
+        row["computed_answer"] = "WRONG"
+        row["synthetic_kind"] = item.get("synthetic_kind", "contrastive_wrong_expected_output")
+        return row
+
     # ------------------------------------------------------------------
     # Row construction and public API
     # ------------------------------------------------------------------
@@ -966,14 +1277,35 @@ class CryptarithmAugmentGenerator:
         if self.config.include_candidate_check:
             for item in self._extract_candidate_check_blocks(cot):
                 rows.append(self._make_candidate_check_problem(source_id, prompt, source_answer, source_solver_correct, item))
+            if self.config.include_candidate_keep_from_projections:
+                for item in self._extract_candidate_keep_from_projection_blocks(
+                    cot, limit=self.config.max_synthetic_candidate_keep_per_source
+                ):
+                    rows.append(self._make_candidate_check_problem(source_id, prompt, source_answer, source_solver_correct, item))
 
         if self.config.include_domain_propagation:
             for item in self._extract_domain_blocks(cot):
                 rows.append(self._make_domain_propagation_problem(source_id, prompt, source_answer, source_solver_correct, item))
+            if self.config.include_domain_contradictions_from_rejects:
+                for item in self._extract_domain_contradictions_from_candidate_rejects(
+                    cot, limit=self.config.max_synthetic_domain_contradiction_per_source
+                ):
+                    rows.append(self._make_domain_contradiction_problem(source_id, prompt, source_answer, source_solver_correct, item))
 
         if self.config.include_rule_verification:
-            for idx, item in enumerate(self._extract_rule_verification_tasks(cot)):
+            verification_items = self._extract_rule_verification_tasks(cot)
+            for idx, item in enumerate(verification_items):
                 rows.append(self._make_rule_verification_problem(source_id, prompt, source_answer, source_solver_correct, item, idx, digit_map))
+            if self.config.include_contrastive_rule_verification_wrong:
+                made_wrong = 0
+                for idx, item in enumerate(verification_items):
+                    wrong_item = self._make_wrong_verification_item(item, digit_map)
+                    if wrong_item is None:
+                        continue
+                    rows.append(self._make_rule_verification_wrong_problem(source_id, prompt, source_answer, source_solver_correct, wrong_item, idx, digit_map))
+                    made_wrong += 1
+                    if made_wrong >= self.config.max_contrastive_wrong_verification_per_source:
+                        break
 
         if self.config.include_ambiguity_audit:
             if audit_for_source is not None:
@@ -1036,7 +1368,58 @@ class CryptarithmAugmentGenerator:
             return pd.DataFrame(
                 columns=["id", "prompt", "completion", "answer", "label", "generated_cot", "computed_answer", "task_mode"]
             )
-        return pd.DataFrame.from_records(rows)
+        df = pd.DataFrame.from_records(rows)
+        if self.config.balance_answer_labels:
+            df = self.balance_answer_labels(df, max_ratio=self.config.max_answer_label_ratio, seed=self.seed)
+        return df
+
+    @staticmethod
+    def balance_answer_labels(
+        df: pd.DataFrame,
+        max_ratio: float = 2.0,
+        seed: Optional[int] = None,
+        task_modes: Optional[Sequence[str]] = None,
+    ) -> pd.DataFrame:
+        """Downsample majority answer labels inside decision-like modes.
+
+        This intentionally does not balance target_application or
+        rule_filtering by raw answer string: those answers are content labels,
+        not binary decisions.  It balances the modes where the answer is a
+        decision class such as keep/reject or MATCH/WRONG.
+        """
+        if df.empty or "task_mode" not in df.columns or "answer" not in df.columns:
+            return df
+        modes = set(task_modes or [
+            "cryptarithm_candidate_check",
+            "cryptarithm_domain_propagation",
+            "cryptarithm_rule_verification",
+            "cryptarithm_ambiguity_audit",
+        ])
+        rng_state = 0 if seed is None else seed
+        kept_parts: List[pd.DataFrame] = []
+        for mode, sub in df.groupby("task_mode", sort=False, dropna=False):
+            if str(mode) not in modes:
+                kept_parts.append(sub)
+                continue
+            counts = sub["answer"].astype(str).value_counts()
+            if len(counts) <= 1:
+                kept_parts.append(sub)
+                continue
+            min_count = int(counts.min())
+            if min_count <= 0:
+                kept_parts.append(sub)
+                continue
+            cap = max(min_count, int(round(min_count * float(max_ratio))))
+            balanced_chunks: List[pd.DataFrame] = []
+            for ans, ans_sub in sub.groupby(sub["answer"].astype(str), sort=False):
+                if len(ans_sub) > cap:
+                    balanced_chunks.append(ans_sub.sample(n=cap, random_state=rng_state))
+                else:
+                    balanced_chunks.append(ans_sub)
+            kept_parts.append(pd.concat(balanced_chunks, axis=0))
+        out = pd.concat(kept_parts, axis=0)
+        # Preserve original row order as much as possible after sampling.
+        return out.sort_index(kind="stable").reset_index(drop=True)
 
     def generate_dataset_from_text_dump(self, text: str) -> pd.DataFrame:
         return self.generate_dataset(self.parse_text_dump(text))
@@ -1065,6 +1448,7 @@ class CryptarithmAugmentGenerator:
             "target_rows_from_nonunique_sources": 0,
             "candidate_check_has_keep": False,
             "domain_propagation_has_contradiction": False,
+            "rule_verification_has_wrong": False,
         }
         if df.empty:
             return report
@@ -1099,6 +1483,8 @@ class CryptarithmAugmentGenerator:
             report["candidate_check_has_keep"] = bool((cand["answer"].astype(str) == "keep").any())
             dom = df[df["task_mode"].astype(str) == "cryptarithm_domain_propagation"]
             report["domain_propagation_has_contradiction"] = bool((dom["answer"].astype(str) == "contradiction").any())
+            ver = df[df["task_mode"].astype(str) == "cryptarithm_rule_verification"]
+            report["rule_verification_has_wrong"] = bool((ver["answer"].astype(str) == "WRONG").any())
         return report
 
     @staticmethod
@@ -1136,6 +1522,7 @@ class CryptarithmAugmentGenerator:
             "target_rows_from_nonunique_sources",
             "candidate_check_has_keep",
             "domain_propagation_has_contradiction",
+            "rule_verification_has_wrong",
         ]
         lines.append("checks:")
         lines.extend(f"  {k}: {report.get(k)}" for k in checks)
@@ -1156,6 +1543,10 @@ if __name__ == "__main__":
     parser.add_argument("--keep-nonunique-targets", action="store_true", help="Allow target_application rows from ambiguous/incomplete audits. Default skips them.")
     parser.add_argument("--no-rule-semantics", action="store_true", help="Do not add the compact rule-notation legend to prompts")
     parser.add_argument("--no-quality-metadata", action="store_true", help="Do not add lightweight metadata columns to output rows")
+    parser.add_argument("--no-balanced-extras", action="store_true", help="Disable derived keep/contradiction/WRONG balancing examples")
+    parser.add_argument("--max-balanced-extras-per-source", type=int, default=10, help="Cap each kind of balancing example per source row")
+    parser.add_argument("--balance-answer-labels", action="store_true", help="Downsample majority answer labels inside decision-like modes")
+    parser.add_argument("--max-answer-label-ratio", type=float, default=2.0, help="Max majority/minority ratio when --balance-answer-labels is used")
     parser.add_argument("--quality-report", action="store_true", help="Print a dataset QA report after generation")
     parser.add_argument("--quality-report-json", default="", help="Optional path to write the QA report as JSON")
     parser.add_argument("--fail-on-quality-issues", action="store_true", help="Exit nonzero if conservative QA checks find issues")
@@ -1168,6 +1559,14 @@ if __name__ == "__main__":
         skip_ambiguous_target_application=not args.keep_nonunique_targets,
         include_rule_semantics_in_prompts=not args.no_rule_semantics,
         include_quality_metadata=not args.no_quality_metadata,
+        include_candidate_keep_from_projections=not args.no_balanced_extras,
+        include_domain_contradictions_from_rejects=not args.no_balanced_extras,
+        include_contrastive_rule_verification_wrong=not args.no_balanced_extras,
+        max_synthetic_candidate_keep_per_source=args.max_balanced_extras_per_source,
+        max_synthetic_domain_contradiction_per_source=args.max_balanced_extras_per_source,
+        max_contrastive_wrong_verification_per_source=args.max_balanced_extras_per_source,
+        balance_answer_labels=args.balance_answer_labels,
+        max_answer_label_ratio=args.max_answer_label_ratio,
     )
 
     with open(args.input, "r", encoding="utf-8") as f:
