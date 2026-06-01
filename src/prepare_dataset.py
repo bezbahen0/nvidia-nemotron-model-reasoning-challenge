@@ -28,7 +28,7 @@ def parse_args():
 
     # Number of new validated full cryptarithm prompts to synthesize.
     # These rows get source=generated. Their extracted subtasks also get source=generated.
-    parser.add_argument("--cryptarithm_generated_n", type=int, default=100)
+    parser.add_argument("--cryptarithm_generated_n", type=int, default=300)
     parser.add_argument("--cryptarithm_generated_timeout", type=float, default=10.0)
     parser.add_argument("--cryptarithm_generated_max_attempts", type=int, default=100)
     parser.add_argument("--cryptarithm_generated_max_cot_chars", type=int, default=0)
@@ -121,7 +121,7 @@ def main():
 
     cryptarithm_aug_dataset = cryptarithm_augment_generator.generate_dataset(
         source_data=data[data.label == "cryptarithm"].copy(),
-        sample_frac=1.0,
+        sample_frac=0.5,
         only_solver_correct=False,
     )
     cryptarithm_aug_dataset = with_source(cryptarithm_aug_dataset, "solver")
