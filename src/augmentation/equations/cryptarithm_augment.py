@@ -47,7 +47,7 @@ class CryptarithmAugmentConfig:
     # Optional downsampling after augmentation. It keeps every minority label and
     # caps majority labels inside binary/multiclass decision modes. This is safer
     # than fabricating unlimited negatives.
-    balance_answer_labels: bool = True
+    balance_answer_labels: bool = False
     max_answer_label_ratio: float = 2.0
 
 
@@ -697,15 +697,31 @@ class CryptarithmAugmentGenerator:
 
     @staticmethod
     def _extract_rule_verification_tasks(cot: str) -> List[Dict[str, Any]]:
-        section = CryptarithmAugmentGenerator._section(cot, r"^Verify selected rules\s*$", r"^Target\s*$")
+        # Verify-selected-rules is followed by Ambiguity audit in the final solver
+        # and only then by Target.  Stop at the first of these headers; otherwise
+        # the last verification example can accidentally absorb the audit block.
+        section = CryptarithmAugmentGenerator._section(
+            cot,
+            r"^Verify selected rules\s*$",
+            r"^(?:Ambiguity audit|Target)\s*$",
+        )
         if not section:
             return []
         tasks: List[Dict[str, Any]] = []
         current_rule: Optional[Tuple[str, str]] = None
         lines = section.splitlines()
+        hard_stop_headers = (
+            "Ambiguity audit",
+            "Target",
+            "Selected digit map",
+            "Local replay steps",
+            "Rule matching",
+        )
         i = 0
         while i < len(lines):
             line = lines[i].rstrip()
+            if any(line.startswith(h) for h in hard_stop_headers):
+                break
             mr = re.match(r"^Operator\s+(.+?)\s+uses\s+(.+)$", line)
             if mr:
                 current_rule = (mr.group(1).strip(), mr.group(2).strip())
@@ -716,20 +732,33 @@ class CryptarithmAugmentGenerator:
                 calc: List[str] = []
                 j = i + 1
                 while j < len(lines):
-                    nxt = lines[j]
-                    if nxt.startswith("Operator ") or nxt.startswith("- "):
+                    nxt = lines[j].rstrip()
+                    if (
+                        nxt.startswith("Operator ")
+                        or nxt.startswith("- ")
+                        or any(nxt.startswith(h) for h in hard_stop_headers)
+                    ):
                         break
-                    calc.append(nxt.rstrip())
+                    calc.append(nxt)
                     j += 1
                 text = "\n".join(calc).strip()
                 ma = re.search(r"->\s*(MATCH|WRONG)\s*$", text, flags=re.M)
                 answer = ma.group(1) if ma else "MATCH"
+                # Keep only the local verification lines.  This guard prevents
+                # unrelated source-level sections from entering the subtask
+                # even if the source CoT format changes later.
+                clean_calc = [
+                    (ln[2:] if ln.startswith("  ") else ln)
+                    for ln in calc
+                    if ln.strip()
+                    and not any(ln.lstrip().startswith(h) for h in hard_stop_headers)
+                ]
                 tasks.append(
                     {
                         "operator": current_rule[0],
                         "rule": current_rule[1],
                         "example": example,
-                        "calc_lines": [ln[2:] if ln.startswith("  ") else ln for ln in calc if ln.strip()],
+                        "calc_lines": clean_calc,
                         "answer": answer,
                     }
                 )
