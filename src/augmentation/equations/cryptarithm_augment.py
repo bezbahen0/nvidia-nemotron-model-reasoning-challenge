@@ -22,6 +22,16 @@ class CryptarithmAugmentConfig:
     include_domain_propagation: bool = True
     include_rule_verification: bool = True
     include_target_application: bool = True
+    include_ambiguity_audit: bool = True
+    # For final-answer training, skip target-application rows from sources whose
+    # audit says the target is not unique. Local subtasks can still be used.
+    skip_ambiguous_target_application: bool = True
+    # Add a compact legend for std/rev/add1/mulm1/etc. so each subtask is
+    # understandable without hidden solver state.
+    include_rule_semantics_in_prompts: bool = True
+    # Store lightweight QA metadata in each generated row. This is useful for
+    # filtering training data without reparsing prompts/completions.
+    include_quality_metadata: bool = True
 
 
 class CryptarithmAugmentGenerator:
@@ -49,6 +59,9 @@ class CryptarithmAugmentGenerator:
 
       5. cryptarithm_target_application
          Apply selected rule and digit map to the target expression.
+
+      6. cryptarithm_ambiguity_audit
+         Interpret the final target-invariance audit: unique, ambiguous, or incomplete.
     """
 
     def __init__(self, seed: Optional[int] = None, config: Optional[CryptarithmAugmentConfig] = None):
@@ -163,6 +176,39 @@ class CryptarithmAugmentGenerator:
                 "4. mul_offset: std/mul, std/mul1, std/mulm1, rev/mul, rev/mul1, rev/mulm1",
             ]
         )
+
+    @staticmethod
+    def _rule_semantics_text() -> str:
+        return "\n".join(
+            [
+                "std: read each visible number left-to-right; rev: read each visible number right-to-left.",
+                "cat: concatenate the two decoded operands.",
+                "add/add1/addm1: compute A+B, A+B+1, or A+B-1.",
+                "abs/sub: compute abs(A-B) or signed A-B.",
+                "mul/mul1/mulm1: compute A*B, A*B+1, or A*B-1.",
+                "Encode the numeric result back with the same injective digit map; signed negative outputs use the operator symbol as the minus sign when present in the CoT.",
+            ]
+        )
+
+    def _add_rule_semantics(self, prompt_lines: List[str]) -> None:
+        """Optionally insert the shared rule legend before output instructions.
+
+        The legend is prompt context, not an output requirement, so place it
+        before the first "Return ..." instruction when that instruction already
+        exists; otherwise append it to the current context block.
+        """
+        if not self.config.include_rule_semantics_in_prompts:
+            return
+        block = ["", "Rule notation:", self._rule_semantics_text()]
+        insert_at: Optional[int] = None
+        for idx, line in enumerate(prompt_lines):
+            if str(line).startswith("Return "):
+                insert_at = idx
+                break
+        if insert_at is None:
+            prompt_lines.extend(block)
+        else:
+            prompt_lines[insert_at:insert_at] = block
 
     @staticmethod
     def _answer_from_survivors(block_text: str) -> str:
@@ -332,7 +378,7 @@ class CryptarithmAugmentGenerator:
         prompt_lines = [
             "In Alice's Wonderland, a hidden arithmetic rule is assigned to one operator symbol.",
             "Your task is to perform only the structural rule filtering step for this operator.",
-            "Do not solve the digit map. Use only output length, signed-output information, and the rule family definitions.",
+            "Do not solve the digit map. Use only structural checks: output length, signed-output information, concat positional equality, and the rule family definitions.",
             "",
             f"Operator: {item['operator']}",
             "",
@@ -347,6 +393,7 @@ class CryptarithmAugmentGenerator:
             "Return the structural filtering blocks and finish with:",
             "Answer: <comma-separated surviving candidates>",
         ]
+        self._add_rule_semantics(prompt_lines)
         completion = item["block_text"].rstrip() + "\nAnswer: " + item["answer"]
         return self._row(
             source_id,
@@ -371,21 +418,27 @@ class CryptarithmAugmentGenerator:
         local = CryptarithmAugmentGenerator._section(cot, r"^Local replay steps\s*$", r"^Selected digit map\s*$")
         if not local:
             return []
-        # Start only at causal test blocks.
+        # Start only at causal test blocks. Full-CoT traces can contain either
+        #   Combo block N: test operator '+' -> std/add
+        # or
+        #   Combo block N: test prefix assignment operator '+' -> std/add
+        # The latter exposes downstream continuation rejects; older augmentation
+        # silently missed those examples.
         pattern = re.compile(
-            r"(?ms)^Combo block\s+(\d+):\s+test operator\s+(.+?)\s*->\s*([^\n]+)\n"
-            r"(.*?)(?=^(?:Combo block|No-leading-zero block|Projection block|AllDifferent block|Branch block|Map block|Selected digit map|Verify selected rules|Target)\b|\Z)"
+            r"(?ms)^Combo block\s+(\d+):\s+test\s+(prefix assignment\s+)?operator\s+(.+?)\s*->\s*([^\n]+)\n"
+            r"(.*?)(?=^(?:Combo block|No-leading-zero block|Target no-leading-zero block|Projection block|AllDifferent block|Branch block|Map block|Selected digit map|Verify selected rules|Target)\b|\Z)"
         )
         out: List[Dict[str, Any]] = []
         for m in pattern.finditer(local):
             number = int(m.group(1))
-            op = m.group(2).strip()
-            rule = m.group(3).strip()
-            body = m.group(4).rstrip()
-            full = f"Combo block {number}: test operator {op} -> {rule}\n{body}".rstrip()
+            is_prefix = bool(m.group(2))
+            op = m.group(3).strip()
+            rule = m.group(4).strip()
+            body = m.group(5).rstrip()
+            header = "test prefix assignment operator" if is_prefix else "test operator"
+            full = f"Combo block {number}: {header} {op} -> {rule}\n{body}".rstrip()
             answer = CryptarithmAugmentGenerator._answer_from_decision(full) or "reject"
-            # Remove result/decision lines from the prompt-side local check.
-            check_input = CryptarithmAugmentGenerator._remove_lines(body, ["result:", "decision:"])
+            check_input = CryptarithmAugmentGenerator._remove_lines(body, ["apply update:", "result:", "decision:"])
             out.append(
                 {
                     "number": number,
@@ -394,6 +447,7 @@ class CryptarithmAugmentGenerator:
                     "block_text": full,
                     "check_input": check_input,
                     "answer": answer,
+                    "candidate_check_kind": "prefix_assignment" if is_prefix else "single_candidate",
                 }
             )
         return out
@@ -407,8 +461,8 @@ class CryptarithmAugmentGenerator:
         item: Dict[str, Any],
     ) -> Dict[str, Any]:
         prompt_lines = [
-            "In Alice's Wonderland, a candidate rule for one operator is being tested during rule-combo search.",
-            "Your task is to run the shown local check and decide whether this candidate is rejected or remains possible.",
+            "In Alice's Wonderland, a candidate rule or rule-prefix is being tested during rule-combo search.",
+            "Your task is to run the shown local check and decide whether this candidate/prefix is rejected or remains possible.",
             "Use the formula and the supported projection. If the supported projection is empty, the candidate is rejected.",
             "",
             "Candidate:",
@@ -420,6 +474,7 @@ class CryptarithmAugmentGenerator:
             "Return the local check and finish with:",
             "Answer: reject or Answer: keep",
         ]
+        self._add_rule_semantics(prompt_lines)
         completion = item["block_text"].rstrip() + "\nAnswer: " + item["answer"]
         return self._row(
             source_id,
@@ -432,7 +487,7 @@ class CryptarithmAugmentGenerator:
             prompt,
             source_answer,
             source_solver_correct,
-            extra={"operator": item["operator"], "rule": item["rule"], "block_number": item["number"]},
+            extra={"operator": item["operator"], "rule": item["rule"], "block_number": item["number"], "candidate_check_kind": item.get("candidate_check_kind", "single_candidate")},
         )
 
     # ------------------------------------------------------------------
@@ -442,11 +497,13 @@ class CryptarithmAugmentGenerator:
     @staticmethod
     def _domain_block_start_pattern() -> re.Pattern[str]:
         # Domain-propagation examples may start only at one of these local
-        # state-transition blocks.  A Branch block is included only when it is
-        # an explicit assignment, not when it merely chooses a symbol.
+        # state-transition blocks. A Branch block is included only when it is
+        # an explicit assignment, not when it merely chooses a symbol/tuple.
+        # Full-CoT traces additionally contain Target no-leading-zero and
+        # tuple-branch assignments; older augmentation missed both.
         return re.compile(
-            r"(?m)^(No-leading-zero block|Projection block|AllDifferent block)\s+(\d+)"
-            r"|^(Branch block)\s+(\d+):\s+try set\s+(.+)$"
+            r"(?m)^(No-leading-zero block|Target no-leading-zero block|Projection block|AllDifferent block)\s+(\d+)"
+            r"|^(Branch block)\s+(\d+):\s+try\s+(set|tuple)\s+(.+)$"
         )
 
     @staticmethod
@@ -458,6 +515,7 @@ class CryptarithmAugmentGenerator:
         return re.compile(
             r"(?m)^(?:"
             r"No-leading-zero block\s+\d+"
+            r"|Target no-leading-zero block\s+\d+"
             r"|Projection block\s+\d+"
             r"|AllDifferent block\s+\d+"
             r"|Branch block\s+\d+:"
@@ -479,6 +537,13 @@ class CryptarithmAugmentGenerator:
         return len(local)
 
     @staticmethod
+    def _extract_hall_digits(block_text: str) -> List[int]:
+        m = re.search(r"(?m)^\s*Hall set:\s+symbols\s+.+?;\s+union digits\s+(\{[^{}]*\})\s*$", block_text or "")
+        if not m:
+            return []
+        return sorted(CryptarithmAugmentGenerator._domain_values_to_set(m.group(1)))
+
+    @staticmethod
     def _extract_domain_blocks(cot: str) -> List[Dict[str, Any]]:
         local = CryptarithmAugmentGenerator._section(cot, r"^Local replay steps\s*$", r"^Selected digit map\s*$")
         if not local:
@@ -490,7 +555,10 @@ class CryptarithmAugmentGenerator:
             end = CryptarithmAugmentGenerator._next_major_header_start(local, start)
             raw = local[start:end].rstrip()
             first = raw.splitlines()[0].strip() if raw.splitlines() else ""
-            if first.startswith("No-leading-zero"):
+            if first.startswith("Target no-leading-zero"):
+                kind = "target_no_leading_zero"
+                num = int(re.search(r"block\s+(\d+)", first).group(1))
+            elif first.startswith("No-leading-zero"):
                 kind = "no_leading_zero"
                 num = int(re.search(r"block\s+(\d+)", first).group(1))
             elif first.startswith("Projection"):
@@ -498,6 +566,9 @@ class CryptarithmAugmentGenerator:
                 num = int(re.search(r"block\s+(\d+)", first).group(1))
             elif first.startswith("AllDifferent"):
                 kind = "alldifferent"
+                num = int(re.search(r"block\s+(\d+)", first).group(1))
+            elif first.startswith("Branch") and "try tuple" in first:
+                kind = "branch_tuple_assignment"
                 num = int(re.search(r"block\s+(\d+)", first).group(1))
             elif first.startswith("Branch") and "try set" in first:
                 kind = "branch_assignment"
@@ -512,12 +583,19 @@ class CryptarithmAugmentGenerator:
             # For prompt, remove apply update and decision so the model has to produce them.
             prompt_block = CryptarithmAugmentGenerator._remove_lines(raw, ["apply update:", "decision:"])
             current_domains = CryptarithmAugmentGenerator._current_domains_from_update(update)
-            fixed_digits_to_remove: List[int] = []
+            alldiff_digits_to_remove: List[int] = []
+            alldiff_reason_kind = ""
             if kind == "alldifferent":
-                fixed_digits_to_remove = sorted(CryptarithmAugmentGenerator._removed_digits_from_update(update))
-                # If we cannot reconstruct which fixed digits caused the update,
-                # the task would not be self-contained.  Do not emit it.
-                if not fixed_digits_to_remove:
+                hall_digits = CryptarithmAugmentGenerator._extract_hall_digits(raw)
+                if hall_digits:
+                    alldiff_digits_to_remove = hall_digits
+                    alldiff_reason_kind = "hall_reserved_digits"
+                else:
+                    alldiff_digits_to_remove = sorted(CryptarithmAugmentGenerator._removed_digits_from_update(update))
+                    alldiff_reason_kind = "fixed_digits"
+                # If we cannot reconstruct which digits caused the update,
+                # the task would not be self-contained. Do not emit it.
+                if not alldiff_digits_to_remove:
                     continue
             blocks.append(
                 {
@@ -526,7 +604,9 @@ class CryptarithmAugmentGenerator:
                     "block_text": raw,
                     "prompt_block": prompt_block,
                     "current_domains": current_domains,
-                    "fixed_digits_to_remove": fixed_digits_to_remove,
+                    "fixed_digits_to_remove": alldiff_digits_to_remove,  # backward-compatible column name
+                    "alldiff_digits_to_remove": alldiff_digits_to_remove,
+                    "alldiff_reason_kind": alldiff_reason_kind,
                     "answer": "contradiction" if answer == "contradiction" else "keep",
                 }
             )
@@ -543,8 +623,10 @@ class CryptarithmAugmentGenerator:
         kind_intro = {
             "projection": "digit domains are being narrowed by one local projection step.",
             "no_leading_zero": "digit domains are being narrowed by the no-leading-zero rule.",
+            "target_no_leading_zero": "target operand domains are being narrowed by the target no-leading-zero rule.",
             "alldifferent": "digit domains are being narrowed by the AllDifferent rule.",
             "branch_assignment": "a branch assignment is being applied to the digit domains.",
+            "branch_tuple_assignment": "a tuple branch assignment is being applied to multiple digit domains.",
         }.get(item["kind"], "digit domains are being narrowed by one local step.")
         prompt_lines = [
             f"In Alice's Wonderland, {kind_intro}",
@@ -553,12 +635,17 @@ class CryptarithmAugmentGenerator:
             "Local operation:",
             item.get("prompt_block", ""),
         ]
-        if item.get("kind") == "alldifferent" and item.get("fixed_digits_to_remove"):
+        self._add_rule_semantics(prompt_lines)
+        if item.get("kind") == "alldifferent" and item.get("alldiff_digits_to_remove"):
+            if item.get("alldiff_reason_kind") == "hall_reserved_digits":
+                label = "Hall-reserved digits to remove from symbols outside the Hall set:"
+            else:
+                label = "Fixed digits to remove from non-fixed domains:"
             prompt_lines.extend(
                 [
                     "",
-                    "Fixed digits to remove from non-fixed domains:",
-                    self._set_to_domain_values(item["fixed_digits_to_remove"]),
+                    label,
+                    self._set_to_domain_values(item["alldiff_digits_to_remove"]),
                 ]
             )
         if item.get("current_domains"):
@@ -660,6 +747,7 @@ class CryptarithmAugmentGenerator:
             "Return the verification and finish with:",
             "Answer: MATCH or Answer: WRONG",
         ]
+        self._add_rule_semantics(prompt_lines)
         completion = "\n".join(item["calc_lines"] + [f"Answer: {item['answer']}"])
         return self._row(
             source_id,
@@ -731,6 +819,7 @@ class CryptarithmAugmentGenerator:
             "Return the calculation and finish with:",
             "Answer: <visible output>",
         ]
+        self._add_rule_semantics(prompt_lines)
         completion = "\n".join(item["calc_lines"] + [f"Answer: {item['answer']}"])
         return self._row(
             source_id,
@@ -744,6 +833,70 @@ class CryptarithmAugmentGenerator:
             source_answer,
             source_solver_correct,
             extra={"target_expression": item["target_expr"], "selected_rule": item["selected_rule"]},
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Ambiguity / target-invariance audit extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_ambiguity_audit_task(cot: str) -> Optional[Dict[str, Any]]:
+        section = CryptarithmAugmentGenerator._section(cot, r"^Ambiguity audit\s*$", r"^Target\s*$")
+        if not section:
+            return None
+        md = re.search(r"(?m)^decision:\s*(.+)$", section)
+        if not md:
+            return None
+        decision = md.group(1).strip()
+        low = decision.lower()
+        if "ambiguous item" in low or "multiple target outputs" in low:
+            answer = "ambiguous"
+        elif "audit incomplete" in low or "timeout" in low or "incomplete" in low:
+            answer = "incomplete"
+        elif "unique" in low:
+            answer = "unique"
+        else:
+            answer = "incomplete"
+        prompt_section = CryptarithmAugmentGenerator._remove_lines(section, ["decision:"])
+        return {
+            "audit_summary": section.strip(),
+            "prompt_summary": prompt_section.strip(),
+            "decision": decision,
+            "answer": answer,
+        }
+
+    def _make_ambiguity_audit_problem(
+        self,
+        source_id: str,
+        prompt: str,
+        source_answer: str,
+        source_solver_correct: bool,
+        item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        prompt_lines = [
+            "In Alice's Wonderland, the solver has run a target-invariance audit after finding a candidate solution.",
+            "Your task is to interpret the audit summary and decide whether the target output is proven unique, ambiguous, or not exhaustively proven.",
+            "Do not recompute the whole digit search; use the audit counts and target-output set shown below.",
+            "",
+            "Audit summary:",
+            item.get("prompt_summary", ""),
+            "",
+            "Return the audit interpretation and finish with:",
+            "Answer: unique, Answer: ambiguous, or Answer: incomplete",
+        ]
+        completion = "Ambiguity audit\n" + item["audit_summary"].rstrip() + "\nAnswer: " + item["answer"]
+        return self._row(
+            source_id,
+            "ambiguity_audit",
+            "ambiguity_audit",
+            "cryptarithm_ambiguity_audit",
+            prompt_lines,
+            completion,
+            item["answer"],
+            prompt,
+            source_answer,
+            source_solver_correct,
+            extra={"audit_decision": item.get("decision", "")},
         )
 
     # ------------------------------------------------------------------
@@ -779,6 +932,10 @@ class CryptarithmAugmentGenerator:
             "source_answer": source_answer,
             "source_solver_correct": source_solver_correct,
         }
+        if self.config.include_quality_metadata:
+            row["subtask_type"] = task_type
+            row["has_source_prompt"] = bool(source_prompt)
+            row["answer_len"] = len(str(answer).strip())
         if extra:
             row.update(extra)
         return row
@@ -798,6 +955,9 @@ class CryptarithmAugmentGenerator:
 
         rows: List[Dict[str, Any]] = []
         digit_map = self._extract_digit_map(cot)
+        audit_for_source = self._extract_ambiguity_audit_task(cot)
+        source_audit_answer = audit_for_source.get("answer", "") if audit_for_source else ""
+        source_audit_decision = audit_for_source.get("decision", "") if audit_for_source else ""
 
         if self.config.include_rule_filtering:
             for idx, item in enumerate(self._extract_rule_filtering_blocks(cot)):
@@ -815,10 +975,26 @@ class CryptarithmAugmentGenerator:
             for idx, item in enumerate(self._extract_rule_verification_tasks(cot)):
                 rows.append(self._make_rule_verification_problem(source_id, prompt, source_answer, source_solver_correct, item, idx, digit_map))
 
+        if self.config.include_ambiguity_audit:
+            if audit_for_source is not None:
+                rows.append(self._make_ambiguity_audit_problem(source_id, prompt, source_answer, source_solver_correct, audit_for_source))
+
         if self.config.include_target_application:
-            target = self._extract_target_task(cot)
-            if target is not None:
-                rows.append(self._make_target_application_problem(source_id, prompt, source_answer, source_solver_correct, target, digit_map))
+            target_application_allowed = True
+            if self.config.skip_ambiguous_target_application and source_audit_answer and source_audit_answer != "unique":
+                target_application_allowed = False
+            if target_application_allowed:
+                target = self._extract_target_task(cot)
+                if target is not None:
+                    rows.append(self._make_target_application_problem(source_id, prompt, source_answer, source_solver_correct, target, digit_map))
+
+        for out_row in rows:
+            out_row["source_audit_answer"] = source_audit_answer
+            out_row["source_audit_decision"] = source_audit_decision
+            out_row["source_target_is_unique"] = (source_audit_answer == "unique")
+            out_row["target_application_policy"] = (
+                "skip_nonunique" if self.config.skip_ambiguous_target_application else "allow_selected"
+            )
 
         return rows
 
@@ -865,20 +1041,156 @@ class CryptarithmAugmentGenerator:
     def generate_dataset_from_text_dump(self, text: str) -> pd.DataFrame:
         return self.generate_dataset(self.parse_text_dump(text))
 
+    # ------------------------------------------------------------------
+    # Dataset QA helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def quality_report(df: pd.DataFrame) -> Dict[str, Any]:
+        """Return lightweight checks that catch common augmentation mistakes.
+
+        The report is intentionally conservative: it flags likely leaks and
+        distribution issues, but it does not attempt to re-solve cryptarithms.
+        """
+        report: Dict[str, Any] = {
+            "rows": int(len(df)),
+            "columns": list(df.columns),
+            "empty_prompt_rows": 0,
+            "empty_completion_rows": 0,
+            "empty_answer_rows": 0,
+            "duplicate_id_rows": 0,
+            "task_mode_counts": {},
+            "answer_counts_by_task_mode": {},
+            "candidate_prompts_with_output_markers": 0,
+            "target_rows_from_nonunique_sources": 0,
+            "candidate_check_has_keep": False,
+            "domain_propagation_has_contradiction": False,
+        }
+        if df.empty:
+            return report
+
+        def col(name: str) -> pd.Series:
+            return df[name].astype(str) if name in df.columns else pd.Series([""] * len(df), index=df.index)
+
+        report["empty_prompt_rows"] = int((col("prompt").str.strip() == "").sum())
+        report["empty_completion_rows"] = int((col("completion").str.strip() == "").sum())
+        report["empty_answer_rows"] = int((col("answer").str.strip() == "").sum())
+        report["duplicate_id_rows"] = int(df.duplicated("id").sum()) if "id" in df.columns else 0
+        if "task_mode" in df.columns:
+            report["task_mode_counts"] = {str(k): int(v) for k, v in df["task_mode"].value_counts().items()}
+            answer_counts: Dict[str, Dict[str, int]] = {}
+            for mode, sub in df.groupby("task_mode", dropna=False):
+                answer_counts[str(mode)] = {str(k): int(v) for k, v in sub["answer"].astype(str).value_counts().items()} if "answer" in sub.columns else {}
+            report["answer_counts_by_task_mode"] = answer_counts
+
+        if {"task_mode", "prompt"}.issubset(df.columns):
+            cand = df[df["task_mode"].astype(str) == "cryptarithm_candidate_check"]
+            if len(cand):
+                # These markers are expected in completions, not in the local-check prompt.
+                marker_re = r"(?m)^\s*(?:apply update|result|decision):"
+                report["candidate_prompts_with_output_markers"] = int(cand["prompt"].astype(str).str.contains(marker_re, regex=True).sum())
+
+        if {"task_mode", "source_audit_answer"}.issubset(df.columns):
+            targ = df[df["task_mode"].astype(str) == "cryptarithm_target_application"]
+            report["target_rows_from_nonunique_sources"] = int((targ["source_audit_answer"].astype(str) != "unique").sum())
+
+        if {"task_mode", "answer"}.issubset(df.columns):
+            cand = df[df["task_mode"].astype(str) == "cryptarithm_candidate_check"]
+            report["candidate_check_has_keep"] = bool((cand["answer"].astype(str) == "keep").any())
+            dom = df[df["task_mode"].astype(str) == "cryptarithm_domain_propagation"]
+            report["domain_propagation_has_contradiction"] = bool((dom["answer"].astype(str) == "contradiction").any())
+        return report
+
+    @staticmethod
+    def quality_issues(df: pd.DataFrame) -> List[str]:
+        report = CryptarithmAugmentGenerator.quality_report(df)
+        issues: List[str] = []
+        for key in ["empty_prompt_rows", "empty_completion_rows", "empty_answer_rows", "duplicate_id_rows"]:
+            if report.get(key, 0):
+                issues.append(f"{key}: {report[key]}")
+        if report.get("candidate_prompts_with_output_markers", 0):
+            issues.append(f"candidate prompts contain output markers: {report['candidate_prompts_with_output_markers']}")
+        if report.get("target_rows_from_nonunique_sources", 0):
+            issues.append(f"target_application rows from non-unique sources: {report['target_rows_from_nonunique_sources']}")
+        return issues
+
+    @staticmethod
+    def format_quality_report(report: Dict[str, Any]) -> str:
+        lines = [f"rows: {report.get('rows', 0)}"]
+        counts = report.get("task_mode_counts", {}) or {}
+        if counts:
+            lines.append("task_mode_counts:")
+            lines.extend(f"  {k}: {v}" for k, v in counts.items())
+        answer_counts = report.get("answer_counts_by_task_mode", {}) or {}
+        if answer_counts:
+            lines.append("answer_counts_by_task_mode:")
+            for mode, counts2 in answer_counts.items():
+                compact = ", ".join(f"{k}={v}" for k, v in counts2.items())
+                lines.append(f"  {mode}: {compact}")
+        checks = [
+            "empty_prompt_rows",
+            "empty_completion_rows",
+            "empty_answer_rows",
+            "duplicate_id_rows",
+            "candidate_prompts_with_output_markers",
+            "target_rows_from_nonunique_sources",
+            "candidate_check_has_keep",
+            "domain_propagation_has_contradiction",
+        ]
+        lines.append("checks:")
+        lines.extend(f"  {k}: {report.get(k)}" for k in checks)
+        return "\n".join(lines)
+
 
 if __name__ == "__main__":
     import argparse
+    import json
 
-    parser = argparse.ArgumentParser(description="Generate cryptarithm local-subtask dataset from solved CoT text dump.")
+    parser = argparse.ArgumentParser(description="Generate cryptarithm local-subtask dataset from solved replay CoT text dumps.")
     parser.add_argument("input", help="Path to pasted solved cryptarithm text dump")
     parser.add_argument("--output", "-o", default="cryptarithm_subtasks.csv", help="Output CSV path")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for sampling")
+    parser.add_argument("--sample-n", type=int, default=None, help="Sample at most N source rows before augmentation")
+    parser.add_argument("--sample-frac", type=float, default=1.0, help="Sample this fraction of source rows before augmentation")
+    parser.add_argument("--only-solver-correct", action="store_true", help="Keep only rows whose source answer matches the replay final answer")
+    parser.add_argument("--keep-nonunique-targets", action="store_true", help="Allow target_application rows from ambiguous/incomplete audits. Default skips them.")
+    parser.add_argument("--no-rule-semantics", action="store_true", help="Do not add the compact rule-notation legend to prompts")
+    parser.add_argument("--no-quality-metadata", action="store_true", help="Do not add lightweight metadata columns to output rows")
+    parser.add_argument("--quality-report", action="store_true", help="Print a dataset QA report after generation")
+    parser.add_argument("--quality-report-json", default="", help="Optional path to write the QA report as JSON")
+    parser.add_argument("--fail-on-quality-issues", action="store_true", help="Exit nonzero if conservative QA checks find issues")
     args = parser.parse_args()
+
+    config = CryptarithmAugmentConfig(
+        sample_frac=args.sample_frac,
+        sample_n=args.sample_n,
+        only_solver_correct=args.only_solver_correct,
+        skip_ambiguous_target_application=not args.keep_nonunique_targets,
+        include_rule_semantics_in_prompts=not args.no_rule_semantics,
+        include_quality_metadata=not args.no_quality_metadata,
+    )
 
     with open(args.input, "r", encoding="utf-8") as f:
         text = f.read()
-    gen = CryptarithmAugmentGenerator()
+
+    gen = CryptarithmAugmentGenerator(seed=args.seed, config=config)
     df = gen.generate_dataset_from_text_dump(text)
     df.to_csv(args.output, index=False)
     print(f"wrote {len(df)} rows to {args.output}")
     if len(df):
         print(df["task_mode"].value_counts().to_string())
+
+    report = CryptarithmAugmentGenerator.quality_report(df)
+    issues = CryptarithmAugmentGenerator.quality_issues(df)
+    if args.quality_report:
+        print("\nquality report")
+        print(CryptarithmAugmentGenerator.format_quality_report(report))
+    if args.quality_report_json:
+        with open(args.quality_report_json, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+    if issues:
+        print("\nquality issues:")
+        for issue in issues:
+            print(f"- {issue}")
+        if args.fail_on_quality_issues:
+            raise SystemExit(1)
