@@ -162,9 +162,6 @@ class ASTBruteForceSolver:
         text = "" if cot_text is None else str(cot_text)
         patterns = [
             r"(?im)^\s*Final answer\s*:\s*(\S+)\s*$",
-            r"(?im)^\s*Computed output\s*:\s*(\S+)\s*$",
-            r"(?im)^\s*Answer\s*:\s*(\S+)\s*$",
-            r"\\boxed\{([^{}\s]+)\}",
         ]
         for pattern in patterns:
             m = re.search(pattern, text)
