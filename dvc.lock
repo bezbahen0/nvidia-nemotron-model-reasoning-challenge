@@ -111,8 +111,8 @@ stages:
     outs:
     - path: models/sft_v0.0.18
       hash: md5
-      md5: bb29de1e29a1734754744b9dc76017e7.dir
-      size: 10783685942
+      md5: 2850aac3b5799a76c427ca452a0f185f.dir
+      size: 10820313445
       nfiles: 27
   analyze_sft_train_telemetry:
     cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.13/train_telemetry
