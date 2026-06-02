@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 Digit = int
@@ -11,49 +11,21 @@ Domains = Dict[str, Set[Digit]]
 
 @dataclass
 class SolverConfig:
+    # Runtime/search knobs only. Output is always answer-only.
     timeout_seconds: Any = 30.0
-    max_trace_lines: Any = 10000000
-    max_trace_chars: Any = 1000000000
-    include_digit_matching_lines: Any = True
-    include_rule_reject_summary: Any = True
-    include_search_branches: Any = True
-    max_kept_rules_shown: Any = 16
-    max_digit_lines_shown: Any = 10000000
-    include_no_change_events: Any = False
-    include_failed_attempt_events: Any = False
-    max_projection_blocks: Any = 10000000
-    max_structural_tests_per_operator: Any = 10000000
     use_support_cache: Any = True
-    projection_strategy: Any = 'rule_specific_exact_first'
-    exact_dominates_modular_space: Any = 1000
-    modular_anchor_ks: Any = (1, 2, -1)
-    compact_structural_matching: Any = True
-    compact_projection_blocks: Any = True
-    show_current_domains: Any = True
-    show_projection_reason: Any = False
-    show_support_counts: Any = True
+    projection_strategy: Any = "rule_specific_exact_first"
     cat_as_positional_equalities: Any = True
-    causal_reject_blocks: Any = True
-    show_projection_derivation: Any = True
-    max_projection_witnesses: Any = 0
-    show_supported_projection: Any = True
-    show_projection_search_space: Any = True
-    max_exact_witness_count: Any = 6
     use_rule_specific_exact_projection: Any = True
     max_rule_specific_variables: Any = 8
-    max_transition_values_shown: Any = 10000000
     skip_modular_when_rule_specific_exact: Any = True
-    show_exact_first_skip_events: Any = False
-    include_ambiguity_audit: Any = True
-    max_audit_solutions: Any = 100000
-    max_audit_rule_combos: Any = 100000
-    max_audit_target_outputs_shown: Any = 16
-    audit_stop_after_distinct_target_outputs: Any = 2
-    # Full CoT/audit is always enabled in this build; these are pruning knobs, not modes.
     use_bounds_sign_structural_pruning: Any = True
     use_target_no_leading_zero: Any = True
     use_column_tuple_branching: Any = True
     max_column_branch_tuples: Any = 24
+    include_failed_attempt_events: Any = False
+    include_no_change_events: Any = False
+    max_projection_witnesses: Any = 0
 
 @dataclass(frozen=True)
 class Equation:
@@ -109,47 +81,17 @@ class ReplayEvent:
 
 @dataclass
 class ReplayTrace:
-    config: SolverConfig
-    events: List[ReplayEvent] = field(default_factory=list)
-    notes: List[str] = field(default_factory=list)
-    last_reject: str = ""
+    """Minimal no-op trace sink used by the search code.
 
-    def add(self, line: str) -> None:
-        
-        line = str(line).strip()
-        if line:
-            self.notes.append(line)
-
-    def add_event(self, event: ReplayEvent) -> None:
-        self.events.append(event)
-        if event.decision == "reject" or "contradiction" in event.kind.lower() or "reject" in event.kind.lower():
-            self.last_reject = event.reason or event.title or event.label
-
-    def extend(self, other: "ReplayTrace") -> None:
-        self.events.extend(other.events)
-        self.notes.extend(other.notes)
-        if other.last_reject:
-            self.last_reject = other.last_reject
-
-    def finish(self) -> List[ReplayEvent]:
-        return list(self.events)
-
-    def reject_reason(self) -> str:
-        return self.last_reject or "no supported continuation"
-
-
-class SilentReplayTrace:
-    """Trace sink for exhaustive audits.
-
-    It accepts the same minimal calls used by propagation, but does not retain
-    event bodies.  This keeps ambiguity audits from consuming memory or
-    contaminating the train-style replay trace.
+    The solver still calls trace.add_event(...) in the same search locations,
+    but we do not retain replay/debug events in answer-only mode.
+    Only the last rejection reason is kept because search uses it to report
+    upstream failures.
     """
 
-    def __init__(self) -> None:
-        self.events: List[ReplayEvent] = []
-        self.notes: List[str] = []
-        self.last_reject = ""
+    config: SolverConfig
+    last_reject: str = ""
+    events: List[ReplayEvent] = field(default_factory=list)
 
     def add(self, line: str) -> None:
         return None
@@ -158,7 +100,7 @@ class SilentReplayTrace:
         if event.decision == "reject" or "contradiction" in event.kind.lower() or "reject" in event.kind.lower():
             self.last_reject = event.reason or event.title or event.label
 
-    def extend(self, other: Any) -> None:
+    def extend(self, other: "ReplayTrace") -> None:
         if getattr(other, "last_reject", ""):
             self.last_reject = other.last_reject
 
@@ -169,15 +111,15 @@ class SilentReplayTrace:
         return self.last_reject or "no supported continuation"
 
 
+
+
 class CryptarithmSolver:
     _EXACT_FIRST_RULES: Set[str] = {"add", "add1", "addm1", "mul", "mul1", "mulm1"}
 
-    """Final cryptarithm solver with replay-reproducible CoT.
+    """Cryptarithm solver with answer-only public output.
 
-    This file intentionally contains only the final solver path. The CoT is a structured
-    replay trace: from the prompt plus the printed trace, the selected rules,
-    digit map, verified examples, and target answer can be recomputed without
-    hidden solver state.
+    The internal search is preserved, but generate_cot()/solve()["solution"]
+    return only `Final answer: ...` so evaluation is not polluted by replay text.
     """
 
 
@@ -212,7 +154,7 @@ class CryptarithmSolver:
             if target is None:
                 return self._failure("target expression could not be parsed", started)
 
-            target_expr, target_left, target_op, target_right = target
+            _target_expr, target_left, target_op, target_right = target
             symbols = self._symbols(equations, target_left, target_right)
             if len(symbols) > 10:
                 return self._failure(f"too many distinct symbols: {len(symbols)} > 10", started)
@@ -221,7 +163,7 @@ class CryptarithmSolver:
             for eq in equations:
                 by_op.setdefault(eq.op, []).append(eq)
 
-            candidates, reject_summary = self._operation_candidates(by_op)
+            candidates, _reject_summary = self._operation_candidates(by_op)
             for op in list(candidates):
                 candidates[op] = sorted(candidates[op], key=self._rule_sort_key)
 
@@ -232,83 +174,41 @@ class CryptarithmSolver:
                 return self._failure(f"target operator {repr(target_op)} was not seen in examples", started)
 
             domains: Domains = {s: set(range(10)) for s in symbols}
-            ordered_ops = sorted(candidates, key=lambda op: (0 if op == target_op else 1, len(candidates[op]), -len(by_op[op]), op))
-            trace = ReplayTrace(self.config)
-            trace.add_event(
-                ReplayEvent(
-                    kind="RULE_ORDER",
-                    title="Rule-combo search order",
-                    decision="order",
-                    meta={"ordered_ops": tuple(ordered_ops), "target_op": target_op},
-                )
+            ordered_ops = sorted(
+                candidates,
+                key=lambda op: (0 if op == target_op else 1, len(candidates[op]), -len(by_op[op]), op),
             )
-            assignment, combo = self._search_rules(ordered_ops, candidates, equations, domains, {}, trace, 0, target_context=(target_left, target_op, target_right))
+            trace = ReplayTrace(self.config)
+            assignment, combo = self._search_rules(
+                ordered_ops, candidates, equations, domains, {}, trace, 0,
+                target_context=(target_left, target_op, target_right),
+            )
 
             if assignment is None or combo is None:
                 return self._failure("no rule/map combination satisfies all examples", started)
 
-            answer, target_error, target_a, target_b, target_value = self._encode_target(
+            answer, target_error, _target_a, _target_b, _target_value = self._encode_target(
                 target_left, target_op, target_right, combo[target_op], assignment
             )
-            audit_result = self._audit_target_outputs(
-                ordered_ops=ordered_ops,
-                candidates=candidates,
-                equations=equations,
-                initial_domains=domains,
-                target_left=target_left,
-                target_op=target_op,
-                target_right=target_right,
-                selected_answer=answer,
-            )
-            events = trace.finish()
-            self.stats.replay_events = len(events)
-            solution_lines = self._render_replay_solution(
-                equations=equations,
-                target_expr=target_expr,
-                target_left=target_left,
-                target_op=target_op,
-                target_right=target_right,
-                candidates=candidates,
-                reject_summary=reject_summary,
-                combo=combo,
-                assignment=assignment,
-                events=events,
-                answer=answer,
-                target_error=target_error,
-                target_a=target_a,
-                target_b=target_b,
-                target_value=target_value,
-                ordered_ops=ordered_ops,
-                symbols=symbols,
-                audit_result=audit_result,
-            )
+            final = answer if (not target_error and answer is not None) else "nan"
+            lines = [f"Final answer: {final}"]
             return {
                 "answer": answer,
-                "solution": "\n".join(solution_lines),
-                "debug": solution_lines,
-                "trace": solution_lines,
-                "events": [asdict(e) for e in events],
+                "solution": "\n".join(lines),
+                "debug": lines,
+                "trace": lines,
+                "events": [],
                 "mapping": assignment,
                 "rules": {op: self._rule_name(rule) for op, rule in combo.items()},
-                "audit": audit_result,
                 "stats": self.stats.__dict__,
                 "elapsed_seconds": round(time.time() - started, 4),
-                "training_category": "cryptarithm.final_replay",
+                "training_category": "cryptarithm.answer_only",
             }
         except TimeoutError:
             return self._failure("solver timeout", started)
         except Exception as exc:
             return self._failure(f"execution error: {type(exc).__name__}: {exc}", started)
 
-    def _support_line(self, event: ReplayEvent, indent: str) -> Optional[str]:
-        if not self._cfg("show_supported_projection", True):
-            return None
-        if event.supported is None:
-            return None
-        if self._cfg("show_support_counts", False):
-            count = "unknown" if event.count is None else str(event.count)
-            return f"{indent}supported projection ({count} supports): {self._domain_text_map(event.supported)}"
-        return f"{indent}supported projection: {self._domain_text_map(event.supported)}"
 
     def _rule_specific_project_replay(
         self,
@@ -468,312 +368,8 @@ class CryptarithmSolver:
         # Final solver is exact-first.  If a non-exact-first config is forced, do no modular pruning rather than emit weaker suffix blocks.
         return False
 
-    def _format_replay_event_default(self, event: ReplayEvent, block_num: int) -> List[str]:
-        lines: List[str] = []
-        kind = event.kind
-        if kind == "RULE_ORDER":
-            ordered = event.meta.get("ordered_ops", ()) if event.meta else ()
-            lines.append(f"Rule-combo order: " + ", ".join(repr(op) for op in ordered))
-            return lines
-        if kind == "RULE_TRY":
-            lines.append(f"Combo block {block_num}: try {event.reason}")
-            return lines
-        if kind == "COMBO_PROPAGATE":
-            combo = event.meta.get("combo", ()) if event.meta else ()
-            combo_text = "; ".join(f"{repr(op)}->{rule}" for op, rule in combo)
-            lines.append(f"Combo block {block_num}: all operators assigned; start digit-domain solving")
-            lines.append(f"  combo: {combo_text}")
-            return lines
-        if kind == "COMBO_ACCEPT":
-            combo = event.meta.get("combo", ()) if event.meta else ()
-            combo_text = "; ".join(f"{repr(op)}->{rule}" for op, rule in combo)
-            lines.append(f"Combo block {block_num}: selected combo {combo_text}")
-            lines.append(f"  decision: {event.reason}")
-            return lines
-        if kind in {"NO_LEADING_ZERO", "ALLDIFFERENT"}:
-            lines.append(f"{event.title} {block_num}")
-            lines.append(f"  constraint: {event.constraint}")
-            if kind == "ALLDIFFERENT" and event.meta:
-                hall_symbols = event.meta.get("hall_symbols")
-                hall_digits = event.meta.get("hall_digits")
-                if hall_symbols is not None and hall_digits is not None:
-                    sym_text = "{" + ",".join(repr(ch) for ch in hall_symbols) + "}"
-                    digit_text = "{" + ",".join(str(d) for d in hall_digits) + "}"
-                    lines.append(f"  Hall set: symbols {sym_text}; union digits {digit_text}")
-            if event.reason:
-                lines.append(f"  reason: {event.reason}")
-            if self._cfg("show_current_domains", False):
-                lines.append(f"  current domains: {self._domain_text_map(event.before)}")
-            lines.append(f"  apply update: {self._changes_text(event.changes)}")
-            lines.append(f"  decision: {event.decision}")
-            return lines
-        if kind == "BRANCH_SELECT":
-            lines.append(f"Branch block {block_num}: choose symbol")
-            lines.append(f"  reason: {event.reason}")
-            return lines
-        if kind == "TUPLE_BRANCH_SELECT":
-            lines.append(f"Branch block {block_num}: choose column tuple relation")
-            if event.label:
-                lines.append(f"  label: {event.label}")
-            if event.constraint:
-                lines.append(f"  formula: {event.constraint}")
-            lines.append(f"  reason: {event.reason}")
-            if event.meta:
-                tuples = event.meta.get("tuples", ())
-                if tuples:
-                    rendered = []
-                    for tup in tuples:
-                        rendered.append("{" + ", ".join(f"{repr(ch)}={d}" for ch, d in tup) + "}")
-                    lines.append("  branch tuples: " + "; ".join(rendered))
-            return lines
-        if kind == "TUPLE_TRY":
-            lines.append(f"Branch block {block_num}: try tuple {event.reason}")
-            lines.append(f"  apply update: {self._changes_text(event.changes)}")
-            lines.append("  decision: propagate this tuple assignment")
-            return lines
-        if kind == "DIGIT_TRY":
-            lines.append(f"Branch block {block_num}: try {event.reason}")
-            lines.append(f"  apply update: {self._changes_text(event.changes)}")
-            lines.append("  decision: propagate this assignment")
-            return lines
-        if kind == "MAP_ACCEPT":
-            assignment = event.meta.get("assignment", ()) if event.meta else ()
-            lines.append(f"Map block {block_num}: digit map accepted")
-            lines.append("  map: " + "; ".join(f"{repr(ch)}={d}" for ch, d in assignment))
-            lines.append(f"  decision: {event.reason}")
-            return lines
-        if kind == "MAP_REJECT":
-            lines.append(f"Map block {block_num}: reject candidate map")
-            lines.append(f"  reason: {event.reason}")
-            return lines
-        if kind == "MODULAR_SKIP":
-            if self._cfg("include_no_change_events", False):
-                lines.append(f"Projection block {block_num}: modular suffix checks skipped")
-                lines.append(f"  reason: {event.reason}")
-                lines.append("  decision: skip")
-            return lines
-        lines.append(f"Replay block {block_num}: {event.kind}: {event.title}")
-        if event.reason:
-            lines.append(f"  reason: {event.reason}")
-        if event.decision:
-            lines.append(f"  decision: {event.decision}")
-        return lines
 
-    def _format_replay_event(self, event: ReplayEvent, block_num: int) -> List[str]:
-        if event.kind in {"COLUMN_PROJECT", "FULL_PROJECT", "PROJECTION"}:
-            lines: List[str] = [f"Projection block {block_num}"]
-            if event.label:
-                lines.append(f"  label: {event.label}")
-            if event.constraint:
-                lines.append(f"  formula: {event.constraint}")
-            if self._cfg("show_current_domains", False):
-                lines.append(f"  current local domains: {self._domain_text_map(event.before)}")
-            lines.extend(self._render_projection_derivation(event, "  "))
-            support_line = self._support_line(event, "  ")
-            if support_line:
-                lines.append(support_line)
-            lines.append(f"  apply update: {self._changes_text(event.changes)}")
-            if event.reason and self._cfg("show_projection_reason", False):
-                lines.append(f"  reason: {event.reason}")
-            lines.append(f"  decision: {event.decision}")
-            return lines
 
-        if self._cfg("causal_reject_blocks", True):
-            if event.kind == "RULE_REJECT":
-                candidate, failure = self._split_decision_reason(event.reason)
-                downstream = self._downstream_failure_info(event, candidate, failure)
-                if downstream is not None:
-                    failed_op, failed_rule, clean_failure = downstream
-                    lines: List[str] = [f"Combo block {block_num}: test prefix assignment {candidate}"]
-                    lines.append("  Continue rule-combo search for remaining operators.")
-                    lines.append("  Downstream check:")
-                    lines.append(f"    operator {failed_op} -> {failed_rule}")
-                    if event.label or event.constraint or event.supported is not None:
-                        lines.extend(self._render_local_check(event, indent="    ", result_override=clean_failure))
-                    else:
-                        lines.append(f"    result: {clean_failure}")
-                    lines.append(f"  decision: reject prefix {candidate} because no globally consistent continuation remains")
-                    return lines
-
-                lines = [f"Combo block {block_num}: test {candidate}"]
-                local_failure = f"{candidate}: {failure}" if failure else candidate
-                if event.label or event.constraint or event.supported is not None:
-                    lines.extend(self._render_local_check(event, indent="  ", result_override=local_failure))
-                else:
-                    lines.append(f"  result: {local_failure}")
-                lines.append(f"  decision: reject {candidate}")
-                return lines
-
-            if event.kind == "COMBO_REJECT":
-                combo = event.meta.get("combo", ()) if event.meta else ()
-                combo_text = "; ".join(f"{repr(op)}->{rule}" for op, rule in combo)
-                lines = [f"Combo block {block_num}: test combo {combo_text}"]
-                if event.label or event.constraint or event.supported is not None:
-                    lines.extend(self._render_local_check(event, indent="  "))
-                else:
-                    lines.append(f"  result: {event.reason}")
-                lines.append(f"  decision: reject combo {combo_text}")
-                return lines
-
-            if event.kind in {"DIGIT_REJECT", "TUPLE_REJECT"}:
-                branch, failure = self._split_decision_reason(event.reason)
-                lines = [f"Branch block {block_num}: test {branch}"]
-                if event.label or event.constraint or event.supported is not None:
-                    lines.extend(self._render_local_check(event, indent="  ", result_override=failure))
-                else:
-                    lines.append(f"  result: {failure}")
-                lines.append(f"  decision: reject {branch}")
-                return lines
-
-        return self._format_replay_event_default(event, block_num)
-
-    def _render_replay_solution(
-        self,
-        equations: Sequence[Equation],
-        target_expr: str,
-        target_left: str,
-        target_op: str,
-        target_right: str,
-        candidates: Dict[str, List[Rule]],
-        reject_summary: Dict[str, Dict[str, int]],
-        combo: Dict[str, Rule],
-        assignment: Assignment,
-        events: Sequence[ReplayEvent],
-        answer: Optional[str],
-        target_error: Optional[str],
-        target_a: int,
-        target_b: int,
-        target_value: Optional[int],
-        ordered_ops: Sequence[str],
-        symbols: Sequence[str],
-        audit_result: Optional[Dict[str, Any]] = None,
-    ) -> List[str]:
-        lines: List[str] = []
-        add = lines.append
-        by_op: Dict[str, List[Equation]] = {}
-        for eq in equations:
-            by_op.setdefault(eq.op, []).append(eq)
-
-        add("Search setup")
-        add("Each visible non-operator symbol is a digit variable.")
-        add("The digit map is injective: different symbols denote different decimal digits.")
-        add("Each operator has one selected arithmetic rule, shared by all examples using that operator.")
-        add("A candidate is valid only if the same digit map and selected operator rules reproduce every visible output.")
-        add("")
-
-        add("Examples")
-        for i, eq in enumerate(equations, 1):
-            add(f"{i}. {eq.display()}")
-        add(f"Target: {target_expr}")
-        add("")
-
-        add("Parsed equations")
-        for i, eq in enumerate(equations, 1):
-            expected = f"{eq.op}{eq.result}" if eq.has_sign else eq.result
-            add(f"{i}. left={eq.left}, op={repr(eq.op)}, right={eq.right}, output={expected}, signed_output={eq.has_sign}")
-        add("")
-
-        add("Symbols")
-        add("Digit symbols: " + ", ".join(repr(ch) for ch in symbols))
-        add("Operator symbols: " + ", ".join(repr(op) for op in sorted(by_op)))
-        add("AllDifferent: every listed digit symbol must take a different digit.")
-        add("")
-
-        add("Search axes")
-        add("- read direction: std reads symbols left-to-right; rev reads symbols right-to-left")
-        add("- arithmetic family: concat, add/add1/addm1, abs/sub, mul/mul1/mulm1")
-        add("- digit map: injective assignment from visible digit symbols to 0..9")
-        add("- output encoding: signed rules show a negative result by prefixing the operator symbol")
-        add("Rule-combo order: " + ", ".join(repr(op) for op in ordered_ops))
-        add("")
-
-        lines.extend(self._render_structural_matching(by_op, candidates, combo))
-
-        add("Local replay steps")
-        add("Replay convention: a projection block is one local solver operation; rule-specific exact full projections are used instead of low-k suffix projection cascades.")
-        add("Branch blocks explicitly assign one digit and then run the following propagation blocks.")
-        if self._cfg("show_current_domains", False):
-            add("Only local operations that change state, reject a branch/combo, or select a branch are shown; each local pruning block prints its current local domains before the update.")
-        else:
-            add("Only local operations that change state, reject a branch/combo, or select a branch are shown; current domains are reconstructed from earlier updates.")
-        projection_count = 0
-        for idx, event in enumerate(events, 1):
-            if event.kind in {"COLUMN_PROJECT", "FULL_PROJECT", "PROJECTION"}:
-                projection_count += 1
-                if projection_count > self._cfg("max_projection_blocks", 10_000_000):
-                    add(f"... remaining projection blocks omitted by max_projection_blocks={self._cfg('max_projection_blocks', 10_000_000)}")
-                    break
-            for line in self._format_replay_event(event, idx):
-                if line:
-                    add(line)
-        add("")
-
-        add("Selected digit map")
-        add("; ".join(f"{repr(ch)}={assignment[ch]}" for ch in sorted(assignment)))
-        add("")
-
-        add("Verify selected rules")
-        for op in sorted(by_op):
-            rule = combo[op]
-            add(f"Operator {repr(op)} uses {self._rule_name(rule)}")
-            for eq in by_op[op]:
-                a = self._number(eq.left, assignment, rule.reverse)
-                b = self._number(eq.right, assignment, rule.reverse)
-                op_text, value = self._operation_line(rule, a, b)
-                encoded = None if value is None else self._encode_value(value, eq.op, rule, assignment)
-                expected = f"{eq.op}{eq.result}" if eq.has_sign else eq.result
-                status = "MATCH" if encoded == expected else "WRONG"
-                add(f"- {eq.display()}")
-                add(f"  decode {eq.left}->{a}, {eq.right}->{b}")
-                add(f"  apply rule: {op_text}")
-                add(f"  encode result: {encoded}")
-                add(f"  compare visible output: produced {encoded} vs expected {expected} -> {status}")
-        add("")
-
-        if audit_result and audit_result.get("enabled"):
-            add("Ambiguity audit")
-            add("Audit scope: all structurally kept rule combos and all digit maps satisfying the training examples.")
-            add(f"Rule combos tested: {audit_result.get('rule_combos_tested', 0)}")
-            add(f"Valid rule combos found: {audit_result.get('valid_rule_combos', 0)}")
-            add(f"Valid complete solutions found: {audit_result.get('valid_complete_solutions', 0)}")
-            outputs = audit_result.get("target_outputs", ())
-            if outputs:
-                max_shown = int(self._cfg("max_audit_target_outputs_shown", 16))
-                shown = tuple(outputs[:max_shown])
-                shown_outputs = ", ".join(repr(x) for x in shown)
-                suffix = "" if len(outputs) <= max_shown else f", ... {len(outputs) - max_shown} more"
-                add(f"Target outputs found: {{{shown_outputs}{suffix}}}")
-            else:
-                add("Target outputs found: none")
-            selected_output = audit_result.get("selected_output", "nan")
-            add(f"Selected solution output: {repr(selected_output)}")
-            outputs_count = len(outputs)
-            if audit_result.get("complete") or outputs_count > 1:
-                add(f"decision: {audit_result.get('decision', 'audit complete')}")
-                if not audit_result.get("complete"):
-                    add(f"audit stopped early: {audit_result.get('stopped_reason', 'unknown stop reason')}")
-            else:
-                add(f"decision: audit incomplete — {audit_result.get('stopped_reason', 'unknown stop reason')}")
-            add("")
-
-        add("Target")
-        target_rule = combo[target_op]
-        add(f"Target operator {repr(target_op)} was found in the examples.")
-        add(f"Use selected rule: {self._rule_name(target_rule)}")
-        add(f"Replay the rule on target {target_left}{target_op}{target_right}:")
-        add(f"  decode {target_left}->{target_a}, {target_right}->{target_b}")
-        if target_error or answer is None or target_value is None:
-            add(f"  apply rule: {target_error or 'invalid target'}")
-            add("Computed output: nan")
-            add("Final answer: nan")
-        else:
-            operation, _ = self._operation_line(target_rule, target_a, target_b)
-            add(f"  apply rule: {operation}")
-            add(f"  encode {target_value}: {answer}")
-            add(f"Computed output: {answer}")
-            add(f"Final answer: {answer}")
-            add(f"\\boxed{{{answer}}}")
-        return lines
 
     @staticmethod
     @staticmethod
@@ -1102,21 +698,6 @@ class CryptarithmSolver:
     def _changes(before: Dict[str, Tuple[int, ...]], after: Dict[str, Tuple[int, ...]]) -> Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]]:
         return {ch: (before[ch], after[ch]) for ch in before if before[ch] != after.get(ch, ())}
 
-    @staticmethod
-    @staticmethod
-    def _changes_text(changes: Optional[Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]]]) -> str:
-        if not changes:
-            return "none"
-        pieces = []
-        for ch, (before, after) in changes.items():
-            b = "{" + ",".join(str(v) for v in before) + "}"
-            a = "{" + ",".join(str(v) for v in after) + "}"
-            if before == tuple(range(10)):
-                b = "{0..9}"
-            if after == tuple(range(10)):
-                a = "{0..9}"
-            pieces.append(f"D[{repr(ch)}]: {b} -> {a}")
-        return "; ".join(pieces)
 
     def _choose_column_assignments(
         self,
@@ -1437,65 +1018,8 @@ class CryptarithmSolver:
             return "{0..9}"
         return "{" + ",".join(str(v) for v in vals) + "}"
 
-    @staticmethod
-    @staticmethod
-    def _domain_space(domains: Domains, scope: Sequence[str], cap: int = 10_000_000) -> int:
-        """Approximate local search size for a support projection.
 
-        This intentionally ignores AllDifferent permutations and uses the product
-        of domain sizes.  It is a safe cheap upper-ish signal for deciding whether
-        a full projection can dominate the modular low-k cascade.
-        """
-        total = 1
-        for ch in dict.fromkeys(scope):
-            total *= max(1, len(domains[ch]))
-            if total > cap:
-                return total
-        return total
 
-    @staticmethod
-    @staticmethod
-    def _domain_text_map(domains: Optional[Dict[str, Tuple[int, ...]]]) -> str:
-        if not domains:
-            return "none"
-        pieces = []
-        for ch, vals in domains.items():
-            if tuple(vals) == tuple(range(10)):
-                txt = "{0..9}"
-            else:
-                txt = "{" + ",".join(str(v) for v in vals) + "}"
-            pieces.append(f"D[{repr(ch)}]={txt}")
-        return "; ".join(pieces)
-
-    def _downstream_failure_info(
-        self,
-        event: ReplayEvent,
-        candidate_text: str,
-        failure_text: str,
-    ) -> Optional[Tuple[str, str, str]]:
-        """Return (failed_op, failed_rule, clean_failure) for downstream rejects.
-
-        RULE_REJECT events can represent two different cases:
-          * local candidate failure: the currently tested operator/rule fails;
-          * prefix failure: the current prefix is tested, then a later operator
-            fails during recursive rule-combo search.
-
-        Rule rejections can be local failures or downstream prefix failures.
-        This renderer-only helper detects the second case from the textual
-        witness and renders it as a prefix rejection instead of making it look
-        like the current operator was directly disproved by another operator's
-        projection.
-        """
-        tested = self._parse_operator_rule_fragment(candidate_text)
-        failed = self._parse_operator_rule_fragment(failure_text)
-        if not tested or not failed:
-            return None
-        tested_op, tested_rule = tested
-        failed_op, failed_rule = failed
-        if tested_op == failed_op and tested_rule == failed_rule:
-            return None
-        clean_failure = self._strip_downstream_prefix(failure_text) or failure_text
-        return failed_op, failed_rule, clean_failure
 
     def _encode_target(self, left: str, op: str, right: str, rule: Rule, assignment: Assignment) -> Tuple[Optional[str], Optional[str], int, int, Optional[int]]:
         a = self._number(left, assignment, rule.reverse)
@@ -1544,12 +1068,7 @@ class CryptarithmSolver:
         return digits == [assignment[ch] for ch in eq.result]
 
     def _failure(self, reason: str, started: float) -> Dict[str, Any]:
-        lines = [
-            "Search setup",
-            "Each visible non-operator symbol is a digit variable; the digit map is injective; each operator has one selected arithmetic rule.",
-            f"Solver failed: {reason}",
-            "Final answer: nan",
-        ]
+        lines = ["Final answer: nan"]
         return {
             "answer": None,
             "solution": "\n".join(lines),
@@ -1558,103 +1077,17 @@ class CryptarithmSolver:
             "events": [],
             "stats": self.stats.__dict__,
             "elapsed_seconds": round(time.time() - started, 4),
+            "failure_reason": reason,
         }
 
-    def _family_reason_details(self, reason: str, rules: Sequence[Rule], eqs: Sequence[Equation]) -> List[str]:
-        rep = sorted(rules, key=self._rule_sort_key)[0]
-        if reason == "sign":
-            return ["signed output is present in the examples, but these rules are unsigned."]
-        if reason == "concat positional":
-            lines: List[str] = []
-            for rule in sorted(rules, key=self._rule_sort_key):
-                for eq in eqs:
-                    expected = self._cat_expected_output(eq, rule)
-                    observed = eq.result
-                    if len(expected) == len(observed) and expected != observed:
-                        mismatch = next(
-                            (idx, exp, obs)
-                            for idx, (exp, obs) in enumerate(zip(expected, observed), 1)
-                            if exp != obs
-                        )
-                        idx, exp, obs = mismatch
-                        lines.append(
-                            f"{self._rule_name(rule)} on {eq.display()} requires visible output {expected!r}; "
-                            f"observed {observed!r}; first mismatch at position {idx}: expected {exp!r}, observed {obs!r}. "
-                            "Because the digit map is injective, different visible symbols cannot be identified."
-                        )
-                        break
-            return lines or ["concat visible output does not match the positional symbol pattern required by these rules."]
-        if reason in {"value range", "signed value range", "unsigned value range"}:
-            lines: List[str] = []
-            for rule in sorted(rules, key=self._rule_sort_key):
-                for eq in eqs:
-                    ok, why = self._bounds_sign_status(rule, eq)
-                    if not ok and why == reason:
-                        lines.append(self._bounds_sign_reason(rule, eq))
-                        break
-            return lines or ["numeric value range cannot overlap the visible output range with the required sign."]
 
-        lines: List[str] = []
-        grouped: Dict[Tuple[int, int], Set[int]] = {}
-        for eq in eqs:
-            grouped.setdefault((len(eq.left), len(eq.right)), set()).add(len(eq.result))
-        for (ll, rr), observed in sorted(grouped.items()):
-            # Build a small synthetic equation carrying the same operand lengths so
-            # _possible_result_lengths can be used without depending on symbols.
-            fake = Equation(raw="", left="A" * ll, right="B" * rr, op="?", result="R", has_sign=False)
-            possible = self._possible_result_lengths(rep, fake)
-            fam = rep.name
-            if rep.name == "cat":
-                capability = "concat"
-            elif rep.name.startswith("add"):
-                capability = "this add-offset rule"
-            elif rep.name.startswith("mul"):
-                capability = "this mul-offset rule"
-            elif rep.name in {"abs", "sub"}:
-                capability = "this abs/sub rule"
-            else:
-                capability = fam
-            lines.append(
-                f"for {ll}+{rr} operands, {capability} can produce output lengths {self._set_text(possible)}; observed lengths are {self._set_text(observed)}"
-            )
-        return lines
-
-    def _family_structural_summary(self, rules: Sequence[Rule], eqs: Sequence[Equation]) -> Dict[str, Any]:
-        kept: List[Rule] = []
-        eliminated: Dict[str, List[Rule]] = {}
-        reason_details: Dict[str, List[str]] = {}
-        for rule in sorted(rules, key=self._rule_sort_key):
-            ok, reason = self._structural_status(rule, eqs)
-            if ok:
-                kept.append(rule)
-            else:
-                eliminated.setdefault(reason, []).append(rule)
-        for reason, rs in eliminated.items():
-            reason_details[reason] = self._family_reason_details(reason, rs, eqs)
-        return {"kept": kept, "eliminated": eliminated, "reason_details": reason_details}
 
     @staticmethod
     @staticmethod
     def _fmt_symbol_digit(sym: Optional[str]) -> str:
         return "0" if sym is None else repr(sym)
 
-    @staticmethod
-    @staticmethod
-    def _fmt_value_set(values: Iterable[int], limit: int = 12) -> str:
-        vals = sorted(set(values))
-        if not vals:
-            return "{}"
-        if len(vals) <= limit:
-            return "{" + ",".join(str(v) for v in vals) + "}"
-        head = ",".join(str(v) for v in vals[:limit])
-        return "{" + head + f", ... {len(vals) - limit} more" + "}"
 
-    @staticmethod
-    @staticmethod
-    def _is_empty_supported_projection(event: ReplayEvent) -> bool:
-        if event.supported is None:
-            return False
-        return all(len(tuple(vals)) == 0 for vals in event.supported.values())
 
     def _leading_zero(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains, trace: ReplayTrace) -> bool:
         scope: List[str] = []
@@ -1808,10 +1241,6 @@ class CryptarithmSolver:
             n = 10 ** len(str(n))
         return out
 
-    @staticmethod
-    @staticmethod
-    def _literal(s: str) -> str:
-        return repr(s)
 
     def _low_to_high_symbols(self, term: str, rule: Rule) -> List[str]:
         # _number() reads term[::-1] for rev and term for std as high-to-low.
@@ -1840,18 +1269,6 @@ class CryptarithmSolver:
             value = value * 10 + assignment[ch]
         return value
 
-    def _observed_signature_line(self, eqs: Sequence[Equation]) -> str:
-        groups: Dict[Tuple[int, int], Dict[str, Set[Any]]] = {}
-        for eq in eqs:
-            key = (len(eq.left), len(eq.right))
-            groups.setdefault(key, {"lengths": set(), "signed": set()})
-            groups[key]["lengths"].add(len(eq.result))
-            groups[key]["signed"].add(eq.has_sign)
-        parts = []
-        for (ll, rr), data in sorted(groups.items()):
-            signed_vals = "{" + ",".join("True" if x else "False" for x in sorted(data["signed"])) + "}"
-            parts.append(f"{ll}+{rr} -> output lengths {self._set_text(data['lengths'])}, signed outputs {signed_vals}")
-        return "; ".join(parts)
 
     def _operation_candidates(self, by_op: Dict[str, List[Equation]]) -> Tuple[Dict[str, List[Rule]], Dict[str, Dict[str, int]]]:
         candidates: Dict[str, List[Rule]] = {}
@@ -1870,29 +1287,6 @@ class CryptarithmSolver:
             rejects[op] = reasons
         return candidates, rejects
 
-    def _operation_line(self, rule: Rule, a: int, b: int) -> Tuple[str, Optional[int]]:
-        value = rule.func(a, b)
-        if value is None:
-            return "invalid", None
-        if rule.name == "add":
-            return f"{a}+{b}={value}", value
-        if rule.name == "add1":
-            return f"{a}+{b}+1={value}", value
-        if rule.name == "addm1":
-            return f"{a}+{b}-1={value}", value
-        if rule.name == "mul":
-            return f"{a}*{b}={value}", value
-        if rule.name == "mul1":
-            return f"{a}*{b}+1={value}", value
-        if rule.name == "mulm1":
-            return f"{a}*{b}-1={value}", value
-        if rule.name == "abs":
-            return f"abs({a}-{b})={value}", value
-        if rule.name == "sub":
-            return f"{a}-{b}={value}", value
-        if rule.name == "cat":
-            return f"concat({a},{b})={value}", value
-        return f"{rule.name}({a},{b})={value}", value
 
     def _parse_equation(self, line: str, known_ops: Optional[Set[str]] = None) -> Optional[Equation]:
         compact = str(line).strip().replace(" ", "")
@@ -1928,24 +1322,6 @@ class CryptarithmSolver:
         equations = [eq for line in lines if (eq := self._parse_equation(line, guessed))]
         return equations, guessed
 
-    @staticmethod
-    @staticmethod
-    def _parse_operator_rule_fragment(text: str) -> Optional[Tuple[str, str]]:
-        """Parse fragments like "operator '*' -> std/mul".
-
-        This is used only by the renderer to distinguish a local candidate
-        rejection from a prefix rejection caused by a downstream operator.
-        It intentionally accepts quoted operator symbols, including escaped
-        quotes/backslashes, because cryptarithm operators are arbitrary visible
-        symbols.
-        """
-        m = re.search(
-            r"operator\s+((?:'[^']*')|(?:\"[^\"]*\")|\S+)\s*->\s*([a-z]+/[a-z0-9]+)",
-            str(text or ""),
-        )
-        if not m:
-            return None
-        return m.group(1).strip(), m.group(2).strip()
 
     def _parse_target(self, text: str, known_ops: Set[str]) -> Optional[Tuple[str, str, str, str]]:
         raw = str(text)
@@ -2001,15 +1377,6 @@ class CryptarithmSolver:
     def _preferred_operator_index(left_side: str) -> int:
         return 2 if len(left_side) >= 5 else len(left_side) // 2
 
-    def _project(
-        self,
-        domains: Domains,
-        scope: Sequence[str],
-        predicate: Callable[[Assignment], bool],
-        label: str,
-        trace: ReplayTrace,
-    ) -> Optional[bool]:
-        return self._project_replay(domains, scope, predicate, label, trace, constraint=label, kind="PROJECTION")
 
     def _project_replay(
         self,
@@ -2145,7 +1512,7 @@ class CryptarithmSolver:
             return "addition check: keep assignments satisfying the displayed sum formula"
         return "local support check: keep injective assignments satisfying the displayed formula"
 
-    def _propagate(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains, trace: Trace, target_context: Optional[Tuple[str, str, str]] = None) -> bool:
+    def _propagate(self, equations: Sequence[Equation], combo: Dict[str, Rule], domains: Domains, trace: ReplayTrace, target_context: Optional[Tuple[str, str, str]] = None) -> bool:
         while True:
             before = {ch: tuple(sorted(vals)) for ch, vals in domains.items()}
             if not self._leading_zero(equations, combo, domains, trace):
@@ -2168,117 +1535,8 @@ class CryptarithmSolver:
             if before == after:
                 return True
 
-    def _render_local_check(self, event: ReplayEvent, indent: str = "  ", result_override: Optional[str] = None) -> List[str]:
-        lines: List[str] = []
-        title = "Projection check" if event.supported is not None else "Local check"
-        lines.append(f"{indent}{title}")
-        if event.label:
-            lines.append(f"{indent}  label: {event.label}")
-        if event.constraint:
-            lines.append(f"{indent}  formula: {event.constraint}")
-        if self._cfg("show_current_domains", False):
-            lines.append(f"{indent}  current local domains: {self._domain_text_map(event.before)}")
-        lines.extend(self._render_projection_derivation(event, indent + "  "))
-        support_line = self._support_line(event, indent + "  ")
-        if support_line:
-            lines.append(support_line)
-        lines.append(f"{indent}  apply update: {self._changes_text(event.changes)}")
-        if result_override is not None:
-            result = result_override
-        elif self._is_empty_supported_projection(event):
-            result = event.reason or "no supported local digit assignment"
-        else:
-            result = event.reason or event.decision or "local check failed"
-        if result:
-            lines.append(f"{indent}  result: {result}")
-        return lines
 
-    def _render_projection_derivation(self, event: ReplayEvent, indent: str = "  ") -> List[str]:
-        if not self._cfg("show_projection_derivation", True):
-            return []
-        meta = event.meta or {}
-        proof = meta.get("projection_derivation") if isinstance(meta, dict) else None
-        if not isinstance(proof, dict):
-            return []
-        lines: List[str] = [f"{indent}projection derivation:"]
-        deriv_lines = proof.get("derivation_lines") or ()
-        if deriv_lines:
-            for line in deriv_lines:
-                lines.append(f"{indent}  {line}")
-        else:
-            # Fallback to the v2.5 generic renderer, but without large witness lists.
-            method = proof.get("method")
-            if method:
-                lines.append(f"{indent}  method: {method}")
-            scope = proof.get("scope", ())
-            if scope:
-                scope_text = ", ".join(f"D[{repr(ch)}]" for ch in scope)
-                lines.append(f"{indent}  local variables: {scope_text}")
-            sat = proof.get("satisfying_count", event.count if event.count is not None else "unknown")
-            lines.append(f"{indent}  satisfying assignments: {sat}")
-        sat = proof.get("satisfying_count", event.count if event.count is not None else "unknown")
-        lines.append(f"{indent}  satisfying assignments after column propagation: {sat}")
-        union_supported = proof.get("union_supported", ()) or ()
-        if union_supported:
-            lines.append(f"{indent}  union by symbol gives: {self._tuple_domain_text(tuple(union_supported))}")
-        return lines
 
-    def _render_structural_matching(self, by_op: Dict[str, List[Equation]], candidates: Dict[str, List[Rule]], combo: Dict[str, Rule]) -> List[str]:
-        lines: List[str] = ["Rule matching"]
-        compact = self._cfg("compact_structural_matching", True)
-        for op in sorted(by_op):
-            eqs = by_op[op]
-            lines.append(f"Operator {repr(op)}")
-            lines.append("examples: " + "; ".join(eq.display() for eq in eqs))
-            lines.append(f"structural signature: {self._observed_signature_line(eqs)}")
-            lines.append("selection policy: these blocks perform only structural pre-checks; digit consistency is checked later by rule-combo search")
-            block_idx = 1
-            for family, names in self._rule_family_order():
-                family_rules = [r for r in self.rules if r.name in names]
-                if not family_rules:
-                    continue
-                lines.append(f"Family block {block_idx}: {family}")
-                if compact:
-                    summary = self._family_structural_summary(family_rules, eqs)
-                    kept = summary["kept"]
-                    eliminated = summary["eliminated"]
-                    if kept:
-                        lines.append("  kept after structural test: " + ", ".join(self._rule_name(r) for r in kept))
-                    else:
-                        lines.append("  kept after structural test: none")
-                    if eliminated:
-                        elim_parts = []
-                        for reason, rules in sorted(eliminated.items()):
-                            elim_parts.append(f"{reason}: " + ", ".join(self._rule_name(r) for r in rules))
-                        lines.append("  eliminated by structural test: " + "; ".join(elim_parts))
-                        for reason, details in sorted(summary["reason_details"].items()):
-                            lines.append(f"  {reason} detail:")
-                            for detail in details:
-                                lines.append(f"    {detail}")
-                    else:
-                        lines.append("  eliminated by structural test: none")
-                    lines.append(f"  decision: {'family remains' if kept else 'no candidate in this family remains'}")
-                else:
-                    kept_any = False
-                    for rule in sorted(family_rules, key=self._rule_sort_key):
-                        ok, reason = self._structural_status(rule, eqs)
-                        row_details = [self._structural_reason(rule, eq) for eq in eqs]
-                        verdict = "keep" if ok else f"eliminate by structural test ({reason})"
-                        if ok:
-                            kept_any = True
-                        lines.append(f"  test {self._rule_name(rule)}: {verdict}")
-                        for detail in row_details:
-                            lines.append(f"    {detail}")
-                    lines.append(f"  decision: {'family remains' if kept_any else 'no candidate in this family remains'}")
-                block_idx += 1
-            surviving = candidates.get(op, [])
-            if surviving:
-                lines.append("surviving after structural filtering: " + ", ".join(self._rule_name(r) for r in surviving))
-                lines.append("final rule is selected later by rule-combo search")
-            else:
-                lines.append("surviving after structural filtering: none")
-            lines.append("")
-        return lines
 
     def _rule_family_order(self) -> List[Tuple[str, List[str]]]:
         return [
@@ -2288,21 +1546,6 @@ class CryptarithmSolver:
             ("mul_offset", ["mul", "mul1", "mulm1"]),
         ]
 
-    def _rule_meaning(self, rule: Rule) -> str:
-        read = "read right-to-left" if rule.reverse else "read left-to-right"
-        enc = "encode right-to-left" if rule.reverse else "encode left-to-right"
-        action = {
-            "add": "A+B",
-            "add1": "A+B+1",
-            "addm1": "A+B-1",
-            "mul": "A*B",
-            "mul1": "A*B+1",
-            "mulm1": "A*B-1",
-            "abs": "abs(A-B)",
-            "sub": "A-B, with operator sign if negative",
-            "cat": "concat(A,B)",
-        }[rule.name]
-        return f"{read}; {action}; {enc}"
 
     @staticmethod
     @staticmethod
@@ -2313,165 +1556,6 @@ class CryptarithmSolver:
         family_rank = {name: i for i, (_, names) in enumerate(self._rule_family_order()) for name in names}
         return (family_rank.get(rule.name, 99), 0 if rule.orientation == "std" else 1, rule.name)
 
-    def _audit_target_outputs(
-        self,
-        ordered_ops: Sequence[str],
-        candidates: Dict[str, List[Rule]],
-        equations: Sequence[Equation],
-        initial_domains: Domains,
-        target_left: str,
-        target_op: str,
-        target_right: str,
-        selected_answer: Optional[str],
-    ) -> Dict[str, Any]:
-        """Exhaustively audit whether the target output is invariant.
-
-        The main solver deliberately stops at the first valid solution.  This
-        audit is a separate silent search over every structurally kept rule
-        combo and every digit map that satisfies the training examples.  It is
-        allowed to stop early only when it can already prove ambiguity, or when
-        explicit audit limits/timeouts are hit; incomplete audits are rendered
-        as incomplete rather than as uniqueness proofs.
-        """
-        selected_output = selected_answer if selected_answer is not None else "nan"
-        result: Dict[str, Any] = {
-            "enabled": bool(self._cfg("include_ambiguity_audit", True)),
-            "complete": False,
-            "stopped_reason": "not run",
-            "rule_combos_tested": 0,
-            "valid_rule_combos": 0,
-            "valid_complete_solutions": 0,
-            "target_outputs": tuple(),
-            "selected_output": selected_output,
-            "decision": "audit not run",
-        }
-        if not result["enabled"]:
-            return result
-
-        max_solutions = int(self._cfg("max_audit_solutions", 100000))
-        max_rule_combos = int(self._cfg("max_audit_rule_combos", 100000))
-        stop_after_outputs = int(self._cfg("audit_stop_after_distinct_target_outputs", 2))
-        target_outputs: Set[str] = set()
-        valid_rule_combos: Set[Tuple[Tuple[str, str], ...]] = set()
-        previous_stats = dict(self.stats.__dict__)
-        stopped = {"reason": "exhausted"}
-
-        def finish(complete: bool, reason: str) -> Dict[str, Any]:
-            # Restore main-solve stats: the audit is intentionally silent and
-            # should not make replay statistics look larger than the printed
-            # replay path.  Then add explicit audit counters.
-            self.stats.__dict__.clear()
-            self.stats.__dict__.update(previous_stats)
-            self.stats.audit_rule_combos_tested = result["rule_combos_tested"]
-            self.stats.audit_valid_rule_combos = len(valid_rule_combos)
-            self.stats.audit_valid_complete_solutions = result["valid_complete_solutions"]
-            self.stats.audit_distinct_target_outputs = len(target_outputs)
-
-            outputs = tuple(sorted(target_outputs))
-            result.update({
-                "complete": complete,
-                "stopped_reason": reason,
-                "valid_rule_combos": len(valid_rule_combos),
-                "target_outputs": outputs,
-            })
-            if len(outputs) > 1:
-                result["decision"] = "ambiguous item: multiple target outputs are consistent with the training examples"
-            elif not complete:
-                result["decision"] = "target-output uniqueness was not proven"
-            elif len(outputs) == 0:
-                result["decision"] = "no valid complete solution was found during audit"
-            else:
-                only = outputs[0]
-                if only == selected_output:
-                    result["decision"] = "target output is unique over all valid complete solutions"
-                else:
-                    result["decision"] = "audit found one target output, but it differs from the selected solution output"
-            return result
-
-        def should_stop_after_output() -> bool:
-            if stop_after_outputs <= 0:
-                return False
-            if len(target_outputs) >= stop_after_outputs:
-                stopped["reason"] = f"found {len(target_outputs)} distinct target outputs; ambiguity is already proven"
-                return True
-            return False
-
-        def record_solution(combo: Dict[str, Rule], assignment: Assignment) -> bool:
-            if not self._verify_assignment(equations, combo, assignment):
-                return True
-            answer, _, _, _, _ = self._encode_target(target_left, target_op, target_right, combo[target_op], assignment)
-            target_outputs.add(answer if answer is not None else "nan")
-            result["valid_complete_solutions"] += 1
-            combo_key = tuple(sorted((op, self._rule_name(rule)) for op, rule in combo.items()))
-            valid_rule_combos.add(combo_key)
-            if result["valid_complete_solutions"] >= max_solutions:
-                stopped["reason"] = f"reached max_audit_solutions={max_solutions} before exhaustive audit"
-                return False
-            if should_stop_after_output():
-                return False
-            return True
-
-        def enumerate_digit_maps(combo: Dict[str, Rule], domains: Domains) -> bool:
-            if time.time() > self._deadline:
-                raise TimeoutError("audit timeout")
-            unresolved = [ch for ch, vals in domains.items() if len(vals) > 1]
-            if not unresolved:
-                assignment = {ch: next(iter(vals)) for ch, vals in domains.items()}
-                return record_solution(combo, assignment)
-
-            tuple_branch = self._select_column_tuple_branch(equations, combo, domains)
-            if tuple_branch is not None:
-                for tuple_assignment in tuple_branch["tuples"]:
-                    applied = self._apply_tuple_to_domains(domains, tuple_assignment)
-                    if applied is None:
-                        continue
-                    branch_domains, _changes = applied
-                    if self._propagate(equations, combo, branch_domains, SilentReplayTrace(), (target_left, target_op, target_right)):
-                        if not enumerate_digit_maps(combo, branch_domains):
-                            return False
-                return True
-
-            symbol = min(unresolved, key=lambda ch: (len(domains[ch]), ch))
-            for digit in sorted(domains[symbol]):
-                branch_domains = self._copy_domains(domains)
-                branch_domains[symbol] = {digit}
-                if self._propagate(equations, combo, branch_domains, SilentReplayTrace(), (target_left, target_op, target_right)):
-                    if not enumerate_digit_maps(combo, branch_domains):
-                        return False
-            return True
-
-        def search_rule_combos(index: int, combo: Dict[str, Rule], domains: Domains) -> bool:
-            if time.time() > self._deadline:
-                raise TimeoutError("audit timeout")
-            if index == len(ordered_ops):
-                result["rule_combos_tested"] += 1
-                if result["rule_combos_tested"] > max_rule_combos:
-                    stopped["reason"] = f"reached max_audit_rule_combos={max_rule_combos} before exhaustive audit"
-                    return False
-                combo_domains = self._copy_domains(domains)
-                if not self._propagate(equations, combo, combo_domains, SilentReplayTrace(), (target_left, target_op, target_right)):
-                    return True
-                return enumerate_digit_maps(combo, combo_domains)
-
-            op = ordered_ops[index]
-            for rule in candidates[op]:
-                combo2 = dict(combo)
-                combo2[op] = rule
-                domains2 = self._copy_domains(domains)
-                if self._propagate(equations, combo2, domains2, SilentReplayTrace(), (target_left, target_op, target_right)):
-                    if not search_rule_combos(index + 1, combo2, domains2):
-                        return False
-            return True
-
-        try:
-            completed = search_rule_combos(0, {}, self._copy_domains(initial_domains))
-            if completed:
-                return finish(True, "exhausted all structurally kept rule combos and digit maps")
-            return finish(False, stopped["reason"])
-        except TimeoutError:
-            return finish(False, "audit timeout before exhaustive proof")
-        except Exception as exc:
-            return finish(False, f"audit error: {type(exc).__name__}: {exc}")
 
     def _search_rules(
         self,
@@ -2578,11 +1662,6 @@ class CryptarithmSolver:
                 trace.extend(trace2)
         return None, None
 
-    @staticmethod
-    @staticmethod
-    def _set_text(values: Iterable[Any]) -> str:
-        vals = sorted(set(values))
-        return "{" + ",".join(str(v) for v in vals) + "}"
 
     @staticmethod
     @staticmethod
@@ -2948,60 +2027,7 @@ class CryptarithmSolver:
                 trace.extend(branch_trace)
         return None
 
-    @staticmethod
-    @staticmethod
-    def _split_decision_reason(reason: str) -> Tuple[str, str]:
-        """Split a renderer reason into ``candidate`` and ``failure`` safely.
 
-        Old code used ``text.split(":", 1)``.  That breaks when the operator
-        itself is a colon, because reasons are rendered as, for example:
-
-            operator ':' -> std/add: no supported local digit assignment
-
-        Splitting at the first colon turns the candidate into ``operator '``.
-        This helper first recognizes the structured rule-candidate prefix and
-        splits only after the ``std/add``-style rule name.  It also supports
-        quoted arbitrary operator symbols such as ``":"``, ``"'"`` and
-        ``"\"``.
-        """
-        text = str(reason or "").strip()
-        if not text:
-            return "", ""
-
-        op_lit = r"(?:\'[^\']*\'|\"[^\"]*\"|\\S+)"
-        rule_name = r"[a-z]+/[a-z0-9]+"
-
-        # Most RULE_REJECT reasons have this exact shape:
-        #   operator <op> -> <rule>: <failure>
-        m = re.match(rf"^(operator\s+{op_lit}\s*->\s*{rule_name})\s*:\s*(.*)$", text)
-        if m:
-            return m.group(1).strip(), m.group(2).strip()
-
-        # Combo strings can appear in COMBO_REJECT-like contexts.
-        # Avoid splitting inside quoted symbols and prefer the separator after
-        # a rule name whenever possible.
-        m = re.match(rf"^(.+?->\s*{rule_name})\s*:\s*(.*)$", text)
-        if m:
-            return m.group(1).strip(), m.group(2).strip()
-
-        # Digit branch reasons still use a simple form such as "'x'=3: ...";
-        # for those, a plain first-colon split is safe enough because the
-        # candidate prefix is not an operator literal expression.
-        if ":" in text:
-            head, tail = text.split(":", 1)
-            return head.strip(), tail.strip()
-        return text, text
-
-    @staticmethod
-    @staticmethod
-    def _strip_downstream_prefix(text: str) -> str:
-        """Remove the leading "operator X -> rule:" part from a downstream failure."""
-        return re.sub(
-            r"^\s*operator\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*->\s*[a-z]+/[a-z0-9]+\s*:\s*",
-            "",
-            str(text or "").strip(),
-            count=1,
-        )
 
     def _result_value_interval(self, eq: Equation) -> Tuple[int, int]:
         lo, hi = self._bounds(len(eq.result))
@@ -3058,45 +2084,7 @@ class CryptarithmSolver:
         feasible = self._intervals_overlap(value_interval, output_interval)
         return (True, "keep") if feasible else (False, "value range")
 
-    def _bounds_sign_reason(self, rule: Rule, eq: Equation) -> str:
-        value_interval = self._rule_value_interval(rule, eq)
-        output_interval = self._result_value_interval(eq)
-        sign_text = "signed" if eq.has_sign else "unsigned"
-        return (
-            f"bounds/sign check for {self._rule_name(rule)} on {eq.display()}: "
-            f"rule value range [{value_interval[0]},{value_interval[1]}], "
-            f"visible {sign_text} output range [{output_interval[0]},{output_interval[1]}]; "
-            "ranges do not overlap with the required sign -> no"
-        )
 
-    def _structural_reason(self, rule: Rule, eq: Equation) -> str:
-        if eq.has_sign and not rule.signed:
-            return f"signed output is present, but {self._rule_name(rule)} is unsigned -> no"
-        possible = self._possible_result_lengths(rule, eq)
-        actual = len(eq.result)
-        lengths = "{" + ",".join(str(x) for x in sorted(possible)) + "}"
-        if actual not in possible:
-            return f"lengths {len(eq.left)} and {len(eq.right)} can produce result length in {lengths}; actual length {actual} -> no"
-        if rule.name == "cat":
-            expected = self._cat_expected_output(eq, rule)
-            observed = eq.result
-            if expected == observed:
-                return f"concat positional check requires visible output {expected!r}; observed {observed!r} -> possible"
-            mismatch = next(
-                (idx, exp, obs)
-                for idx, (exp, obs) in enumerate(zip(expected, observed), 1)
-                if exp != obs
-            )
-            idx, exp, obs = mismatch
-            return (
-                f"concat positional check requires visible output {expected!r}; observed {observed!r}; "
-                f"first mismatch at position {idx}: expected {exp!r}, observed {obs!r}; "
-                "injective digit map forbids identifying different symbols -> no"
-            )
-        bounds_ok, _ = self._bounds_sign_status(rule, eq)
-        if not bounds_ok:
-            return self._bounds_sign_reason(rule, eq)
-        return f"lengths {len(eq.left)} and {len(eq.right)} can produce result length in {lengths}; actual length {actual}; bounds/sign ranges overlap -> possible"
 
     def _structural_status(self, rule: Rule, equations: Sequence[Equation]) -> Tuple[bool, str]:
         for eq in equations:
@@ -3116,48 +2104,11 @@ class CryptarithmSolver:
                 return False, bounds_reason
         return True, "keep"
 
-    def _suffix(self, term: str, k: int, reverse: bool) -> str:
-        return term[:k] if reverse else term[-k:]
 
     def _support_key(self, label: str, domains: Domains, scope: Sequence[str]) -> Tuple[str, Tuple[Tuple[str, Tuple[int, ...]], ...]]:
         ordered = tuple((ch, tuple(sorted(domains[ch]))) for ch in dict.fromkeys(scope))
         return (label, ordered)
 
-    def _supports(
-        self,
-        scope: Sequence[str],
-        domains: Domains,
-        predicate: Callable[[Assignment], bool],
-    ) -> Tuple[bool, Dict[str, Set[int]], int]:
-        self.stats.support_checks += 1
-        ordered = sorted(dict.fromkeys(scope), key=lambda ch: (len(domains[ch]), ch))
-        supported: Dict[str, Set[int]] = {ch: set() for ch in ordered}
-        local: Assignment = {}
-        used: Set[int] = set()
-        count = 0
-
-        def bt(i: int) -> None:
-            nonlocal count
-            if time.time() > self._deadline:
-                raise TimeoutError("timeout")
-            if i == len(ordered):
-                if predicate(local):
-                    count += 1
-                    for ch, d in local.items():
-                        supported[ch].add(d)
-                return
-            ch = ordered[i]
-            for digit in sorted(domains[ch]):
-                if digit in used:
-                    continue
-                local[ch] = digit
-                used.add(digit)
-                bt(i + 1)
-                used.remove(digit)
-                del local[ch]
-
-        bt(0)
-        return count > 0, supported, count
 
     def _supports_with_witnesses(
         self,
@@ -3239,17 +2190,6 @@ class CryptarithmSolver:
             text += f", ... {len(pairs) - limit} more"
         return f"column {idx}: surviving {name} transitions {{{text}}}"
 
-    @staticmethod
-    @staticmethod
-    def _tuple_domain_text(items: Tuple[Tuple[str, Tuple[int, ...]], ...]) -> str:
-        pieces: List[str] = []
-        for ch, vals in items:
-            if tuple(vals) == tuple(range(10)):
-                txt = "{0..9}"
-            else:
-                txt = "{" + ",".join(str(v) for v in vals) + "}"
-            pieces.append(f"D[{repr(ch)}]={txt}")
-        return "; ".join(pieces) if pieces else "none"
 
     def _use_exact_first_for_rule(self, rule: Rule) -> bool:
         return (
@@ -3267,10 +2207,6 @@ class CryptarithmSolver:
             return False
         return all(self._equation_matches(eq, combo[eq.op], assignment) for eq in equations)
 
-    @staticmethod
-    @staticmethod
-    def _witness_text(items: Tuple[Tuple[str, int], ...]) -> str:
-        return ", ".join(f"{repr(ch)}={digit}" for ch, digit in items)
 
     @staticmethod
     @staticmethod
