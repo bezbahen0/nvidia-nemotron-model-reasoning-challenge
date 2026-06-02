@@ -1,604 +1,844 @@
+from __future__ import annotations
+
 import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+
+N_BITS = 8
+
+SYM_FAMILIES = ("XOR", "OR", "AND")
+ASYM_FAMILIES = ("AND-NOT", "XOR-NOT", "OR-NOT")
+PAIR_FAMILIES = SYM_FAMILIES + ASYM_FAMILIES
+UNARY_FAMILIES = ("I", "NOT")
+CONSTANT_FAMILIES = ("0", "1")
+DEFAULT_FAMILY = "DEFAULT"
+
+SECTION_ORDER = (
+    "Identity",
+    "NOT",
+    "Constant",
+    "AND",
+    "OR",
+    "XOR",
+    "AND-NOT",
+    "OR-NOT",
+    "XOR-NOT",
+)
+
+RuleFamily = Literal[
+    "I",
+    "NOT",
+    "0",
+    "1",
+    "XOR",
+    "OR",
+    "AND",
+    "AND-NOT",
+    "XOR-NOT",
+    "OR-NOT",
+    "DEFAULT",
+]
+
+
+@dataclass(frozen=True)
+class Example:
+    input_value: str
+    output_value: str
+
+
+@dataclass(frozen=True)
+class Problem:
+    examples: List[Example]
+    question: str
+    answer: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RuleCandidate:
+    family: RuleFamily
+    primary: Optional[int]
+    secondary: Optional[int]
+    expr: str
+
+    @property
+    def is_default(self) -> bool:
+        return self.family == DEFAULT_FAMILY
+
+
+@dataclass(frozen=True)
+class Record:
+    label: str
+    col: str
+    hash_: str
+    matches: Tuple[int, ...]
+
+
+@dataclass
+class Analysis:
+    inputs: List[str]
+    outputs: List[str]
+    question_bits: str
+    output_columns: List[str]
+    input_columns: List[str]
+    records: Dict[str, List[Record]]
+    matches: Dict[str, List[List[RuleCandidate]]]
+    section_lefts: List[Tuple[str, str]]
+    section_rights: List[Tuple[str, str]]
+    selected: List[RuleCandidate]
+    answer: str
+    trace: str
+
+
+def normalize_bits(value: Any) -> str:
+    raw = "" if value is None else str(value)
+    bits = "".join(ch for ch in raw if ch in {"0", "1"})
+    if len(bits) == N_BITS:
+        return bits
+    if 0 < len(bits) < N_BITS:
+        return bits.zfill(N_BITS)
+    if len(bits) > N_BITS:
+        return bits[-N_BITS:]
+    return ""
+
+
+def parse_prompt(prompt: Any, answer: Optional[Any] = None) -> Problem:
+    text = "" if prompt is None else str(prompt)
+    examples: List[Example] = []
+
+    for line in text.splitlines():
+        if "->" not in line:
+            continue
+        left, right = line.split("->", 1)
+        left_bits = re.findall(r"(?<![01])([01]{1,8})(?![01])", left)
+        right_bits = re.findall(r"(?<![01])([01]{1,8})(?![01])", right)
+        if not left_bits or not right_bits:
+            continue
+        x = normalize_bits(left_bits[-1])
+        y = normalize_bits(right_bits[0])
+        if x and y:
+            examples.append(Example(x, y))
+
+    target_match = re.search(
+        r"(?:output\s+for|target)\s*:?\s*([01]{1,8})(?![01])",
+        text,
+        re.IGNORECASE,
+    )
+    question = normalize_bits(target_match.group(1)) if target_match else ""
+    gold = normalize_bits(answer) if answer is not None else None
+    return Problem(examples=examples, question=question, answer=gold)
+
+
+def column_bits(values: Sequence[str], bit: int) -> str:
+    return "".join(v[bit] for v in values)
+
+
+def bit_not(bit: str) -> str:
+    return "1" if bit == "0" else "0"
+
+
+def invert(bits: str) -> str:
+    return "".join(bit_not(b) for b in bits)
+
+
+def column_hash(bits: str, total_examples: int) -> str:
+    ones = bits.count("1")
+    if ones == 0 or ones == total_examples:
+        return "a"
+    return format(ones, "x")
+
+
+def evaluate_binary(a: str, b: str, family: str) -> str:
+    if family in ("AND", "AND-NOT"):
+        return "1" if a == "1" and b == "1" else "0"
+    if family in ("OR", "OR-NOT"):
+        return "1" if a == "1" or b == "1" else "0"
+    if family in ("XOR", "XOR-NOT"):
+        return "1" if a != b else "0"
+    raise ValueError(f"Unsupported family: {family}")
+
+
+def apply_family(a_bits: str, b_bits: str, family: str, invert_second: bool = False) -> str:
+    b_eff = invert(b_bits) if invert_second else b_bits
+    return "".join(evaluate_binary(a, b, family) for a, b in zip(a_bits, b_eff))
+
+
+def evaluate_rule(bits: str, rule: RuleCandidate) -> str:
+    if rule.family == DEFAULT_FAMILY:
+        return "1"
+    if rule.family == "0":
+        return "0"
+    if rule.family == "1":
+        return "1"
+    if rule.family == "I":
+        assert rule.primary is not None
+        return bits[rule.primary]
+    if rule.family == "NOT":
+        assert rule.primary is not None
+        return bit_not(bits[rule.primary])
+    if rule.family in PAIR_FAMILIES:
+        assert rule.primary is not None and rule.secondary is not None
+        a = bits[rule.primary]
+        b = bits[rule.secondary]
+        if "-NOT" in rule.family:
+            b = bit_not(b)
+        return evaluate_binary(a, b, rule.family)
+    raise ValueError(rule.family)
+
+
+def compact_rule(c: RuleCandidate) -> str:
+    if c.primary is not None and c.secondary is not None:
+        return f"{c.primary}{c.secondary}"
+    if c.primary is not None:
+        return str(c.primary)
+    return c.expr
+
+
+def format_list(cands: List[RuleCandidate], with_count: bool = False, failed: Optional[str] = None) -> str:
+    if not cands:
+        return "none"
+    if with_count:
+        parts = []
+        for i, c in enumerate(cands):
+            parts.append(c.expr if i == 0 else compact_rule(c))
+        return " ".join(parts) + f": {len(cands)}"
+    parts = [compact_rule(c) for c in cands]
+    if failed:
+        parts.append(failed)
+    return " ".join(parts)
+
+
+def find_match(candidates: List[RuleCandidate], fam: str, ep: Optional[int], es: Optional[int]) -> Optional[RuleCandidate]:
+    for c in candidates:
+        if c.family != fam:
+            continue
+        if c.primary == ep and (fam not in PAIR_FAMILIES or c.secondary == es):
+            return c
+    return None
+
+
+def exists_anywhere(all_matches: List[List[RuleCandidate]], fam: str, ep: Optional[int], es: Optional[int]) -> bool:
+    return any(find_match(bit_cands, fam, ep, es) is not None for bit_cands in all_matches)
+
+
+def fail_suffix(all_matches: List[List[RuleCandidate]], fam: str, ep: Optional[int], es: Optional[int]) -> str:
+    return "y" if exists_anywhere(all_matches, fam, ep, es) else "x"
+
+
+def find_all_left_runs(all_matches: List[List[RuleCandidate]]) -> List[Tuple[List[RuleCandidate], Optional[str]]]:
+    if not all_matches or not all_matches[0]:
+        return []
+
+    runs: List[Tuple[List[RuleCandidate], Optional[str]]] = []
+    for start_cand in all_matches[0]:
+        fam = start_cand.family
+        chain = [start_cand]
+        cur_p, cur_s = start_cand.primary, start_cand.secondary
+        failed_next: Optional[str] = None
+
+        for out_idx in range(1, len(all_matches)):
+            ep = (cur_p + 1) % N_BITS if cur_p is not None else None
+            es = (cur_s + 1) % N_BITS if cur_s is not None else None
+            found = find_match(all_matches[out_idx], fam, ep, es)
+            if found is None:
+                suffix = fail_suffix(all_matches, fam, ep, es)
+                if ep is not None and es is not None:
+                    failed_next = f"{ep}{es}{suffix}"
+                elif ep is not None:
+                    failed_next = f"{ep}{suffix}"
+                break
+            chain.append(found)
+            cur_p, cur_s = ep, es
+        runs.append((chain, failed_next))
+    return runs
+
+
+def find_all_right_runs(all_matches: List[List[RuleCandidate]]) -> List[Tuple[List[RuleCandidate], Optional[str]]]:
+    n = len(all_matches)
+    if not all_matches or not all_matches[-1]:
+        return []
+
+    runs: List[Tuple[List[RuleCandidate], Optional[str]]] = []
+    for end_cand in all_matches[-1]:
+        fam = end_cand.family
+        chain = [end_cand]
+        cur_p, cur_s = end_cand.primary, end_cand.secondary
+        failed_next: Optional[str] = None
+
+        for step in range(1, n):
+            out_idx = n - 1 - step
+            pp = (cur_p - 1) % N_BITS if cur_p is not None else None
+            ps = (cur_s - 1) % N_BITS if cur_s is not None else None
+            found = find_match(all_matches[out_idx], fam, pp, ps)
+            if found is None:
+                suffix = fail_suffix(all_matches, fam, pp, ps)
+                if pp is not None and ps is not None:
+                    failed_next = f"{pp}{ps}{suffix}"
+                elif pp is not None:
+                    failed_next = f"{pp}{suffix}"
+                break
+            chain.insert(0, found)
+            cur_p, cur_s = pp, ps
+        runs.append((chain, failed_next))
+    return runs
+
+
+def lr_from_matches(all_matches: List[List[RuleCandidate]]) -> Tuple[List[str], str, List[str], str]:
+    left_runs = find_all_left_runs(all_matches)
+    right_runs = find_all_right_runs(all_matches)
+    left_run = max(left_runs, key=lambda t: len(t[0])) if left_runs else ([], None)
+    right_run = max(right_runs, key=lambda t: len(t[0])) if right_runs else ([], None)
+
+    left_lines = [format_list(chain, failed=failed) for chain, failed in left_runs] if left_runs else ["none"]
+    left_best = format_list(left_run[0], with_count=True)
+
+    right_lines = [format_list(list(reversed(chain)), failed=failed) for chain, failed in right_runs] if right_runs else ["none"]
+    right_best = format_list(list(reversed(right_run[0])), with_count=True)
+    return left_lines, left_best, right_lines, right_best
+
+
+def parse_count(val: str) -> int:
+    if val == "none":
+        return 0
+    try:
+        return int(val.rsplit(": ", 1)[-1])
+    except Exception:
+        return 0
+
+
+def pick_winner(entries: List[Tuple[str, str]]) -> Tuple[Optional[str], str, int]:
+    best_name: Optional[str] = None
+    best_text = "none"
+    best_count = 0
+    for name, val in entries:
+        count = parse_count(val)
+        if count > best_count:
+            best_count = count
+            best_name = name
+            best_text = val
+    return best_name, best_text, best_count
 
 
 class BitManipulationSolver:
-    def __init__(self, max_macro_proof_examples=10):
-        self.ops = {
-            'I': lambda a, b: a,
-            'NOT': lambda a, b: 1 - a,
-            'C0': lambda a, b: 0,
-            'C1': lambda a, b: 1,
-            'AND': lambda a, b: a & b,
-            'OR': lambda a, b: a | b,
-            'XOR': lambda a, b: a ^ b,
-            'AND-NOT': lambda a, b: a & (1 - b),
-            'OR-NOT': lambda a, b: a | (1 - b),
-            'XOR-NOT': lambda a, b: a ^ (1 - b),
-        }
-
-        self.bin_ops_keys = ['AND', 'OR', 'XOR', 'AND-NOT', 'OR-NOT', 'XOR-NOT']
-        self.SECTION_ORDER = ['I', 'NOT', 'C0', 'C1'] + self.bin_ops_keys
-        self.max_macro_proof_examples = max_macro_proof_examples
-
-    def _normalize_bits(self, value):
-        bits = re.sub(r'[^01]', '', value)
-
-        if not bits:
-            return ''
-
-        if len(bits) < 8:
-            return bits.zfill(8)
-
-        if len(bits) == 8:
-            return bits
-
-        return bits[-8:]
-
-    def _parse_prompt(self, prompt):
-        examples = []
-
-        for line in prompt.splitlines():
-            if '->' not in line:
-                continue
-
-            left, right = line.split('->', 1)
-
-            left_tokens = re.findall(r'(?<![01])([01]{1,8})(?![01])', left)
-            right_tokens = re.findall(r'(?<![01])([01]{1,8})(?![01])', right)
-
-            if left_tokens and right_tokens:
-                in_str = self._normalize_bits(left_tokens[-1])
-                out_str = self._normalize_bits(right_tokens[0])
-            else:
-                in_str = self._normalize_bits(left)
-                out_str = self._normalize_bits(right)
-
-            if len(in_str) == 8 and len(out_str) == 8:
-                examples.append((in_str, out_str))
-
-        target_match = re.search(
-            r'(?:output\s+for|target)\s*:?\s*([01]{1,8})(?![01])',
-            prompt,
-            re.IGNORECASE,
-        )
-
-        if not target_match:
-            return examples, ''
-
-        target_input = self._normalize_bits(target_match.group(1))
-        return examples, target_input
-
-    def _get_valid_rules(self, examples, out_idx):
-        valid = []
-
-        for op_name in self.SECTION_ORDER:
-            op_func = self.ops[op_name]
-
-            if op_name in ['C0', 'C1']:
-                if all(int(ex_out[out_idx]) == op_func(0, 0) for _, ex_out in examples):
-                    valid.append((op_name, -1, -1))
-
-            elif op_name in ['I', 'NOT']:
-                for in1 in range(8):
-                    if all(
-                        int(ex_out[out_idx]) == op_func(int(ex_in[in1]), 0)
-                        for ex_in, ex_out in examples
-                    ):
-                        valid.append((op_name, in1, -1))
-
-            else:
-                for in1 in range(8):
-                    for in2 in range(8):
-                        is_valid = True
-
-                        for ex_in, ex_out in examples:
-                            if op_func(int(ex_in[in1]), int(ex_in[in2])) != int(ex_out[out_idx]):
-                                is_valid = False
-                                break
-
-                        if is_valid:
-                            valid.append((op_name, in1, in2))
-
-        return valid
-
-    def _detect_macro_pattern(self, examples):
-        if all(
-            ex_out == ''.join('1' if bit == '0' else '0' for bit in ex_in)
-            for ex_in, ex_out in examples
-        ):
-            return 'NOT_ALL', 'invert all bits'
-
-        for shift in range(1, 8):
-            if all(ex_out == ex_in[shift:] + ex_in[:shift] for ex_in, ex_out in examples):
-                return f'ROL_{shift}', f'rotate left by {shift}'
-
-            if all(ex_out == ex_in[-shift:] + ex_in[:-shift] for ex_in, ex_out in examples):
-                return f'ROR_{shift}', f'rotate right by {shift}'
-
-            if all(ex_out == ex_in[shift:] + '0' * shift for ex_in, ex_out in examples):
-                return f'SHL_{shift}', f'shift left by {shift}, padding with 0'
-
-            if all(ex_out == '0' * shift + ex_in[:-shift] for ex_in, ex_out in examples):
-                return f'SHR_{shift}', f'shift right by {shift}, padding with 0'
-
-            if all(ex_out == ex_in[shift:] + '1' * shift for ex_in, ex_out in examples):
-                return f'SHL_1_{shift}', f'shift left by {shift}, padding with 1'
-
-            if all(ex_out == '1' * shift + ex_in[:-shift] for ex_in, ex_out in examples):
-                return f'SHR_1_{shift}', f'shift right by {shift}, padding with 1'
-
-        return None, None
-
-    def _apply_macro_pattern(self, pattern_id, target_input):
-        if pattern_id == 'NOT_ALL':
-            return ''.join('1' if bit == '0' else '0' for bit in target_input)
-
-        if pattern_id.startswith('ROL_'):
-            shift = int(pattern_id.split('_')[1])
-            return target_input[shift:] + target_input[:shift]
-
-        if pattern_id.startswith('ROR_'):
-            shift = int(pattern_id.split('_')[1])
-            return target_input[-shift:] + target_input[:-shift]
-
-        if pattern_id.startswith('SHL_1_'):
-            shift = int(pattern_id.split('_')[2])
-            return target_input[shift:] + '1' * shift
-
-        if pattern_id.startswith('SHR_1_'):
-            shift = int(pattern_id.split('_')[2])
-            return '1' * shift + target_input[:-shift]
-
-        if pattern_id.startswith('SHL_'):
-            shift = int(pattern_id.split('_')[1])
-            return target_input[shift:] + '0' * shift
-
-        if pattern_id.startswith('SHR_'):
-            shift = int(pattern_id.split('_')[1])
-            return '0' * shift + target_input[:-shift]
-
-        return ''
-
-    def _find_best_runs(self, flat_matches):
-        best_left_run = []
-        best_right_run = []
-
-        if flat_matches[0]:
-            for cand in flat_matches[0]:
-                run = [cand]
-                op, in1, in2 = cand
-
-                for i in range(1, 8):
-                    exp_in1 = (in1 + i) % 8 if in1 != -1 else -1
-                    exp_in2 = (in2 + i) % 8 if in2 != -1 else -1
-
-                    if (op, exp_in1, exp_in2) in flat_matches[i]:
-                        run.append((op, exp_in1, exp_in2))
-                    else:
-                        break
-
-                if len(run) > len(best_left_run):
-                    best_left_run = run
-
-        if flat_matches[7]:
-            for cand in flat_matches[7]:
-                run = [cand]
-                op, in1, in2 = cand
-
-                for step in range(1, 8):
-                    i = 7 - step
-                    exp_in1 = (in1 - step) % 8 if in1 != -1 else -1
-                    exp_in2 = (in2 - step) % 8 if in2 != -1 else -1
-
-                    if (op, exp_in1, exp_in2) in flat_matches[i]:
-                        run.insert(0, (op, exp_in1, exp_in2))
-                    else:
-                        break
-
-                if len(run) > len(best_right_run):
-                    best_right_run = run
-
-        return best_left_run, best_right_run
-
-    def _select_final_rules(self, flat_matches):
-        best_left_run, best_right_run = self._find_best_runs(flat_matches)
-
-        len_l = len(best_left_run)
-        len_r = len(best_right_run)
-
-        if len_l + len_r > 8:
-            if len_r > len_l:
-                len_l = 8 - len_r
-                best_left_run = best_left_run[:len_l]
-            else:
-                len_r = 8 - len_l
-                best_right_run = best_right_run[-len_r:] if len_r > 0 else []
-
-        final_rules = [None] * 8
-
-        for i in range(len_l):
-            final_rules[i] = best_left_run[i]
-
-        for i in range(len_r):
-            out_idx = 8 - len_r + i
-            final_rules[out_idx] = best_right_run[i]
-
-        for out_idx in range(8):
-            if final_rules[out_idx] is None:
-                if flat_matches[out_idx]:
-                    final_rules[out_idx] = flat_matches[out_idx][0]
-                else:
-                    final_rules[out_idx] = ('UNKNOWN', -1, -1)
-
-        return final_rules
-
-    def _expected_column(self, examples, out_idx):
-        return ''.join(ex_out[out_idx] for _, ex_out in examples)
-
-    def _apply_rule(self, rule, input_bits):
-        op, in1, in2 = rule
-
-        if op == 'UNKNOWN':
-            return 1
-
-        if op in ['C0', 'C1']:
-            return self.ops[op](0, 0)
-
-        if op in ['I', 'NOT']:
-            return self.ops[op](int(input_bits[in1]), 0)
-
-        return self.ops[op](int(input_bits[in1]), int(input_bits[in2]))
-
-    def _rule_column(self, rule, examples):
-        op, _, _ = rule
-
-        if op == 'UNKNOWN':
-            return '?' * len(examples)
-
-        return ''.join(str(self._apply_rule(rule, ex_in)) for ex_in, _ in examples)
-
-    def _rule_to_text(self, rule):
-        op, in1, in2 = rule
-
-        if op == 'UNKNOWN':
-            return 'UNKNOWN'
-
-        if op == 'C0':
-            return '0'
-
-        if op == 'C1':
-            return '1'
-
-        if op == 'I':
-            return f'in[{in1}]'
-
-        if op == 'NOT':
-            return f'NOT(in[{in1}])'
-
-        return f'{op}(in[{in1}], in[{in2}])'
-
-    def _rule_assignment_text(self, out_idx, rule):
-        return f'out[{out_idx}] = {self._rule_to_text(rule)}'
-
-    def _operation_eval_text(self, rule, input_bits):
-        op, in1, in2 = rule
-
-        if op == 'UNKNOWN':
-            return 'UNKNOWN -> fallback 1', 1
-
-        if op == 'C0':
-            return '0', 0
-
-        if op == 'C1':
-            return '1', 1
-
-        if op == 'I':
-            v1 = int(input_bits[in1])
-            return f'in[{in1}] = {v1}', v1
-
-        if op == 'NOT':
-            v1 = int(input_bits[in1])
-            result = self.ops[op](v1, 0)
-            return f'NOT(in[{in1}]) = NOT({v1}) = {result}', result
-
-        v1 = int(input_bits[in1])
-        v2 = int(input_bits[in2])
-        result = self.ops[op](v1, v2)
-
-        if op == 'AND':
-            return f'AND(in[{in1}], in[{in2}]) = AND({v1}, {v2}) = {result}', result
-
-        if op == 'OR':
-            return f'OR(in[{in1}], in[{in2}]) = OR({v1}, {v2}) = {result}', result
-
-        if op == 'XOR':
-            return f'XOR(in[{in1}], in[{in2}]) = XOR({v1}, {v2}) = {result}', result
-
-        if op == 'AND-NOT':
-            return f'AND-NOT(in[{in1}], in[{in2}]) = {v1} AND NOT({v2}) = {result}', result
-
-        if op == 'OR-NOT':
-            return f'OR-NOT(in[{in1}], in[{in2}]) = {v1} OR NOT({v2}) = {result}', result
-
-        if op == 'XOR-NOT':
-            return f'XOR-NOT(in[{in1}], in[{in2}]) = {v1} XOR NOT({v2}) = {result}', result
-
-        return f'{op}(in[{in1}], in[{in2}]) = {result}', result
-
-    def _rule_input_signature(self, rule):
-        op, in1, in2 = rule
-
-        if op in ['C0', 'C1', 'UNKNOWN']:
+    """
+    Tonghuikang-style bit manipulation solver.
+
+    Public interface expected by your generator:
+        solver = BitManipulationSolver()
+        cot = solver.generate_cot(prompt)
+        answer = solver.extract_answer(cot)
+
+    The trace is intentionally a column-matching reasoning trace, not a brute-force
+    global transform search ledger.
+    """
+
+    def analyze(self, prompt: Any, answer: Optional[Any] = None) -> Optional[Analysis]:
+        problem = parse_prompt(prompt, answer)
+        if not problem.examples or not problem.question:
             return None
 
-        if op in ['I', 'NOT']:
-            return (in1,)
+        inputs = [normalize_bits(ex.input_value) for ex in problem.examples]
+        outputs = [normalize_bits(ex.output_value) for ex in problem.examples]
+        question_bits = normalize_bits(problem.question)
+        if any(not b for b in inputs + outputs) or not question_bits:
+            return None
 
-        return (in1, in2)
+        n_examples = len(outputs)
+        output_columns = [column_bits(outputs, i) for i in range(N_BITS)]
+        input_columns = [column_bits(inputs, i) for i in range(N_BITS)]
+        input_inverted = [invert(c) for c in input_columns]
 
-    def _is_shifted_from_previous(self, previous_rule, current_rule):
-        previous_op, _, _ = previous_rule
-        current_op, _, _ = current_rule
+        records: Dict[str, List[Record]] = {name: [] for name in SECTION_ORDER}
+        matches: Dict[str, List[List[RuleCandidate]]] = {name: [[] for _ in range(N_BITS)] for name in SECTION_ORDER}
 
-        if previous_op != current_op:
-            return False
+        for out_idx, out_col in enumerate(output_columns):
+            for i_col, in_col in enumerate(input_columns):
+                if in_col == out_col:
+                    matches["Identity"][out_idx].append(RuleCandidate("I", i_col, None, f"I{i_col}"))
+                if input_inverted[i_col] == out_col:
+                    matches["NOT"][out_idx].append(RuleCandidate("NOT", i_col, None, f"NOT{i_col}"))
+            if out_col.count("1") == 0:
+                matches["Constant"][out_idx].append(RuleCandidate("0", None, None, "C0"))
+            if out_col.count("1") == n_examples:
+                matches["Constant"][out_idx].append(RuleCandidate("1", None, None, "C1"))
 
-        previous_signature = self._rule_input_signature(previous_rule)
-        current_signature = self._rule_input_signature(current_rule)
+        for label, col in zip([str(i) for i in range(N_BITS)], input_columns):
+            m = tuple(i for i, oc in enumerate(output_columns) if col == oc)
+            records["Identity"].append(Record(label, col, column_hash(col, n_examples), m))
 
-        if previous_signature is None or current_signature is None:
-            return False
+        for label, col in zip([str(i) for i in range(N_BITS)], input_inverted):
+            m = tuple(i for i, oc in enumerate(output_columns) if col == oc)
+            records["NOT"].append(Record(label, col, column_hash(col, n_examples), m))
 
-        if len(previous_signature) != len(current_signature):
-            return False
+        for val in ("0", "1"):
+            col = val * n_examples
+            m = tuple(i for i, oc in enumerate(output_columns) if col == oc)
+            records["Constant"].append(Record(val, col, column_hash(col, n_examples), m))
 
-        return all(
-            (previous_signature[idx] + 1) % 8 == current_signature[idx]
-            for idx in range(len(previous_signature))
+        for fam in ("XOR", "OR", "AND"):
+            for circ_diff in range(1, N_BITS // 2 + 1):
+                n_pairs = N_BITS // 2 if circ_diff == N_BITS // 2 else N_BITS
+                for a in range(n_pairs):
+                    b = (a + circ_diff) % N_BITS
+                    lo, hi = min(a, b), max(a, b)
+                    col = apply_family(input_columns[lo], input_columns[hi], fam)
+                    m = tuple(i for i, oc in enumerate(output_columns) if col == oc)
+                    records[fam].append(Record(f"{a}{b} {b}{a}", col, column_hash(col, n_examples), m))
+                    for out_idx in m:
+                        matches[fam][out_idx].append(RuleCandidate(fam, a, b, f"{fam}{a}{b}"))
+                        matches[fam][out_idx].append(RuleCandidate(fam, b, a, f"{fam}{b}{a}"))
+
+        for fam in ("AND-NOT", "XOR-NOT", "OR-NOT"):
+            for diff in range(1, N_BITS):
+                for a in range(N_BITS):
+                    b = (a + diff) % N_BITS
+                    col = apply_family(input_columns[a], input_columns[b], fam, invert_second=True)
+                    m = tuple(i for i, oc in enumerate(output_columns) if col == oc)
+                    records[fam].append(Record(f"{a}{b}", col, column_hash(col, n_examples), m))
+                    for out_idx in m:
+                        matches[fam][out_idx].append(RuleCandidate(fam, a, b, f"{fam}{a}{b}"))
+
+        for name in ("Identity", "NOT", "Constant"):
+            records[name].sort(key=lambda r: r.label)
+
+        lines: List[str] = []
+        lines.append("We need to deduce the transformation by matching the example outputs.")
+        lines.append("I will put my final answer inside \\boxed{}.")
+        lines.append("")
+
+        for i, out in enumerate(outputs):
+            lines.append(f"Output {i}: {out}")
+            for bit in range(N_BITS):
+                lines.append(f"{bit} {out[bit]}")
+            lines.append("")
+
+        lines.append("Output bit columns (with bitsum as hash)")
+        for bit in range(N_BITS):
+            lines.append(f"{bit} {output_columns[bit]} {column_hash(output_columns[bit], n_examples)}")
+        lines.append("")
+
+        for i, inp in enumerate(inputs):
+            lines.append(f"Input {i}: {inp}")
+            for bit in range(N_BITS):
+                lines.append(f"{bit} {inp[bit]}")
+            lines.append("")
+
+        lines.append("When matching output")
+        lines.append("x: not in operator")
+        lines.append("y: wrong position")
+        lines.append("")
+
+        section_lefts: List[Tuple[str, str]] = []
+        section_rights: List[Tuple[str, str]] = []
+
+        def add_section(name: str) -> None:
+            section_records = records[name]
+            per_bit = matches[name]
+            lines.append(name)
+            prev_diff: Optional[int] = None
+            for rec in section_records:
+                if len(rec.label) >= 2 and rec.label[0].isdigit() and rec.label[1].isdigit():
+                    diff = (int(rec.label[1]) - int(rec.label[0])) % N_BITS
+                    if prev_diff is not None and diff != prev_diff:
+                        lines.append("")
+                    prev_diff = diff
+                line = f"{rec.label} {rec.col} {rec.hash_}"
+                if rec.matches:
+                    line += " match " + " ".join(str(i) for i in rec.matches)
+                lines.append(line)
+
+            lines.append("")
+            lines.append("Matching output")
+            for i in range(N_BITS):
+                cands = per_bit[i]
+                if cands:
+                    lines.append(f"{i} " + " ".join(compact_rule(c) for c in cands))
+                else:
+                    lines.append(f"{i} absent")
+            lines.append("")
+
+            left_lines, left_best, right_lines, right_best = lr_from_matches(per_bit)
+            section_lefts.append((name, left_best))
+            section_rights.append((name, right_best))
+
+            lines.append("Left")
+            lines.extend(left_lines)
+            lines.append(f"Best: {left_best}")
+            lines.append("")
+            lines.append("Right")
+            lines.extend(right_lines)
+            lines.append(f"Best: {right_best}")
+            lines.append("")
+
+        for name in SECTION_ORDER:
+            add_section(name)
+
+        lines.append("Selecting")
+        lines.append("")
+        left_name, left_text, left_count = pick_winner(section_lefts)
+        right_name, right_text, right_count = pick_winner(section_rights)
+
+        def get_section_run(winner: Optional[str], direction: str) -> List[RuleCandidate]:
+            if winner is None:
+                return []
+            per_bit = matches[winner]
+            runs = find_all_left_runs(per_bit) if direction == "left" else find_all_right_runs(per_bit)
+            if not runs:
+                return []
+            chain, _ = max(runs, key=lambda t: len(t[0]))
+            return chain
+
+        left_run = get_section_run(left_name, "left")
+        right_run = get_section_run(right_name, "right")
+
+        lines.append("Lefts")
+        for name, lb in section_lefts:
+            lines.append(f"{name} {lb}")
+        lines.append("")
+        lines.append("Rights")
+        for name, rb in section_rights:
+            lines.append(f"{name} {rb}")
+        lines.append("")
+        lines.append(f"Left longest: {left_count}")
+        lines.append(f"Right longest: {right_count}")
+        lines.append("")
+
+        def matching_line(label: str, winner_name: Optional[str], entries: List[Tuple[str, str]]) -> str:
+            parts = [f"{name} {'yes' if name == winner_name else 'no'}" for name, _ in entries]
+            return f"{label} winner: {', '.join(parts)}"
+
+        if right_count > left_count:
+            lines.append(matching_line("Right", right_name, section_rights))
+            lines.append(matching_line("Left", left_name, section_lefts))
+            lines.append("")
+            lines.append(f"Best right: {right_text}")
+            lines.append(f"Best left: {left_text}")
+        else:
+            lines.append(matching_line("Left", left_name, section_lefts))
+            lines.append(matching_line("Right", right_name, section_rights))
+            lines.append("")
+            lines.append(f"Best left: {left_text}")
+            lines.append(f"Best right: {right_text}")
+        lines.append("")
+
+        left_len = left_count
+        right_len = right_count
+        if left_len + right_len > N_BITS:
+            if right_len > left_len:
+                left_len = N_BITS - right_len
+                left_run = left_run[:left_len]
+            else:
+                right_len = N_BITS - left_len
+                right_run = right_run[-right_len:] if right_len else []
+
+        left_was_trunc = left_len < left_count
+        right_was_trunc = right_len < right_count
+        trunc_left = f"Truncated left: {format_list(left_run, with_count=True)}" + (" truncated" if left_was_trunc else "")
+        trunc_right = f"Truncated right: {format_list(list(reversed(right_run)), with_count=True)}" + (" truncated" if right_was_trunc else "")
+        if right_count > left_count:
+            lines.append(trunc_right)
+            lines.append(trunc_left)
+        else:
+            lines.append(trunc_left)
+            lines.append(trunc_right)
+        lines.append("")
+
+        right_start = N_BITS - right_len
+        best: List[RuleCandidate] = [RuleCandidate(DEFAULT_FAMILY, None, None, "default 1") for _ in range(N_BITS)]
+        for i, rc in enumerate(left_run):
+            best[i] = rc
+        for i, rc in enumerate(right_run):
+            best[right_start + i] = rc
+
+        lines.append("Tentative from right")
+        for i in range(N_BITS - 1, -1, -1):
+            if i >= right_start and right_run:
+                lines.append(f"{i} {right_run[i - right_start].expr}")
+            else:
+                lines.append(f"{i} pending")
+        lines.append("")
+
+        lines.append("Tentative")
+        for i in range(N_BITS):
+            if i < left_len:
+                lines.append(f"{i} {left_run[i].expr}")
+            elif i >= right_start and right_run:
+                lines.append(f"{i} {right_run[i - right_start].expr}")
+            else:
+                lines.append(f"{i} pending")
+        lines.append("")
+
+        def extrap_from(run: List[RuleCandidate], bit: int, run_start: int, side: str) -> Optional[str]:
+            if not run:
+                return None
+            r = run[0]
+            if r.primary is not None:
+                p_off = (r.primary - run_start) % N_BITS
+                ep = (p_off + bit) % N_BITS
+            else:
+                ep = None
+            if r.secondary is not None:
+                s_off = (r.secondary - run_start) % N_BITS
+                es = (s_off + bit) % N_BITS
+            else:
+                es = None
+            if ep is not None and es is not None:
+                return f"?{ep}{es}"
+            if ep is not None:
+                return f"?{ep}?" if side == "left" else f"??{ep}"
+            return None
+
+        left_fam = left_run[0].family if left_run else None
+        right_fam = right_run[0].family if right_run else None
+        left_binary_or_unary = bool(left_fam and (left_fam in PAIR_FAMILIES or left_fam in UNARY_FAMILIES))
+        right_binary_or_unary = bool(right_fam and (right_fam in PAIR_FAMILIES or right_fam in UNARY_FAMILIES))
+        left_unary = bool(left_fam and left_fam in UNARY_FAMILIES)
+        right_unary = bool(right_fam and right_fam in UNARY_FAMILIES)
+
+        if right_count > left_count:
+            preferred: List[str] = []
+            for i in range(N_BITS):
+                if i >= right_start and right_run:
+                    preferred.append(right_run[i - right_start].expr)
+                elif i < left_len:
+                    preferred.append(left_run[i].expr)
+                elif right_binary_or_unary:
+                    preferred.append(extrap_from(right_run, i, right_start, "right") or "pending")
+                else:
+                    preferred.append("pending")
+
+            lines.append("Preferred from right")
+            for i in range(N_BITS - 1, -1, -1):
+                lines.append(f"{i} {preferred[i]}")
+            lines.append("")
+
+            for i in range(N_BITS):
+                if preferred[i] == "pending":
+                    preferred[i] = extrap_from(left_run, i, 0, "left") if left_binary_or_unary else "?"
+                    preferred[i] = preferred[i] or "?"
+                elif "?" in preferred[i][1:] and left_unary:
+                    el = extrap_from(left_run, i, 0, "left")
+                    if el:
+                        merged = list(preferred[i])
+                        for j, ch in enumerate(el[: len(merged)]):
+                            if j > 0 and merged[j] == "?" and ch != "?":
+                                merged[j] = ch
+                        preferred[i] = "".join(merged)
+
+            lines.append("Preferred from left")
+            for i in range(N_BITS):
+                lines.append(f"{i} {preferred[i]}")
+            lines.append("")
+        else:
+            preferred = []
+            for i in range(N_BITS):
+                if i < left_len:
+                    preferred.append(left_run[i].expr)
+                elif i >= right_start and right_run:
+                    preferred.append(right_run[i - right_start].expr)
+                elif left_binary_or_unary:
+                    preferred.append(extrap_from(left_run, i, 0, "left") or "pending")
+                else:
+                    preferred.append("pending")
+
+            lines.append("Preferred from left")
+            for i in range(N_BITS):
+                lines.append(f"{i} {preferred[i]}")
+            lines.append("")
+
+            for i in range(N_BITS):
+                if preferred[i] == "pending":
+                    preferred[i] = extrap_from(right_run, i, right_start, "right") if right_binary_or_unary else "?"
+                    preferred[i] = preferred[i] or "?"
+                elif "?" in preferred[i][1:] and right_unary:
+                    er = extrap_from(right_run, i, right_start, "right")
+                    if er:
+                        merged = list(preferred[i])
+                        for j, ch in enumerate(er[: len(merged)]):
+                            if j > 0 and merged[j] == "?" and ch != "?":
+                                merged[j] = ch
+                        preferred[i] = "".join(merged)
+
+            lines.append("Preferred from right")
+            for i in range(N_BITS - 1, -1, -1):
+                lines.append(f"{i} {preferred[i]}")
+            lines.append("")
+
+        lines.append("Preferred")
+        for i, pref in enumerate(preferred):
+            if pref.startswith("?") and len(pref) == 3 and pref[1] != "?" and pref[2] != "?":
+                lines.append(f"{i} {pref} ?{pref[2]}{pref[1]}")
+            else:
+                lines.append(f"{i} {pref}")
+        lines.append("")
+
+        lines.append("Matching")
+        pending_indices: List[int] = []
+        per_bit_cat: Dict[str, Dict[int, List[RuleCandidate]]] = {name: {} for name in SECTION_ORDER}
+
+        for i in range(N_BITS):
+            pref = preferred[i]
+            if not pref.startswith("?") or pref == "?":
+                lines.append(f"{i} {best[i].expr}")
+                continue
+
+            pending_indices.append(i)
+            pref_digits = [int(d) for d in pref[1:] if d != "?"]
+            checks: List[str] = []
+
+            for section_name in SECTION_ORDER:
+                cands = matches[section_name][i]
+                if section_name in ("Identity", "NOT"):
+                    found = [c for c in cands if c.primary in pref_digits]
+                    if found:
+                        checks.append(section_name + " " + " ".join(c.expr for c in found))
+                        per_bit_cat[section_name][i] = found
+                    else:
+                        checks.append(f"{section_name} absent")
+                elif section_name == "Constant":
+                    if cands:
+                        checks.append("Constant " + " ".join(c.expr for c in cands))
+                        per_bit_cat[section_name][i] = list(cands)
+                    else:
+                        checks.append("Constant absent")
+                else:
+                    found_c: Optional[RuleCandidate] = None
+                    want_p = int(pref[1]) if len(pref) > 1 and pref[1] != "?" else None
+                    want_s = int(pref[2]) if len(pref) > 2 and pref[2] != "?" else None
+                    orderings = [(want_p, want_s)]
+                    if want_p is not None and want_s is not None and want_p != want_s:
+                        orderings.append((want_s, want_p))
+                    for wp, ws in orderings:
+                        for c in cands:
+                            if (wp is None or c.primary == wp) and (ws is None or c.secondary == ws):
+                                found_c = c
+                                break
+                        if found_c is not None:
+                            break
+                    if found_c is not None:
+                        checks.append(found_c.expr)
+                        per_bit_cat[section_name][i] = [found_c]
+                    else:
+                        checks.append(f"{section_name} absent")
+
+            pref_display = f"{pref} ?{pref[2]}{pref[1]}" if pref.startswith("?") and len(pref) == 3 and pref[1] != "?" and pref[2] != "?" else pref
+            lines.append(f"{i} {pref_display} - {', '.join(checks)}")
+        lines.append("")
+
+        lines.append("Perfect match")
+        chosen_cat: Optional[str] = None
+        for cat in SECTION_ORDER:
+            is_perfect = chosen_cat is None and bool(pending_indices) and all(i in per_bit_cat[cat] for i in pending_indices)
+            lines.append(f"{cat} {'yes' if is_perfect else 'no'}")
+            if is_perfect:
+                chosen_cat = cat
+        lines.append("")
+
+        lines.append("Matched")
+        pending_set = set(pending_indices)
+        for i in range(N_BITS):
+            if i in pending_set:
+                if chosen_cat and i in per_bit_cat[chosen_cat]:
+                    best[i] = per_bit_cat[chosen_cat][i][0]
+                    lines.append(f"{i} {best[i].expr}")
+                else:
+                    all_cands: List[RuleCandidate] = []
+                    for name in SECTION_ORDER:
+                        all_cands.extend(per_bit_cat[name].get(i, []))
+                    if all_cands:
+                        best[i] = all_cands[0]
+                        lines.append(f"{i} " + " ".join(c.expr for c in all_cands))
+                    else:
+                        best[i] = RuleCandidate(DEFAULT_FAMILY, None, None, "default 1")
+                        lines.append(f"{i} none")
+            else:
+                lines.append(f"{i} {best[i].expr}")
+        lines.append("")
+
+        lines.append("Selected")
+        for i, rule in enumerate(best):
+            lines.append(f"{i} {rule.expr}")
+        lines.append("")
+
+        answer_bits = self._emit_apply(lines, question_bits, best)
+        trace = "\n".join(lines)
+        return Analysis(
+            inputs=inputs,
+            outputs=outputs,
+            question_bits=question_bits,
+            output_columns=output_columns,
+            input_columns=input_columns,
+            records=records,
+            matches=matches,
+            section_lefts=section_lefts,
+            section_rights=section_rights,
+            selected=best,
+            answer=answer_bits,
+            trace=trace,
         )
 
-    def _is_same_constant_or_unknown(self, previous_rule, current_rule):
-        previous_op, _, _ = previous_rule
-        current_op, _, _ = current_rule
+    def _emit_apply(self, lines: List[str], question_bits: str, vector: List[RuleCandidate]) -> str:
+        lines.append(f"Applying to {question_bits}")
+        lines.append("Input")
+        for i, bit in enumerate(question_bits):
+            lines.append(f"{i} {bit}")
+        lines.append("Output")
 
-        if previous_op not in ['C0', 'C1', 'UNKNOWN']:
-            return False
-
-        return previous_op == current_op
-
-    def _pattern_group_name(self, rules):
-        first_rule = rules[0]
-        op, _, _ = first_rule
-
-        if op == 'I':
-            return 'shifted copy pattern'
-
-        if op == 'NOT':
-            return 'shifted NOT pattern'
-
-        if op == 'C0':
-            return 'constant 0 pattern'
-
-        if op == 'C1':
-            return 'constant 1 pattern'
-
-        if op == 'UNKNOWN':
-            return 'fallback pattern'
-
-        return f'shifted {op} pattern'
-
-    def _pattern_summary_lines(self, final_rules):
-        lines = []
-        start = 0
-
-        while start < 8:
-            end = start
-
-            while end + 1 < 8 and self._is_shifted_from_previous(final_rules[end], final_rules[end + 1]):
-                end += 1
-
-            if end > start:
-                group_rules = final_rules[start:end + 1]
-                group_name = self._pattern_group_name(group_rules)
-                lines.append(f'out[{start}..{end}] use a {group_name}:')
-                for out_idx in range(start, end + 1):
-                    lines.append(self._rule_assignment_text(out_idx, final_rules[out_idx]))
-                start = end + 1
-                continue
-
-            end = start
-
-            while end + 1 < 8 and self._is_same_constant_or_unknown(final_rules[end], final_rules[end + 1]):
-                end += 1
-
-            if end > start:
-                group_rules = final_rules[start:end + 1]
-                group_name = self._pattern_group_name(group_rules)
-                lines.append(f'out[{start}..{end}] use a {group_name}:')
-                for out_idx in range(start, end + 1):
-                    lines.append(self._rule_assignment_text(out_idx, final_rules[out_idx]))
-                start = end + 1
-                continue
-
-            lines.append(f'out[{start}] is a single rule:')
-            lines.append(self._rule_assignment_text(start, final_rules[start]))
-            start += 1
-
-        return lines
-
-    def _solve(self, prompt):
-        examples, target_input = self._parse_prompt(prompt)
-
-        if not examples or len(target_input) != 8:
-            return {
-                'status': 'parse_error',
-                'task_type': None,
-                'examples': examples,
-                'target_input': target_input,
-                'target_output': 'nan',
-                'macro_id': None,
-                'macro_desc': None,
-                'final_rules': None,
-            }
-
-        macro_id, macro_desc = self._detect_macro_pattern(examples)
-
-        if macro_id is not None:
-            target_output = self._apply_macro_pattern(macro_id, target_input)
-
-            return {
-                'status': 'ok',
-                'task_type': 'macro',
-                'examples': examples,
-                'target_input': target_input,
-                'target_output': target_output,
-                'macro_id': macro_id,
-                'macro_desc': macro_desc,
-                'final_rules': None,
-            }
-
-        flat_matches = [self._get_valid_rules(examples, out_idx) for out_idx in range(8)]
-        final_rules = self._select_final_rules(flat_matches)
-
-        target_output = ''.join(str(self._apply_rule(rule, target_input)) for rule in final_rules)
-
-        return {
-            'status': 'ok',
-            'task_type': 'bit_rules',
-            'examples': examples,
-            'target_input': target_input,
-            'target_output': target_output,
-            'macro_id': None,
-            'macro_desc': None,
-            'final_rules': final_rules,
-        }
-
-    def _render_macro_cot(self, solution):
-        examples = solution['examples']
-        target_input = solution['target_input']
-        target_output = solution['target_output']
-        macro_id = solution['macro_id']
-        macro_desc = solution['macro_desc']
-
-        cot = []
-
-        cot.append('Task type: macro')
-        cot.append('')
-        cot.append('Indexing:')
-        cot.append('Bits are indexed left-to-right as 0..7.')
-        cot.append('')
-        cot.append('Macro rule matching:')
-        cot.append(f'{macro_desc} maps each given input to its expected output.')
-        cot.append(f'Chosen macro: {macro_desc}')
-        cot.append(f'Macro id: {macro_id}')
-        cot.append('')
-        cot.append('Macro check:')
-
-        proof_examples = examples[:self.max_macro_proof_examples]
-
-        for ex_idx, (ex_in, ex_out) in enumerate(proof_examples, start=1):
-            predicted = self._apply_macro_pattern(macro_id, ex_in)
-            status = 'ok' if predicted == ex_out else 'mismatch'
-            cot.append(f'ex{ex_idx}: {ex_in} -> {predicted}; expected {ex_out}; {status}')
-
-        if len(examples) > len(proof_examples):
-            remaining = len(examples) - len(proof_examples)
-            cot.append(f'... {remaining} more example(s) also match this macro rule.')
-
-        cot.append('')
-        cot.append('Apply to target:')
-        cot.append(f'target = {target_input}')
-        cot.append(f'{macro_desc}: {target_input} -> {target_output}')
-        cot.append('')
-        cot.append(f'The final answer: {target_output}')
-
-        return '\n'.join(cot)
-
-    def _render_bit_rules_cot(self, solution):
-        examples = solution['examples']
-        target_input = solution['target_input']
-        target_output = solution['target_output']
-        final_rules = solution['final_rules']
-
-        cot = []
-
-        cot.append('Task type: bit_rules')
-        cot.append('')
-        cot.append('Indexing:')
-        cot.append('Bits are indexed left-to-right as 0..7.')
-        cot.append('')
-        cot.append('Output columns:')
-        cot.append('Each output bit is checked as a column across all examples.')
-
-        for out_idx in range(8):
-            expected = self._expected_column(examples, out_idx)
-            cot.append(f'out[{out_idx}] expected = {expected}')
-
-        cot.append('')
-        cot.append('Rule matching:')
-
-        for out_idx, selected_rule in enumerate(final_rules):
-            expected = self._expected_column(examples, out_idx)
-            selected_column = self._rule_column(selected_rule, examples)
-            rule_text = self._rule_to_text(selected_rule)
-
-            if selected_rule[0] == 'UNKNOWN':
-                cot.append(
-                    f'out[{out_idx}]: expected {expected}; no matching standard rule -> '
-                    f'choose out[{out_idx}] = UNKNOWN fallback 1'
-                )
+        answer_bits: List[str] = []
+        for i, rule in enumerate(vector):
+            if rule.family == DEFAULT_FAMILY:
+                lines.append(f"{i} default 1 = 1")
+                answer_bits.append("1")
+            elif rule.family in CONSTANT_FAMILIES:
+                lines.append(f"{i} {rule.expr} = {rule.family}")
+                answer_bits.append(rule.family)
+            elif rule.family == "I":
+                assert rule.primary is not None
+                val = question_bits[rule.primary]
+                lines.append(f"{i} {rule.expr} = {val}")
+                answer_bits.append(val)
+            elif rule.family == "NOT":
+                assert rule.primary is not None
+                val = question_bits[rule.primary]
+                nval = bit_not(val)
+                lines.append(f"{i} {rule.expr} = NOT({val}) = {nval}")
+                answer_bits.append(nval)
             else:
-                cot.append(
-                    f'out[{out_idx}]: expected {expected}; {rule_text} gives {selected_column} -> '
-                    f'choose out[{out_idx}] = {rule_text}'
-                )
+                assert rule.primary is not None and rule.secondary is not None
+                a = question_bits[rule.primary]
+                b = question_bits[rule.secondary]
+                result = evaluate_rule(question_bits, rule)
+                if rule.family in SYM_FAMILIES:
+                    lines.append(f"{i} {rule.expr} = {rule.family}({a},{b}) = {result}")
+                else:
+                    base = rule.family.split("-")[0]
+                    lines.append(f"{i} {rule.expr} = {base}({a},NOT({b})) = {result}")
+                answer_bits.append(result)
 
-        cot.append('')
-        cot.append('Pattern summary:')
+        answer = "".join(answer_bits)
+        lines.append("")
+        lines.append("I will now return the answer in \\boxed{}")
+        lines.append(f"The answer in \\boxed{{–}} is \\boxed{{{answer}}}")
+        return answer
 
-        for line in self._pattern_summary_lines(final_rules):
-            cot.append(line)
+    def generate_cot(self, prompt: Any) -> str:
+        analysis = self.analyze(prompt)
+        if analysis is None:
+            return ""
+        return analysis.trace
 
-        cot.append('')
-        cot.append('Apply to target:')
-        cot.append(f'target = {target_input}')
-        cot.append('target bits:')
-        cot.append(' '.join(f'in[{idx}]={bit}' for idx, bit in enumerate(target_input)))
-        cot.append('')
+    @staticmethod
+    def extract_answer(cot: Any) -> str:
+        text = "" if cot is None else str(cot)
+        patterns = [
+            r"\\boxed\{([01]{8})\}",
+            r"(?im)^\s*Answer\s*[:=]\s*([01]{8})\s*$",
+            r"(?i)final\s+answer\s*[:=]\s*([01]{8})",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text)
+            if m:
+                return m.group(1)
+        return ""
 
-        output_bits = []
-
-        for out_idx, rule in enumerate(final_rules):
-            eval_text, result = self._operation_eval_text(rule, target_input)
-            output_bits.append(str(result))
-            cot.append(f'out[{out_idx}] = {eval_text}')
-
-        recomputed_output = ''.join(output_bits)
-
-        cot.append('')
-        cot.append(f'result = {recomputed_output}')
-        cot.append(f'The final answer: {target_output}')
-
-        return '\n'.join(cot)
-
-    def generate_cot(self, prompt: str) -> str:
-        solution = self._solve(prompt)
-
-        if solution['status'] == 'parse_error':
-            return '\n'.join([
-                'Task type: parse_error',
-                'Reason: could not parse at least one example pair or the target input.',
-                'The final answer: nan',
-            ])
-
-        if solution['task_type'] == 'macro':
-            return self._render_macro_cot(solution)
-
-        return self._render_bit_rules_cot(solution)
-
-    def extract_answer(self, cot_text: str) -> str:
-        if not cot_text:
-            return 'nan'
-
-        match = re.search(r'(?i)final\s+answer:\s*([01]{8})', cot_text)
-        return match.group(1) if match else 'nan'
+    def solve(self, prompt: Any) -> str:
+        return self.extract_answer(self.generate_cot(prompt))
