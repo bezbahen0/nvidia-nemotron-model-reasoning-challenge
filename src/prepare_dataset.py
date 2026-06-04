@@ -3,9 +3,7 @@ from __future__ import annotations
 import re
 import argparse
 import hashlib
-import importlib
-import random
-from typing import Any, Dict, List, Optional, Tuple
+
 
 import pandas as pd
 
@@ -13,8 +11,10 @@ from transformers import AutoTokenizer
 
 from src.augmentation.equations.numeral_equations_augment import NumeralEquationAugmentGenerator
 from src.augmentation.equations.cryptarithm_task_generator import CryptarithmAugmentGenerator
+
 from src.augmentation.bit_manipulation import BitMatchingAugmentGenerator
 from src.augmentation.encryption import EncryptionTaskGenerator
+from src.augmentation.encryption_cot_augment import EncryptionCotAugmentGenerator, EncryptionCotAugmentConfig
 from src.metric import verify
 from src.log import logger
 
@@ -142,9 +142,34 @@ def main():
     encryption_generator = EncryptionTaskGenerator(vocabulary=global_vocab, seed=args.seed)
 
     encryption_gen_dataset = encryption_generator.generate_dataset(
-        int(len(data[data.label == "encryption"]) *  1.0)
+        int(len(data[data.label == "encryption"]) *  0.5)
     )
     encryption_gen_dataset = with_source(encryption_gen_dataset, "generated")
+
+    encryption_cot_augment_generator = EncryptionCotAugmentGenerator(
+        seed=args.seed,
+        config=EncryptionCotAugmentConfig(
+            sample_frac=1.0,
+            only_solver_correct=False,
+            task_modes=(
+                "word_pair_mapping",
+                "apply_mapping_to_target_partial",
+                "pattern_completion",
+                "new_mapping_from_completed_word",
+                "final_reconstruction",
+            ),
+            # Можно ограничить, если word_pair задач станет слишком много:
+            # max_word_pair_tasks_per_row=6,
+        ),
+    )
+
+    encryption_cot_aug_dataset = encryption_cot_augment_generator.generate_dataset(
+        source_data=data[data.label == "encryption"].copy(),
+        sample_frac=1.0,
+        only_solver_correct=False,
+    )
+
+    encryption_cot_aug_dataset = with_source(encryption_cot_aug_dataset, "solver")
 
     # Cryptarithm
     # Fully synthetic concat-only Alice-style tasks. The generator creates the
@@ -174,6 +199,7 @@ def main():
     generated_parts = [
         numeral_equations_aug_dataset,           # subtasks from real solver numeral equations
         encryption_gen_dataset,                  # synthetic encryption tasks
+        encryption_cot_aug_dataset,
         bit_mp_gen_dataset,                      # subtasks from real solver bit-manipulation tasks
         cryptarithm_gen_dataset,                 # synthetic concat-only cryptarithm tasks
     ]
