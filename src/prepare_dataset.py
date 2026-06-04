@@ -1,21 +1,22 @@
+from __future__ import annotations
+
 import re
 import argparse
 import hashlib
+import importlib
+import random
+from typing import Any, Dict, List, Optional, Tuple
+
 import pandas as pd
 
 from transformers import AutoTokenizer
 
-from src.augmentation.equations.cryptarithm_augment import CryptarithmAugmentGenerator
-from src.augmentation.equations.cryptarithm_task_generator import (
-    CryptarithmReplayTaskGenerator,
-    CryptarithmTaskGeneratorConfig,
-)
 from src.augmentation.equations.numeral_equations_augment import NumeralEquationAugmentGenerator
+from src.augmentation.equations.cryptarithm_task_generator import CryptarithmAugmentGenerator
 from src.augmentation.bit_manipulation import BitMatchingAugmentGenerator
 from src.augmentation.encryption import EncryptionTaskGenerator
 from src.metric import verify
 from src.log import logger
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -25,17 +26,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--tokenizer_path", type=str, required=True)
     parser.add_argument("--max_generated_cot_tokens", type=int, default=7800)
-
-    # Number of new validated full cryptarithm prompts to synthesize.
-    # These rows get source=generated. Their extracted subtasks also get source=generated.
-    parser.add_argument("--cryptarithm_generated_n", type=int, default=300)
-    parser.add_argument("--cryptarithm_generated_timeout", type=float, default=10.0)
-    parser.add_argument("--cryptarithm_generated_max_attempts", type=int, default=100)
-    parser.add_argument("--cryptarithm_generated_max_cot_chars", type=int, default=0)
-    parser.add_argument("--cryptarithm_generated_workers", type=int, default=24)
-
-    parser.add_argument("--cryptarithm_generated_no_parallel", action="store_true")
-    parser.add_argument("--cryptarithm_generated_progress_bar", action="store_true")
+    parser.add_argument("--cryptarithm_generated_count", type=int, default=500)
     
     return parser.parse_args()
 
@@ -108,92 +99,6 @@ def main():
         f"Source solver correct rate: "
         f"{bit_mp_gen_dataset['source_solver_correct'].mean() if len(bit_mp_gen_dataset) else 0.0}"
     )
-    
-    multipliers = {
-        "encryption": 1.0,
-    }
-
-    # Cryptarithm
-    # Instead of generating random full cryptarithm tasks, derive local Alice-style
-    # subtasks from existing replay CoTs: rule filtering, candidate checks,
-    # domain propagation, rule verification, and target application.
-    cryptarithm_augment_generator = CryptarithmAugmentGenerator(seed=args.seed)
-
-    cryptarithm_aug_dataset = cryptarithm_augment_generator.generate_dataset(
-        source_data=data[data.label == "cryptarithm"].copy(),
-        sample_frac=1.0,
-        only_solver_correct=False,
-    )
-    cryptarithm_aug_dataset = with_source(cryptarithm_aug_dataset, "solver")
-    logger.info("\nCryptarithm augmenter:")
-    logger.info(cryptarithm_aug_dataset.columns.tolist())
-    if len(cryptarithm_aug_dataset) and "task_mode" in cryptarithm_aug_dataset.columns:
-        logger.info(cryptarithm_aug_dataset.task_mode.value_counts(normalize=True))
-    logger.info(f"Generated rows: {len(cryptarithm_aug_dataset)}")
-    logger.info(
-        f"Source solver correct rate: "
-        f"{cryptarithm_aug_dataset['source_solver_correct'].mean() if len(cryptarithm_aug_dataset) and 'source_solver_correct' in cryptarithm_aug_dataset.columns else 0.0}"
-    )
-    logger.info(
-        f'Accuracy: '
-        f'{cryptarithm_aug_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean() if len(cryptarithm_aug_dataset) else 0.0}'
-    )
-
-    # New full cryptarithm tasks synthesized from a profile fitted to real solver rows.
-    # The full generated tasks have source=generated.  Their extracted subtasks also
-    # have source=generated.  The generator itself never creates subtasks; subtasks
-    # are always produced here by CryptarithmAugmentGenerator.
-    cryptarithm_generated_full_dataset = pd.DataFrame()
-    cryptarithm_generated_aug_dataset = pd.DataFrame()
-    if args.cryptarithm_generated_n > 0:
-        crypt_config = CryptarithmTaskGeneratorConfig(
-            solver_timeout_seconds=args.cryptarithm_generated_timeout,
-            max_attempts_per_row=args.cryptarithm_generated_max_attempts,
-            require_solver_success=True,
-            max_cot_chars=(args.cryptarithm_generated_max_cot_chars or None),
-        )
-        cryptarithm_task_generator = CryptarithmReplayTaskGenerator.from_source_data(
-            source_data=data[data.label == "cryptarithm"].copy(),
-            seed=args.seed,
-            config=crypt_config,
-        )
-        logger.info(
-            f"Generating {args.cryptarithm_generated_n} full cryptarithm tasks "
-            f"with nb_workers={args.cryptarithm_generated_workers}, "
-            f"use_parallel={not args.cryptarithm_generated_no_parallel}."
-        )
-        cryptarithm_generated_full_dataset = cryptarithm_task_generator.generate_dataset(
-            num_samples=args.cryptarithm_generated_n,
-            progress_bar=args.cryptarithm_generated_progress_bar,
-            nb_workers=args.cryptarithm_generated_workers,
-            use_parallel=not args.cryptarithm_generated_no_parallel,
-        )
-        cryptarithm_generated_full_dataset = with_source(cryptarithm_generated_full_dataset, "generated")
-        logger.info("\nGenerated full cryptarithm tasks:")
-        logger.info(cryptarithm_generated_full_dataset.columns.tolist())
-        if len(cryptarithm_generated_full_dataset) and "task_mode" in cryptarithm_generated_full_dataset.columns:
-            logger.info(cryptarithm_generated_full_dataset.task_mode.value_counts(normalize=True))
-        logger.info(f"Generated rows: {len(cryptarithm_generated_full_dataset)}")
-        logger.info(
-            f'Accuracy: '
-            f'{cryptarithm_generated_full_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean() if len(cryptarithm_generated_full_dataset) else 0.0}'
-        )
-
-        cryptarithm_generated_aug_dataset = cryptarithm_augment_generator.generate_dataset(
-            source_data=cryptarithm_generated_full_dataset.copy(),
-            sample_frac=0.5,
-            only_solver_correct=False,
-        )
-        cryptarithm_generated_aug_dataset = with_source(cryptarithm_generated_aug_dataset, "generated")
-        logger.info("\nCryptarithm augmenter on generated tasks:")
-        logger.info(cryptarithm_generated_aug_dataset.columns.tolist())
-        if len(cryptarithm_generated_aug_dataset) and "task_mode" in cryptarithm_generated_aug_dataset.columns:
-            logger.info(cryptarithm_generated_aug_dataset.task_mode.value_counts(normalize=True))
-        logger.info(f"Generated rows: {len(cryptarithm_generated_aug_dataset)}")
-        logger.info(
-            f'Accuracy: '
-            f'{cryptarithm_generated_aug_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean() if len(cryptarithm_generated_aug_dataset) else 0.0}'
-        )
 
     # Numeral equations
     # Instead of generating new full AST brute-force tasks, derive small Alice-style
@@ -237,18 +142,40 @@ def main():
     encryption_generator = EncryptionTaskGenerator(vocabulary=global_vocab, seed=args.seed)
 
     encryption_gen_dataset = encryption_generator.generate_dataset(
-        int(len(data[data.label == "encryption"]) *  multipliers["encryption"])
+        int(len(data[data.label == "encryption"]) *  1.0)
     )
     encryption_gen_dataset = with_source(encryption_gen_dataset, "generated")
 
+    # Cryptarithm
+    # Fully synthetic concat-only Alice-style tasks. The generator creates the
+    # prompt, computes the intended answer, calls CryptarithmSolver immediately,
+    # and stores solver output as generated_cot/computed_answer.
+    cryptarithm_generator = CryptarithmAugmentGenerator(seed=args.seed)
+    cryptarithm_gen_dataset = pd.DataFrame(
+        cryptarithm_generator.generate_dataset(
+            n=args.cryptarithm_generated_count,
+            include_metadata=False,
+            validate=True,
+        )
+    )
+    if len(cryptarithm_gen_dataset):
+        cryptarithm_gen_dataset["label"] = "cryptarithm"
+    cryptarithm_gen_dataset = with_source(cryptarithm_gen_dataset, "generated")
+
+    logger.info("\nCryptarithm generator:")
+    logger.info(cryptarithm_gen_dataset.columns.tolist())
+    logger.info(f"Generated rows: {len(cryptarithm_gen_dataset)}")
+    logger.info(
+        f'Accuracy: '
+        f'{cryptarithm_gen_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean() if len(cryptarithm_gen_dataset) else 0.0}'
+    )
+
 
     generated_parts = [
-        cryptarithm_aug_dataset,                 # subtasks from real solver cryptarithms
-        cryptarithm_generated_full_dataset,      # new synthetic full cryptarithms
-        cryptarithm_generated_aug_dataset,       # subtasks from synthetic full cryptarithms
         numeral_equations_aug_dataset,           # subtasks from real solver numeral equations
         encryption_gen_dataset,                  # synthetic encryption tasks
         bit_mp_gen_dataset,                      # subtasks from real solver bit-manipulation tasks
+        cryptarithm_gen_dataset,                 # synthetic concat-only cryptarithm tasks
     ]
     generated_parts = [normalize_generated_columns(df) for df in generated_parts if df is not None and len(df)]
     data_gen = pd.concat(generated_parts, ignore_index=True) if generated_parts else pd.DataFrame(
