@@ -12,7 +12,7 @@ from transformers import AutoTokenizer
 from src.augmentation.equations.numeral_equations_augment import NumeralEquationAugmentGenerator
 from src.augmentation.equations.cryptarithm_task_generator import CryptarithmAugmentGenerator
 
-from src.augmentation.bit_manipulation import BitMatchingAugmentGenerator
+from src.augmentation.bit_manipulation import BitMatchingAugmentGenerator, BitMatchingAugmentConfig
 from src.augmentation.encryption import EncryptionTaskGenerator
 from src.augmentation.encryption_cot_augment import EncryptionCotAugmentGenerator, EncryptionCotAugmentConfig
 from src.metric import verify
@@ -72,32 +72,90 @@ def main():
     logger.info(f"Load data from {args.data_path}...")
     data = pd.read_csv(args.data_path)
 
-    # Remove all nan
-    data = data[~data.computed_answer.isna()]
+    # Remove rows where the base solver did not emit any answer at all.
+    data = data[~data.computed_answer.isna()].copy()
     data["source"] = len(data) * ["solver"]
 
-    # skip all answer that not verified
-    data = data[data.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1)]
+    # Keep the full bit-manipulation source before the correctness filter.
+    # Tail-repair augmentation needs failed bit rows because it tries to
+    # construct a corrected final block with answer_hint. The main solver CoT
+    # training rows below should still stay verified-only, as before.
+    bit_aug_source_data = data[data.label == "bit manipulation"].copy()
+
+    # skip all answer that not verified for the main solver-generated rows
+    data = data[data.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1)].copy()
 
     logger.info(f"Datset countes: \n{data.label.value_counts()}")
+    logger.info(
+        "Bit manipulation augmentation source rows before verify filter: "
+        f"{len(bit_aug_source_data)}"
+    )
+    logger.info(
+        "Bit manipulation rows kept as full solver CoT after verify filter: "
+        f"{len(data[data.label == 'bit manipulation'])}"
+    )
 
     # bit manipulation
-    bit_matching_generator = BitMatchingAugmentGenerator(seed=args.seed)
+    # Keep historical bit_matching generation on verified source rows, so the
+    # existing bit_matching distribution does not change just because tail repair
+    # needs failed rows.
+    bit_matching_generator = BitMatchingAugmentGenerator(
+        seed=args.seed,
+        config=BitMatchingAugmentConfig(
+            include_matching=True,
+            include_tail_completion=False,
+            include_tail_repair=False,
+        ),
+    )
 
-    bit_mp_gen_dataset = bit_matching_generator.generate_dataset(
+    bit_matching_dataset = bit_matching_generator.generate_dataset(
         source_data=data[data.label == "bit manipulation"].copy(),
         sample_frac=1.0,
         only_solver_correct=False,
+        include_matching=True,
+        include_tail_completion=False,
+        include_tail_repair=False,
     )
+
+    # Tail subtasks are generated from the full bit source before the verify
+    # filter, because tail_repair is defined on failed baseline rows. The
+    # augmenter itself filters emitted tails to correct/leak-free completions.
+    bit_tail_generator = BitMatchingAugmentGenerator(
+        seed=args.seed,
+        config=BitMatchingAugmentConfig(
+            include_matching=False,
+            include_tail_completion=True,
+            include_tail_repair=True,
+            tail_require_correct=True,
+            tail_completion_require_change=True,
+            tail_repair_require_success=True,
+        ),
+    )
+
+    bit_tail_dataset = bit_tail_generator.generate_dataset(
+        source_data=bit_aug_source_data.copy(),
+        sample_frac=1.0,
+        only_solver_correct=False,
+        include_matching=False,
+        include_tail_completion=True,
+        include_tail_repair=True,
+    )
+
+    bit_mp_gen_dataset = pd.concat(
+        [df for df in [bit_matching_dataset, bit_tail_dataset] if df is not None and len(df)],
+        ignore_index=True,
+    ) if len(bit_matching_dataset) or len(bit_tail_dataset) else pd.DataFrame()
     bit_mp_gen_dataset = with_source(bit_mp_gen_dataset, "solver")
 
-    logger.info("\nBit matching augmenter:")
+    logger.info("\nBit manipulation augmenter:")
     logger.info(bit_mp_gen_dataset.columns.tolist())
-    logger.info(bit_mp_gen_dataset.task_mode.value_counts(normalize=True))
+    if len(bit_mp_gen_dataset) and "task_mode" in bit_mp_gen_dataset.columns:
+        logger.info(bit_mp_gen_dataset.task_mode.value_counts(dropna=False))
+        logger.info(bit_mp_gen_dataset.label.value_counts(dropna=False))
     logger.info(f"Generated rows: {len(bit_mp_gen_dataset)}")
     logger.info(
         f"Source solver correct rate: "
-        f"{bit_mp_gen_dataset['source_solver_correct'].mean() if len(bit_mp_gen_dataset) else 0.0}"
+        f"{bit_mp_gen_dataset['source_solver_correct'].mean() if len(bit_mp_gen_dataset) and 'source_solver_correct' in bit_mp_gen_dataset.columns else 0.0}"
     )
 
     # Numeral equations
