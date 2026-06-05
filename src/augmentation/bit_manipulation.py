@@ -41,6 +41,26 @@ class BitMatchingAugmentConfig:
     only_solver_correct: bool = False
     downsample_sparse: bool = True
 
+    # Keep the historical behavior by default: generate only section-matching tasks.
+    include_matching: bool = True
+
+    # New dense tail subtasks. Enable explicitly when you want to train the
+    # model on the final rule-completion bottleneck.
+    include_tail_completion: bool = False
+    include_tail_repair: bool = False
+
+    # Tail examples are intended for supervised training, so by default we only
+    # keep them when the emitted tail answer agrees with the dataset answer.
+    tail_require_correct: bool = True
+
+    # For tail_completion, keep only examples where the ternary step actually
+    # chooses at least one MAJ/CH rule instead of only reprinting defaults.
+    tail_completion_require_change: bool = True
+
+    # Tail repair needs a solver that supports generate_cot(..., answer_hint=...).
+    # It is filtered to successful repairs by default to avoid post-hoc wrong CoTs.
+    tail_repair_require_success: bool = True
+
 
 class BitMatchingAugmentGenerator:
     """
@@ -71,6 +91,10 @@ class BitMatchingAugmentGenerator:
     @staticmethod
     def _make_id(source_id: str, section: str) -> str:
         return hashlib.sha256(f"matching_{source_id}_{section}".encode()).hexdigest()[:8]
+
+    @staticmethod
+    def _make_tail_id(source_id: str, mode: str) -> str:
+        return hashlib.sha256(f"{mode}_{source_id}".encode()).hexdigest()[:8]
 
     @staticmethod
     def _strip_best_prefix(section: str, best_line: str) -> str:
@@ -161,6 +185,211 @@ class BitMatchingAugmentGenerator:
             return (h % 5) < 1
         return True
 
+
+    @staticmethod
+    def _extract_block(text: str, header: str, before: Optional[str] = None, last: bool = False) -> List[str]:
+        """Extract a simple CoT block whose header is a line by itself.
+
+        Blocks in the bit solver are separated by a blank line, so this helper is
+        deliberately conservative: it returns header + following non-empty lines.
+        """
+        if before and before in text:
+            text = text.split(before, 1)[0]
+
+        lines = text.splitlines()
+        starts = [i for i, line in enumerate(lines) if line.strip() == header]
+        if not starts:
+            return []
+        start = starts[-1] if last else starts[0]
+
+        end = start + 1
+        while end < len(lines) and lines[end].strip() != "":
+            end += 1
+        return lines[start:end]
+
+    @staticmethod
+    def _extract_tail_from_marker(text: str, marker: str) -> str:
+        idx = text.find(marker)
+        if idx < 0:
+            return ""
+        return text[idx:].strip()
+
+    @staticmethod
+    def _has_bad_tail_text(text: str) -> bool:
+        """Guard against hidden-answer leakage or truncated candidate lists."""
+        low = text.lower()
+        banned = (
+            "gold answer",
+            "answer hint",
+            "answer-aware",
+            "teacher repair",
+            "wrong bits",
+            "needed bit",
+        )
+        if any(token in low for token in banned):
+            return True
+        if "..." in text:
+            return True
+        return False
+
+    @staticmethod
+    def _format_input_bit_columns(analysis: Any) -> List[str]:
+        n_examples = len(analysis.inputs)
+        return [
+            f"{bit} {col} {column_hash(col, n_examples)}"
+            for bit, col in enumerate(analysis.input_columns)
+        ]
+
+    def _tail_context_lines(self, analysis: Any, trace: str, mode: str, before_marker: str) -> List[str]:
+        """Build a compact prompt context for tail-only subtasks.
+
+        The context gives enough information to recompute exact column matches,
+        but avoids replaying the whole long solver trace.
+        """
+        lines: List[str] = []
+        lines.append("In Alice's Wonderland, complete the final rule selection for this bit manipulation task.")
+        lines.append("Use the given columns and the current solver state. Continue only with the requested final block.")
+        lines.append("")
+
+        lines.append("Output bit columns (with bitsum as hash)")
+        lines.extend(self._format_output_bit_columns(analysis))
+        lines.append("")
+
+        lines.append("Input bit columns (with bitsum as hash)")
+        lines.extend(self._format_input_bit_columns(analysis))
+        lines.append("")
+
+        lines.append(f"Target input: {analysis.question_bits}")
+        lines.append("")
+
+        if mode == "tail_completion":
+            for header in ("Preferred", "Matching", "Perfect match", "Matched"):
+                block = self._extract_block(trace, header, before=before_marker, last=True)
+                if block:
+                    lines.extend(block)
+                    lines.append("")
+            lines.append("Continue from `Ternary completion` through the final boxed answer.")
+        else:
+            selected = self._extract_block(trace, "Selected", before=before_marker, last=True)
+            if selected:
+                lines.append("Current selected rules")
+                lines.extend(selected[1:])
+                lines.append("")
+            current_answer = getattr(analysis, "answer", "")
+            if current_answer:
+                lines.append(f"Current computed answer: {current_answer}")
+                lines.append("")
+            lines.append("Continue from `Final completion check` through the final boxed answer.")
+
+        return lines
+
+    def _answer_from_text(self, text: str) -> str:
+        try:
+            return self.solver.extract_answer(text)
+        except Exception:
+            m = re.findall(r"\\boxed\{([01]{8})\}", text)
+            return m[-1] if m else ""
+
+    def _make_tail_completion_problem(
+        self,
+        analysis: Any,
+        source_id: str,
+        source_gold_answer: str,
+        source_solver_correct: bool,
+    ) -> Optional[Dict[str, Any]]:
+        trace = str(analysis.trace)
+        marker = "Ternary completion"
+        completion = self._extract_tail_from_marker(trace, marker)
+        if not completion or self._has_bad_tail_text(completion):
+            return None
+
+        if self.config.tail_completion_require_change and not re.search(r"(?m)^\d+ use (?:MAJ|CH)\d+", completion):
+            return None
+
+        computed_answer = self._answer_from_text(completion)
+        tail_correct = bool(source_gold_answer and computed_answer == source_gold_answer)
+        if self.config.tail_require_correct and source_gold_answer and not tail_correct:
+            return None
+
+        prompt = "\n".join(self._tail_context_lines(analysis, trace, "tail_completion", marker))
+        pid = self._make_tail_id(source_id, "tail_completion")
+
+        return {
+            "id": pid,
+            "prompt": prompt,
+            "completion": completion,
+            "answer": completion,
+            "generated_cot": completion,
+            "computed_answer": computed_answer,
+            "category": "bit_tail_completion",
+            "label": "bit_tail_completion",
+            "task_mode": "tail_completion",
+            "source_task_id": source_id,
+            "source_solver_answer": getattr(analysis, "answer", ""),
+            "source_gold_answer": source_gold_answer,
+            "source_solver_correct": source_solver_correct,
+            "tail_correct": tail_correct,
+            "has_ternary_completion": True,
+            "has_answer_hint_repair": False,
+        }
+
+    def _make_tail_repair_problem(
+        self,
+        row: pd.Series,
+        source_id: str,
+        analysis: Any,
+        source_gold_answer: str,
+        source_solver_correct: bool,
+    ) -> Optional[Dict[str, Any]]:
+        if not source_gold_answer:
+            return None
+
+        # The repair tail must be produced by the solver itself.  Solvers that do
+        # not support answer_hint are skipped without affecting matching tasks.
+        try:
+            repaired_trace = self.solver.generate_cot(row["prompt"], answer_hint=source_gold_answer)
+        except TypeError:
+            return None
+        except Exception:
+            return None
+
+        marker = "Final completion check"
+        completion = self._extract_tail_from_marker(str(repaired_trace), marker)
+        if not completion or self._has_bad_tail_text(completion):
+            return None
+
+        repaired_answer = self._answer_from_text(completion)
+        repaired_correct = bool(repaired_answer and repaired_answer == source_gold_answer)
+        if self.config.tail_repair_require_success and not repaired_correct:
+            return None
+
+        # Skip no-op repair tails; those are not useful as a distinct subtask.
+        baseline_answer = getattr(analysis, "answer", "")
+        if baseline_answer == repaired_answer:
+            return None
+
+        prompt = "\n".join(self._tail_context_lines(analysis, str(repaired_trace), "tail_repair", marker))
+        pid = self._make_tail_id(source_id, "tail_repair")
+
+        return {
+            "id": pid,
+            "prompt": prompt,
+            "completion": completion,
+            "answer": completion,
+            "generated_cot": completion,
+            "computed_answer": repaired_answer,
+            "category": "bit_tail_repair",
+            "label": "bit_tail_repair",
+            "task_mode": "tail_repair",
+            "source_task_id": source_id,
+            "source_solver_answer": baseline_answer,
+            "source_gold_answer": source_gold_answer,
+            "source_solver_correct": source_solver_correct,
+            "tail_correct": repaired_correct,
+            "has_ternary_completion": "Ternary completion" in str(repaired_trace),
+            "has_answer_hint_repair": True,
+        }
+
     def _make_matching_problem(
         self,
         analysis: Any,
@@ -211,9 +440,14 @@ class BitMatchingAugmentGenerator:
     def make_tasks_for_row(self, row: pd.Series, source_id: Optional[str] = None) -> List[Dict[str, Any]]:
         source_id = source_id or str(row.get("id", row.name))
         prompt = row["prompt"]
-        gold = normalize_bits(row["answer"]) if "answer" in row else ""
+        if "answer" in row and pd.notna(row.get("answer")):
+            gold = normalize_bits(row["answer"])
+        elif "ground_truth" in row and pd.notna(row.get("ground_truth")):
+            gold = normalize_bits(row["ground_truth"])
+        else:
+            gold = ""
 
-        analysis = self.solver.analyze(prompt, gold)
+        analysis = self.solver.analyze(prompt)
         if analysis is None:
             return []
 
@@ -223,17 +457,41 @@ class BitMatchingAugmentGenerator:
             return []
 
         rows: List[Dict[str, Any]] = []
-        for section in SECTION_NAMES:
-            item = self._make_matching_problem(
+
+        if self.config.include_matching:
+            for section in SECTION_NAMES:
+                item = self._make_matching_problem(
+                    analysis=analysis,
+                    source_id=source_id,
+                    section=section,
+                    source_solver_answer=solver_answer,
+                    source_gold_answer=gold,
+                    source_solver_correct=solver_correct,
+                )
+                if item is not None:
+                    rows.append(item)
+
+        if self.config.include_tail_completion:
+            item = self._make_tail_completion_problem(
                 analysis=analysis,
                 source_id=source_id,
-                section=section,
-                source_solver_answer=solver_answer,
                 source_gold_answer=gold,
                 source_solver_correct=solver_correct,
             )
             if item is not None:
                 rows.append(item)
+
+        if self.config.include_tail_repair:
+            item = self._make_tail_repair_problem(
+                row=row,
+                source_id=source_id,
+                analysis=analysis,
+                source_gold_answer=gold,
+                source_solver_correct=solver_correct,
+            )
+            if item is not None:
+                rows.append(item)
+
         return rows
 
     def generate_dataset(
@@ -242,6 +500,9 @@ class BitMatchingAugmentGenerator:
         sample_frac: Optional[float] = None,
         sample_n: Optional[int] = None,
         only_solver_correct: Optional[bool] = None,
+        include_matching: Optional[bool] = None,
+        include_tail_completion: Optional[bool] = None,
+        include_tail_repair: Optional[bool] = None,
     ) -> pd.DataFrame:
         sample_frac = self.config.sample_frac if sample_frac is None else sample_frac
         sample_n = self.config.sample_n if sample_n is None else sample_n
@@ -258,19 +519,33 @@ class BitMatchingAugmentGenerator:
         elif sample_frac < 1.0:
             work = work.sample(frac=sample_frac, random_state=self.seed)
 
-        old_flag = self.config.only_solver_correct
+        old_only_solver_correct = self.config.only_solver_correct
+        old_include_matching = self.config.include_matching
+        old_include_tail_completion = self.config.include_tail_completion
+        old_include_tail_repair = self.config.include_tail_repair
+
         self.config.only_solver_correct = bool(only_solver_correct)
+        if include_matching is not None:
+            self.config.include_matching = bool(include_matching)
+        if include_tail_completion is not None:
+            self.config.include_tail_completion = bool(include_tail_completion)
+        if include_tail_repair is not None:
+            self.config.include_tail_repair = bool(include_tail_repair)
+
         try:
             rows: List[Dict[str, Any]] = []
             for _, row in work.iterrows():
                 source_id = str(row["id"]) if "id" in row and pd.notna(row["id"]) else str(row.name)
                 rows.extend(self.make_tasks_for_row(row, source_id=source_id))
         finally:
-            self.config.only_solver_correct = old_flag
+            self.config.only_solver_correct = old_only_solver_correct
+            self.config.include_matching = old_include_matching
+            self.config.include_tail_completion = old_include_tail_completion
+            self.config.include_tail_repair = old_include_tail_repair
 
         if not rows:
             return pd.DataFrame(
-                columns=["id", "prompt", "completion", "answer", "label", "generated_cot", "computed_answer", "task_mode"]
+                columns=["id", "prompt", "completion", "answer", "label", "generated_cot", "computed_answer", "task_mode", "source_task_id", "source_solver_answer", "source_gold_answer", "source_solver_correct", "tail_correct"]
             )
 
         return pd.DataFrame.from_records(rows)
