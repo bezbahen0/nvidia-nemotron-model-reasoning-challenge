@@ -9,6 +9,7 @@ N_BITS = 8
 SYM_FAMILIES = ("XOR", "OR", "AND")
 ASYM_FAMILIES = ("AND-NOT", "XOR-NOT", "OR-NOT")
 PAIR_FAMILIES = SYM_FAMILIES + ASYM_FAMILIES
+TERNARY_FAMILIES = ("MAJ", "CH")
 UNARY_FAMILIES = ("I", "NOT")
 CONSTANT_FAMILIES = ("0", "1")
 DEFAULT_FAMILY = "DEFAULT"
@@ -36,6 +37,8 @@ RuleFamily = Literal[
     "AND-NOT",
     "XOR-NOT",
     "OR-NOT",
+    "MAJ",
+    "CH",
     "DEFAULT",
 ]
 
@@ -59,6 +62,7 @@ class RuleCandidate:
     primary: Optional[int]
     secondary: Optional[int]
     expr: str
+    tertiary: Optional[int] = None
 
     @property
     def is_default(self) -> bool:
@@ -157,6 +161,18 @@ def evaluate_binary(a: str, b: str, family: str) -> str:
     raise ValueError(f"Unsupported family: {family}")
 
 
+def evaluate_ternary(a: str, b: str, c: str, family: str) -> str:
+    if family == "MAJ":
+        return "1" if ((a == "1") + (b == "1") + (c == "1")) >= 2 else "0"
+    if family == "CH":
+        return b if a == "1" else c
+    raise ValueError(f"Unsupported family: {family}")
+
+
+def apply_ternary(a_bits: str, b_bits: str, c_bits: str, family: str) -> str:
+    return "".join(evaluate_ternary(a, b, c, family) for a, b, c in zip(a_bits, b_bits, c_bits))
+
+
 def apply_family(a_bits: str, b_bits: str, family: str, invert_second: bool = False) -> str:
     b_eff = invert(b_bits) if invert_second else b_bits
     return "".join(evaluate_binary(a, b, family) for a, b in zip(a_bits, b_eff))
@@ -182,10 +198,18 @@ def evaluate_rule(bits: str, rule: RuleCandidate) -> str:
         if "-NOT" in rule.family:
             b = bit_not(b)
         return evaluate_binary(a, b, rule.family)
+    if rule.family in TERNARY_FAMILIES:
+        assert rule.primary is not None and rule.secondary is not None and rule.tertiary is not None
+        a = bits[rule.primary]
+        b = bits[rule.secondary]
+        c = bits[rule.tertiary]
+        return evaluate_ternary(a, b, c, rule.family)
     raise ValueError(rule.family)
 
 
 def compact_rule(c: RuleCandidate) -> str:
+    if c.primary is not None and c.secondary is not None and c.tertiary is not None:
+        return f"{c.primary}{c.secondary}{c.tertiary}"
     if c.primary is not None and c.secondary is not None:
         return f"{c.primary}{c.secondary}"
     if c.primary is not None:
@@ -330,6 +354,113 @@ class BitManipulationSolver:
     The trace is intentionally a column-matching reasoning trace, not a brute-force
     global transform search ledger.
     """
+
+    def __init__(self, include_ternary_completion: bool = True, max_ternary_candidates_to_show: int = 6):
+        self.include_ternary_completion = include_ternary_completion
+        self.max_ternary_candidates_to_show = max_ternary_candidates_to_show
+
+    @staticmethod
+    def _preferred_digits(pref: str) -> List[int]:
+        if not pref.startswith("?") or pref == "?":
+            return []
+        return [int(d) for d in pref[1:] if d != "?"]
+
+    def _ternary_candidates_for_bit(
+        self,
+        input_columns: Sequence[str],
+        output_column: str,
+    ) -> List[RuleCandidate]:
+        """Return exact MAJ/CH candidates for one unresolved output bit.
+
+        These candidates are intentionally not added to the main section tables.
+        They are only used as a compact completion step for unresolved bits, so
+        the normal unary/binary CoT stays short and stable.
+        """
+        candidates: List[RuleCandidate] = []
+
+        # MAJ is symmetric, so keep each unordered triple once.
+        for a in range(N_BITS):
+            for b in range(a + 1, N_BITS):
+                for c in range(b + 1, N_BITS):
+                    col = apply_ternary(input_columns[a], input_columns[b], input_columns[c], "MAJ")
+                    if col == output_column:
+                        candidates.append(RuleCandidate("MAJ", a, b, f"MAJ{a}{b}{c}", c))
+
+        # CH(a,b,c) is ordered: if a then b else c.  Require distinct operands
+        # to avoid degenerating into unary/binary rules already checked above.
+        for a in range(N_BITS):
+            for b in range(N_BITS):
+                if b == a:
+                    continue
+                for c in range(N_BITS):
+                    if c == a or c == b:
+                        continue
+                    col = apply_ternary(input_columns[a], input_columns[b], input_columns[c], "CH")
+                    if col == output_column:
+                        candidates.append(RuleCandidate("CH", a, b, f"CH{a}{b}{c}", c))
+
+        return candidates
+
+    def _score_ternary_candidate(self, cand: RuleCandidate, pref: str) -> Tuple[int, int, int, int]:
+        digits = self._preferred_digits(pref)
+        operands = tuple(
+            x for x in (cand.primary, cand.secondary, cand.tertiary)
+            if x is not None
+        )
+
+        score = 0
+        if digits:
+            if operands[: len(digits)] == tuple(digits):
+                score += 20
+            if all(d in operands for d in digits):
+                score += 10
+            score -= sum(1 for d in digits if d not in operands) * 5
+
+        # Prefer candidates whose operands form a compact circular neighborhood;
+        # this keeps the completion aligned with the bit-chain style.
+        circular_span = max(operands) - min(operands) if operands else N_BITS
+        family_bonus = 1 if cand.family == "MAJ" else 0
+        return (score, -circular_span, family_bonus, -sum(operands))
+
+    def _choose_ternary_candidate(self, cands: List[RuleCandidate], pref: str) -> RuleCandidate:
+        return max(cands, key=lambda c: self._score_ternary_candidate(c, pref))
+
+    @staticmethod
+    def _preferred_display(pref: str) -> str:
+        if pref.startswith("?") and len(pref) == 3 and pref[1] != "?" and pref[2] != "?":
+            return f"{pref} ?{pref[2]}{pref[1]}"
+        return pref
+
+    @staticmethod
+    def _candidate_operand_text(cand: RuleCandidate) -> str:
+        operands = [
+            str(x) for x in (cand.primary, cand.secondary, cand.tertiary)
+            if x is not None
+        ]
+        return "".join(operands) if operands else "none"
+
+    def _ternary_choice_reason(self, cand: RuleCandidate, pref: str) -> str:
+        digits = self._preferred_digits(pref)
+        operands = [
+            x for x in (cand.primary, cand.secondary, cand.tertiary)
+            if x is not None
+        ]
+        if digits:
+            if operands[: len(digits)] == digits:
+                return (
+                    f"use {cand.expr} because it exactly matches the output column "
+                    f"and its leading operands {self._candidate_operand_text(cand)} follow the preferred pattern "
+                    f"{self._preferred_display(pref)}"
+                )
+            if all(d in operands for d in digits):
+                return (
+                    f"use {cand.expr} because it exactly matches the output column "
+                    f"and contains the preferred operands from {self._preferred_display(pref)}"
+                )
+        return f"use {cand.expr} because it exactly matches the output column"
+
+    def _format_all_ternary_candidates(self, cands: List[RuleCandidate]) -> str:
+        return " ".join(c.expr for c in cands) if cands else "none"
 
     def analyze(self, prompt: Any, answer: Optional[Any] = None) -> Optional[Analysis]:
         problem = parse_prompt(prompt, answer)
@@ -754,6 +885,47 @@ class BitManipulationSolver:
                 lines.append(f"{i} {best[i].expr}")
         lines.append("")
 
+        if self.include_ternary_completion:
+            unresolved_indices = [i for i, rule in enumerate(best) if rule.family == DEFAULT_FAMILY]
+            if unresolved_indices:
+                lines.append("Ternary completion")
+                lines.append(
+                    "Some positions remain unresolved after unary/binary matching. "
+                    "For those positions, I check exact majority/choice column matches."
+                )
+                lines.append(
+                    "The preferred pattern comes from the left/right chain above; "
+                    "when several exact ternary matches exist, I choose the one most aligned with that pattern."
+                )
+                ternary_by_bit = {
+                    i: self._ternary_candidates_for_bit(input_columns, output_columns[i])
+                    for i in unresolved_indices
+                }
+                can_complete_all = all(ternary_by_bit[i] for i in unresolved_indices)
+
+                for i in unresolved_indices:
+                    cands = ternary_by_bit[i]
+                    pref_i = preferred[i] if i < len(preferred) else "?"
+                    pref_display = self._preferred_display(pref_i)
+                    if cands and can_complete_all:
+                        chosen = self._choose_ternary_candidate(cands, pref_i)
+                        best[i] = chosen
+                        shown = self._format_all_ternary_candidates(cands)
+                        reason = self._ternary_choice_reason(chosen, pref_i)
+                        lines.append(f"{i} preferred {pref_display}")
+                        lines.append(f"{i} exact ternary candidates: {shown}")
+                        lines.append(f"{i} {reason}")
+                    elif cands:
+                        shown = self._format_all_ternary_candidates(cands)
+                        lines.append(f"{i} preferred {pref_display}")
+                        lines.append(f"{i} exact ternary candidates: {shown}")
+                        lines.append(f"{i} keep {best[i].expr} because not every unresolved position has a ternary completion")
+                    else:
+                        lines.append(f"{i} preferred {pref_display}")
+                        lines.append(f"{i} exact ternary candidates: none")
+                        lines.append(f"{i} keep {best[i].expr}")
+                lines.append("")
+
         lines.append("Selected")
         for i, rule in enumerate(best):
             lines.append(f"{i} {rule.expr}")
@@ -802,6 +974,14 @@ class BitManipulationSolver:
                 nval = bit_not(val)
                 lines.append(f"{i} {rule.expr} = NOT({val}) = {nval}")
                 answer_bits.append(nval)
+            elif rule.family in TERNARY_FAMILIES:
+                assert rule.primary is not None and rule.secondary is not None and rule.tertiary is not None
+                a = question_bits[rule.primary]
+                b = question_bits[rule.secondary]
+                c = question_bits[rule.tertiary]
+                result = evaluate_rule(question_bits, rule)
+                lines.append(f"{i} {rule.expr} = {rule.family}({a},{b},{c}) = {result}")
+                answer_bits.append(result)
             else:
                 assert rule.primary is not None and rule.secondary is not None
                 a = question_bits[rule.primary]
