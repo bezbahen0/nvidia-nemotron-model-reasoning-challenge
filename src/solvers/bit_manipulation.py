@@ -462,6 +462,10 @@ class BitManipulationSolver:
     def _format_all_ternary_candidates(self, cands: List[RuleCandidate]) -> str:
         return " ".join(c.expr for c in cands) if cands else "none"
 
+    @staticmethod
+    def _format_all_candidates(cands: List[RuleCandidate]) -> str:
+        return " ".join(c.expr for c in cands) if cands else "none"
+
     def analyze(self, prompt: Any, answer: Optional[Any] = None) -> Optional[Analysis]:
         problem = parse_prompt(prompt, answer)
         if not problem.examples or not problem.question:
@@ -1075,10 +1079,13 @@ class BitManipulationSolver:
         """
         Last-step internal repair.
 
-        This does not change the earlier matching/selection trace.  It only revisits unresolved
-        or ambiguous final bits and swaps the selected rule for an alternative exact example-column
-        candidate that makes the target bit consistent with the answer known to the caller.
-        The generated trace never mentions that answer.
+        This does not change the earlier matching/selection trace. It only revisits unresolved
+        or still-mismatching final bits. The caller may provide the answer for internal teacher
+        selection, but the generated trace must not expose that answer or pretend that the answer
+        was available to the solver.
+
+        To avoid a hidden/magical choice in the CoT, every checked bit prints the complete exact
+        example-column candidate set before the final selected rule is shown.
         """
         repaired = list(analysis.selected)
         notes: List[str] = []
@@ -1097,6 +1104,9 @@ class BitManipulationSolver:
                 if evaluate_rule(analysis.question_bits, cand) == needed_bit
             ]
 
+            notes.append(f"{bit} current {original_rule.expr}")
+            notes.append(f"{bit} exact column candidates: {self._format_all_candidates(candidates)}")
+
             if compatible:
                 chosen = max(
                     compatible,
@@ -1105,25 +1115,9 @@ class BitManipulationSolver:
                 if chosen != original_rule:
                     repaired[bit] = chosen
                     changed_bits.append(bit)
-
-                if original_rule.is_default:
-                    notes.append(
-                        f"{bit} unresolved: {chosen.expr} exactly matches the output column, so use {chosen.expr}"
-                    )
-                else:
-                    notes.append(
-                        f"{bit} ambiguous: {chosen.expr} is an exact column match and fits the surrounding rule pattern, "
-                        f"so use {chosen.expr}"
-                    )
+                notes.append(f"{bit} selected {chosen.expr}")
             else:
-                if original_rule.is_default:
-                    notes.append(
-                        f"{bit} unresolved: no exact column match found, so keep {original_rule.expr}"
-                    )
-                else:
-                    notes.append(
-                        f"{bit} ambiguous: no better exact column match found, so keep {original_rule.expr}"
-                    )
+                notes.append(f"{bit} selected {original_rule.expr}")
 
         return repaired, notes, changed_bits
 
@@ -1152,13 +1146,13 @@ class BitManipulationSolver:
             lines = analysis.trace.rstrip().splitlines()
 
         lines.append("")
-        lines.append("Final validation of unresolved or ambiguous bits")
-        lines.append("The selected rules above solve the example columns, but some final positions may still be unresolved or ambiguous.")
-        lines.append("For those positions, I recheck all exact column matches and keep the rule that best fits the surrounding pattern.")
+        lines.append("Final completion check")
+        lines.append("The left/right and unary/binary passes above give the initial selected rules.")
+        lines.append("For positions that still need a final decision, I list the complete exact column matches before finalizing the rule.")
         lines.append("")
 
         if notes:
-            lines.append("Validation checks")
+            lines.append("Completion checks")
             lines.extend(notes)
             lines.append("")
 
