@@ -159,7 +159,8 @@ def main():
     results_df = pd.DataFrame.from_records(records)
 
     logger.info("\n" + results_df.to_string(index=False, justify="center"))
-    logger.info(f"Teoretical global accuracy: {sum(result) / len(result)}")
+    weighted_global_accuracy = data["is_correct_rounded"].mean() * 100
+    logger.info(f"Weighted global accuracy: {weighted_global_accuracy:.2f}")
 
 
 if __name__ == "__main__":
