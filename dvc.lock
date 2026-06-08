@@ -233,45 +233,46 @@ stages:
       md5: 8dab76ac69704eefa2dc893363cc4121
       size: 124845945
   dense_sft_train:
-    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.13_dense_sft_train
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.23_dense_sft_train
       --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
       --data algorithmic_cot_dense --train_path data/densed/train_densed.csv --seed
-      31231 --eval_steps 150 --val_path data/prepared/val_stratified.csv --output_dir
-      models/dense_sft_v0.0.13 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours
-      10.0 --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192\n"
+      31231 --eval_steps 370 --val_path data/prepared/val_stratified.csv --output_dir
+      models/dense_sft_v0.0.23 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours
+      11.0 --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192 --loss_impl
+      cce --cce_impl cce\n"
     deps:
     - path: data/densed/train_densed.csv
       hash: md5
-      md5: 9e313210b9c37a374e4ff22d6f9952ca
-      size: 53803674
+      md5: 8dab76ac69704eefa2dc893363cc4121
+      size: 124845945
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 7891e94d9a995f2de1efa9e24127698c
-      size: 1700551
+      md5: 954ed7c56822e3f8fbc623f90eef9060
+      size: 5760948
     - path: src/sft_train.py
       hash: md5
-      md5: 12817f9e842ac307247613c1916bd3fe
-      size: 23787
+      md5: cd4812bed7b5224deb06947ad772f36f
+      size: 37712
     params:
       params.yaml:
         data.dataset_name: algorithmic_cot
-        model.dense_sft_output_dir: models/dense_sft_v0.0.13
+        model.dense_sft_output_dir: models/dense_sft_v0.0.23
         model.id: 
           /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
         train.batch_size: 4
-        train.dense_eval_steps: 150
+        train.dense_eval_steps: 370
         train.epochs: 1
         train.grad_accum: 8
         train.lora_alpha: 64
         train.lora_r: 32
         train.lr: 0.0002
-        train.max_hours: 10.0
+        train.max_hours: 11.0
         train.max_seq_len: 8192
         train.seed: 31231
-        wandb.wandb_base_run_name: sft_v0.0.13
+        wandb.wandb_base_run_name: sft_v0.0.23
     outs:
-    - path: models/dense_sft_v0.0.13
+    - path: models/dense_sft_v0.0.23
       hash: md5
-      md5: 6dd48dc708d3230521c224f3ad21caf4.dir
-      size: 14261404318
-      nfiles: 30
+      md5: 252fa9c3e9cd4bafeb00d0de20aab124.dir
+      size: 10706989175
+      nfiles: 24
