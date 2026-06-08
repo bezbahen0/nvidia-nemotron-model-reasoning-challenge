@@ -115,88 +115,92 @@ stages:
       size: 10760412884
       nfiles: 29
   analyze_sft_train_telemetry:
-    cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.13/train_telemetry
-      --train_path data/generated/train_with_syntetic.csv --output_dir models/sft_v0.0.13_train_telemetry_analysis
+    cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.23/train_telemetry
+      --train_path data/generated/train_with_syntetic.csv --output_dir models/sft_v0.0.23_train_telemetry_analysis
       --use_all_records\n"
     deps:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 33973c1dd3e67de978ad8b318b9e7746
-      size: 22894589
-    - path: models/sft_v0.0.13
+      md5: 6e89e0e0b390eaf684f232ac7d5e79db
+      size: 61635788
+    - path: models/sft_v0.0.23
       hash: md5
-      md5: 9d9e635be1fdbd0e05f07325af7748c2.dir
-      size: 14300700429
-      nfiles: 43
+      md5: ba034260c699f2b0b819a118cc1119ad.dir
+      size: 10760412884
+      nfiles: 29
     - path: src/analyze_sft_telemetry.py
       hash: md5
       md5: d59e3a69f64f557825d28e467692c994
       size: 15187
     outs:
-    - path: models/sft_v0.0.13_train_telemetry_analysis
+    - path: models/sft_v0.0.23_train_telemetry_analysis
       hash: md5
-      md5: e4f18caa13651a87c19d67507a3e43e3.dir
-      size: 1628512
+      md5: ee47cfa58da106bdce8fdcb243677167.dir
+      size: 2246689
       nfiles: 5
   analyze_sft_eval_telemetry:
-    cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.13/eval_telemetry
-      --train_path data/prepared/val_stratified.csv --output_dir models/sft_v0.0.13_eval_telemetry_analysis
+    cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.23/eval_telemetry
+      --train_path data/prepared/val_stratified.csv --output_dir models/sft_v0.0.23_eval_telemetry_analysis
       --use_all_records\n"
     deps:
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 7891e94d9a995f2de1efa9e24127698c
-      size: 1700551
-    - path: models/sft_v0.0.13
+      md5: 954ed7c56822e3f8fbc623f90eef9060
+      size: 5760948
+    - path: models/sft_v0.0.23
       hash: md5
-      md5: 9d9e635be1fdbd0e05f07325af7748c2.dir
-      size: 14300700429
-      nfiles: 43
+      md5: ba034260c699f2b0b819a118cc1119ad.dir
+      size: 10760412884
+      nfiles: 29
     - path: src/analyze_sft_telemetry.py
       hash: md5
       md5: d59e3a69f64f557825d28e467692c994
       size: 15187
     outs:
-    - path: models/sft_v0.0.13_eval_telemetry_analysis
+    - path: models/sft_v0.0.23_eval_telemetry_analysis
       hash: md5
-      md5: 96efb0beb50c3ee98510d425ff10626f.dir
-      size: 982963
+      md5: 15ea726d71a8e08b9dbf2fc466a57c1a.dir
+      size: 1045996
       nfiles: 5
   build_dense_dataset:
     cmd: "python -m src.build_dense_dataset --input_path data/generated/train_with_syntetic.csv
-      --output_path data/densed/train_densed.csv --train_telemetry_dir models/sft_v0.0.13/train_telemetry
-      --eval_telemetry_dir models/sft_v0.0.13/eval_telemetry --label_weights '{\"\
-      cryptarithm\": 5.0, \"bit manipulation\": 4.0, \"numeral equations\": 3.0, \"\
-      encryption\": 1.3, \"string\": 0.5, \"unit conversion\": 0.5, \"gravitational\"\
-      : 0.5, \"conversion to diff numeral system\": 0.5}' --train_hard_multiplier
-      1.0 --train_very_hard_multiplier 1.1 --train_easy_multiplier 0.75 --eval_hard_multiplier
-      1.0 --eval_very_hard_multiplier 1.0 --eval_easy_multiplier 1.0 --max_repeat
-      6 --hard_boxed_answer_total_nll 0.8 --very_hard_boxed_answer_total_nll 1.6 --easy_boxed_answer_total_nll
-      0.2 --shuffle --seed 31231\n"
+      --output_path data/densed/train_densed.csv --train_telemetry_dir models/sft_v0.0.23/train_telemetry
+      --eval_telemetry_dir models/sft_v0.0.23/eval_telemetry --label_weights '{\"\
+      cryptarithm\": 1.0, \"bit manipulation\": 4.0, \"bit_matching\": 0.8, \"bit_tail_completion\"\
+      : 2.8, \"bit_tail_repair\": 2.4, \"numeral equations\": 2.5, \"numeral equations_rule_application\"\
+      : 1.5, \"numeral equations_family_matching\": 0.8, \"encryption\": 2.5, \"encryption_apply_mapping_to_target_partial\"\
+      : 2.0, \"encryption_new_mapping_from_completed_word\": 1.3, \"encryption_final_reconstruction\"\
+      : 1.4, \"encryption_pattern_completion\": 0.8, \"encryption_word_pair_mapping\"\
+      : 0.8, \"unit conversion\": 0.5, \"gravitational\": 0.5, \"conversion to diff
+      numeral system\": 0.5}' --train_hard_multiplier 1.1 --train_very_hard_multiplier
+      1.25 --train_easy_multiplier 0.75 --eval_hard_multiplier 1.0 --eval_very_hard_multiplier
+      1.0 --eval_easy_multiplier 1.0 --max_repeat 6 --hard_boxed_answer_total_nll
+      0.8 --very_hard_boxed_answer_total_nll 1.6 --easy_boxed_answer_total_nll 0.2
+      --shuffle --seed 31231\n"
     deps:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 33973c1dd3e67de978ad8b318b9e7746
-      size: 22894589
-    - path: models/sft_v0.0.13/eval_telemetry
+      md5: 6e89e0e0b390eaf684f232ac7d5e79db
+      size: 61635788
+    - path: models/sft_v0.0.23/eval_telemetry
       hash: md5
-      md5: ba5135204f0802bbf94ede8ea6cdb87a.dir
-      size: 12336544
-      nfiles: 6
-    - path: models/sft_v0.0.13/train_telemetry
+      md5: 877da84b40729f6d4ee3c3c47dd7daf3.dir
+      size: 3972934
+      nfiles: 2
+    - path: models/sft_v0.0.23/train_telemetry
       hash: md5
-      md5: 453ac74cc82812c130be90ccc94bd4c3.dir
-      size: 26977140
-      nfiles: 7
-    - path: models/sft_v0.0.13_eval_telemetry_analysis
+      md5: 1454fca07685934cbfee210675f51bd6.dir
+      size: 49446554
+      nfiles: 3
+    - path: models/sft_v0.0.23_eval_telemetry_analysis
       hash: md5
-      md5: 96efb0beb50c3ee98510d425ff10626f.dir
-      size: 982963
+      md5: 15ea726d71a8e08b9dbf2fc466a57c1a.dir
+      size: 1045996
       nfiles: 5
-    - path: models/sft_v0.0.13_train_telemetry_analysis
+    - path: models/sft_v0.0.23_train_telemetry_analysis
       hash: md5
-      md5: e4f18caa13651a87c19d67507a3e43e3.dir
-      size: 1628512
+      md5: ee47cfa58da106bdce8fdcb243677167.dir
+      size: 2246689
       nfiles: 5
     - path: src/build_dense_dataset.py
       hash: md5
@@ -209,20 +213,25 @@ stages:
         dense.eval_hard_multiplier: 1.0
         dense.eval_very_hard_multiplier: 1.0
         dense.hard_boxed_answer_total_nll: 0.8
-        dense.label_weights: '{"cryptarithm": 5.0, "bit manipulation": 4.0, "numeral
-          equations": 3.0, "encryption": 1.3, "string": 0.5, "unit conversion": 0.5,
-          "gravitational": 0.5, "conversion to diff numeral system": 0.5}'
+        dense.label_weights: '{"cryptarithm": 1.0, "bit manipulation": 4.0, "bit_matching":
+          0.8, "bit_tail_completion": 2.8, "bit_tail_repair": 2.4, "numeral equations":
+          2.5, "numeral equations_rule_application": 1.5, "numeral equations_family_matching":
+          0.8, "encryption": 2.5, "encryption_apply_mapping_to_target_partial": 2.0,
+          "encryption_new_mapping_from_completed_word": 1.3, "encryption_final_reconstruction":
+          1.4, "encryption_pattern_completion": 0.8, "encryption_word_pair_mapping":
+          0.8, "unit conversion": 0.5, "gravitational": 0.5, "conversion to diff numeral
+          system": 0.5}'
         dense.max_repeat: 6
         dense.train_easy_multiplier: 0.75
-        dense.train_hard_multiplier: 1.0
-        dense.train_very_hard_multiplier: 1.1
+        dense.train_hard_multiplier: 1.1
+        dense.train_very_hard_multiplier: 1.25
         dense.very_hard_boxed_answer_total_nll: 1.6
         train.seed: 31231
     outs:
     - path: data/densed/train_densed.csv
       hash: md5
-      md5: 9e313210b9c37a374e4ff22d6f9952ca
-      size: 53803674
+      md5: 8dab76ac69704eefa2dc893363cc4121
+      size: 124845945
   dense_sft_train:
     cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.13_dense_sft_train
       --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
