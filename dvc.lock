@@ -10,18 +10,18 @@ stages:
       size: 3069304
     - path: src/generate_cot.py
       hash: md5
-      md5: 6696d50e74d84fe5e50712a0a7250ba1
-      size: 8016
+      md5: 9e05dd4ce9c5dcef38c3c454ef9fc19a
+      size: 5706
     - path: src/solvers
       hash: md5
-      md5: 0f1ad7c3f539fe8d7e20c67e9202409e.dir
-      size: 308075
+      md5: 5a3732f62e53b0595c00a85be45c2ddf.dir
+      size: 664359
       nfiles: 20
     outs:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: 9fbeaf692eec602ef51197cd61d34f50
-      size: 57516969
+      md5: f6e81ad44135dc064df335bc402d6f1b
+      size: 38691811
   split_data:
     cmd: "python -m src.split_data --data_path data/solved/train-cot.csv --train_path
       data/prepared/train_stratified.csv --seed 31231 --val_path data/prepared/val_stratified.csv
@@ -29,8 +29,8 @@ stages:
     deps:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: 9fbeaf692eec602ef51197cd61d34f50
-      size: 57516969
+      md5: f6e81ad44135dc064df335bc402d6f1b
+      size: 38691811
     - path: src/split_data.py
       hash: md5
       md5: 76996cca37670c38647a078f69767e18
@@ -42,12 +42,12 @@ stages:
     outs:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: a55f015e9de22cc4e6a8f1deceecbad2
-      size: 51758288
+      md5: cf0808df226bd9f25332430c0be02ff4
+      size: 34868537
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 954ed7c56822e3f8fbc623f90eef9060
-      size: 5760948
+      md5: 313c77456aabd9e61928d8a8556b88a7
+      size: 3829062
   prepare_data:
     cmd: "python -m src.prepare_dataset --data_path data/prepared/train_stratified.csv
       --output_path data/generated/train_with_syntetic.csv --seed 31231 --tokenizer_path
@@ -55,12 +55,12 @@ stages:
     deps:
     - path: data/prepared/train_stratified.csv
       hash: md5
-      md5: a55f015e9de22cc4e6a8f1deceecbad2
-      size: 51758288
+      md5: cf0808df226bd9f25332430c0be02ff4
+      size: 34868537
     - path: src/prepare_dataset.py
       hash: md5
-      md5: 2abce7991b87257ffde2bd45eba7a4b0
-      size: 12949
+      md5: 20253c90fa64d8c634e9a65eb597469e
+      size: 10107
     params:
       params.yaml:
         model.id: 
@@ -69,25 +69,25 @@ stages:
     outs:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 6e89e0e0b390eaf684f232ac7d5e79db
-      size: 61635788
+      md5: 516771676b93f8ba42d94b9da02189bc
+      size: 70446264
   base_sft_train:
-    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.23_base_sft_train
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.24_base_sft_train
       --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
       --data algorithmic_cot --train_path data/generated/train_with_syntetic.csv --seed
       31231 --eval_steps 320 --val_path data/prepared/val_stratified.csv --output_dir
-      models/sft_v0.0.23 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours 11.0
+      models/sft_v0.0.24 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours 11.0
       --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192 --train_telemetry
       --eval_telemetry --loss_impl cce --cce_impl cce --cce_compare_default_loss_once\n"
     deps:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 6e89e0e0b390eaf684f232ac7d5e79db
-      size: 61635788
+      md5: 516771676b93f8ba42d94b9da02189bc
+      size: 70446264
     - path: data/prepared/val_stratified.csv
       hash: md5
-      md5: 954ed7c56822e3f8fbc623f90eef9060
-      size: 5760948
+      md5: 313c77456aabd9e61928d8a8556b88a7
+      size: 3829062
     - path: src/sft_train.py
       hash: md5
       md5: cd4812bed7b5224deb06947ad772f36f
@@ -107,12 +107,12 @@ stages:
         train.max_hours: 11.0
         train.max_seq_len: 8192
         train.seed: 31231
-        wandb.wandb_base_run_name: sft_v0.0.23
+        wandb.wandb_base_run_name: sft_v0.0.24
     outs:
-    - path: models/sft_v0.0.23
+    - path: models/sft_v0.0.24
       hash: md5
-      md5: ba034260c699f2b0b819a118cc1119ad.dir
-      size: 10760412884
+      md5: 2ef781225e2985a65cb987de84941c5e.dir
+      size: 10760619289
       nfiles: 29
   analyze_sft_train_telemetry:
     cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.23/train_telemetry
