@@ -158,7 +158,145 @@ class CryptarithmMappingSubtaskGenerator:
         return CryptarithmMappingSubtaskGenerator._section(cot, "Target", [])
 
     @staticmethod
-    def _context_sections(cot: str, include_domain_search: bool = False) -> str:
+    def _sanitize_structural_context(text: str, hide_selected_rules: bool = False) -> str:
+        """Remove answer-like selected-rule lines from structural context when needed."""
+        if not hide_selected_rules:
+            return text
+        out: List[str] = []
+        for ln in str(text or "").splitlines():
+            stripped = ln.strip()
+            if stripped.startswith("selected rule in successful proof:"):
+                continue
+            if stripped.startswith("selected rule:"):
+                continue
+            if stripped.startswith("not solved:"):
+                continue
+            out.append(ln.rstrip())
+        return "\n".join(out).strip()
+
+    @staticmethod
+    def _sanitize_domain_search_for_mapping_prompt(domain_search: str) -> str:
+        """Keep the reasoning path but remove the final map label from build-mapping prompts."""
+        blocks = CryptarithmMappingSubtaskGenerator._split_family_blocks(domain_search)
+        kept: List[str] = []
+        for _num, header, block in blocks:
+            if header.startswith("singleton domains verify the examples"):
+                continue
+            kept.append(block)
+        return "\n".join(kept).strip()
+
+    @staticmethod
+    def _target_prompt_input(target: str) -> str:
+        """Return a target section with computation/output lines hidden."""
+        lines: List[str] = []
+        for ln in str(target or "").splitlines():
+            stripped = ln.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(("decode ", "apply rule:", "encode ", "Computed output:", "Final answer:", "\\boxed")):
+                continue
+            if (stripped.startswith("std/cat writes") or stripped.startswith("rev/cat writes")):
+                if "->" in stripped:
+                    before = stripped.split("->", 1)[0].rstrip()
+                    lines.append(before + " -> <output>")
+                else:
+                    lines.append(stripped)
+                continue
+            lines.append(ln.rstrip())
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _target_expression_from_section(target: str) -> str:
+        m = re.search(r"(?m)^Replay the rule on target\s+(.+?):\s*$", target or "")
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"(?m)^std/cat writes .*?:\s*(.+?)\s*->\s*\S+\s*$", target or "")
+        if m:
+            return m.group(1).strip()
+        return ""
+
+    @staticmethod
+    def _domain_assignment_pattern() -> re.Pattern[str]:
+        return re.compile(r"(D\[(?:'[^']*'|\"[^\"]*\"|[^\]]+)\])\s*=\s*(\{[^{}]*\})")
+
+    @classmethod
+    def _parse_update_before_after(cls, update_text: str) -> List[Tuple[str, str, str]]:
+        return [(m.group(1), m.group(2), m.group(3)) for m in cls._domain_update_pattern().finditer(update_text or "")]
+
+    @classmethod
+    def _domain_state_before_blocks(cls, domain_search: str) -> Dict[int, Dict[str, str]]:
+        """Best-effort replay of domain updates so local subtasks have enough current domains."""
+        state: Dict[str, str] = {}
+        snapshots: Dict[int, Dict[str, str]] = {}
+        for num, _header, block in cls._split_family_blocks(domain_search):
+            snapshots[num] = dict(state)
+            update_text = cls._extract_apply_projection_updates(block)
+            for sym, _before, after in cls._parse_update_before_after(update_text):
+                state[sym] = after
+        return snapshots
+
+    @classmethod
+    def _domain_symbols_from_supported_projection(cls, block: str) -> List[str]:
+        m = re.search(r"(?m)^\s*supported digit projection:\s*(.+)$", block or "")
+        if not m:
+            return []
+        syms: List[str] = []
+        for dm in cls._domain_assignment_pattern().finditer(m.group(1)):
+            if dm.group(1) not in syms:
+                syms.append(dm.group(1))
+        return syms
+
+    @classmethod
+    def _current_domains_for_block(cls, block: str, state_before: Dict[str, str], update_text: str) -> List[str]:
+        syms = cls._domain_symbols_from_supported_projection(block)
+        state = dict(state_before)
+        for sym, before, _after in cls._parse_update_before_after(update_text):
+            if sym not in syms:
+                syms.append(sym)
+            state[sym] = before
+        rows: List[str] = []
+        for sym in syms:
+            rows.append(f"{sym}={state.get(sym, '{0..9}')}")
+        return rows
+
+    @staticmethod
+    def _domain_values_to_set(text: str) -> set[int]:
+        text = (text or "").strip()
+        if text == "{0..9}":
+            return set(range(10))
+        if not (text.startswith("{") and text.endswith("}")):
+            return set()
+        body = text[1:-1].strip()
+        if not body:
+            return set()
+        out: set[int] = set()
+        for part in body.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ".." in part:
+                lo, hi = part.split("..", 1)
+                out.update(range(int(lo), int(hi) + 1))
+            else:
+                out.add(int(part))
+        return out
+
+    @staticmethod
+    def _set_to_domain_values(values: Iterable[int]) -> str:
+        vals = sorted(set(int(v) for v in values))
+        if vals == list(range(10)):
+            return "{0..9}"
+        return "{" + ",".join(str(v) for v in vals) + "}"
+
+    @classmethod
+    def _removed_digits_from_update(cls, update_text: str) -> set[int]:
+        removed: set[int] = set()
+        for _sym, before, after in cls._parse_update_before_after(update_text):
+            removed.update(cls._domain_values_to_set(before) - cls._domain_values_to_set(after))
+        return removed
+
+    @staticmethod
+    def _context_sections(cot: str, include_domain_search: bool = False, hide_structural_selected: bool = False) -> str:
         names = [
             ("Examples", ["Parsed equations", "Symbols", "Transparent concat", "Search space", "Structural family filtering", "Rule and digit-domain search", "Selected rules", "Target"]),
             ("Parsed equations", ["Symbols", "Transparent concat", "Search space", "Structural family filtering", "Rule and digit-domain search", "Selected rules", "Target"]),
@@ -171,11 +309,16 @@ class CryptarithmMappingSubtaskGenerator:
         for name, ends in names:
             sec = CryptarithmMappingSubtaskGenerator._section(cot, name, ends)
             if sec:
-                parts.append(f"{name}\n{sec}")
+                if name == "Structural family filtering":
+                    sec = CryptarithmMappingSubtaskGenerator._sanitize_structural_context(sec, hide_selected_rules=hide_structural_selected)
+                if sec:
+                    parts.append(f"{name}\n{sec}")
         if include_domain_search:
             sec = CryptarithmMappingSubtaskGenerator._section(cot, "Rule and digit-domain search", ["Selected rules", "Selected digit map", "Verify selected rules", "Target"])
             if sec:
-                parts.append(f"Rule and digit-domain search\n{sec}")
+                sec = CryptarithmMappingSubtaskGenerator._sanitize_domain_search_for_mapping_prompt(sec)
+                if sec:
+                    parts.append(f"Rule and digit-domain search\n{sec}")
         return "\n\n".join(parts).strip()
 
     # ----------------------------- row helpers -----------------------------
@@ -219,7 +362,7 @@ class CryptarithmMappingSubtaskGenerator:
         prompt_lines = self._prompt_prefix(
             "Task: build the digit mapping. Use the family support tables, projections, AllDifferent, and accepted decisions. Do not verify examples and do not solve the target."
         )
-        prompt_lines.extend(["", "Source reasoning context:", context, "", "Return the selected rules and the selected digit map. Finish with:", "Answer: <semicolon-separated digit map>"])
+        prompt_lines.extend(["", "Source reasoning context:", context, "", "Return the selected digit map. Finish with:", "Answer: <semicolon-separated digit map>"])
         answer = selected_map.replace("\n", " ").strip()
         completion = f"Selected rules\n{selected_rules}\n\nSelected digit map\n{selected_map}\nAnswer: {answer}"
         return self._row(source_id, source_prompt, source_answer, "cryptarithm_build_mapping", "build_mapping", "\n".join(prompt_lines), completion, answer)
@@ -228,7 +371,7 @@ class CryptarithmMappingSubtaskGenerator:
         domain_search = self._section(cot, "Rule and digit-domain search", ["Selected rules", "Selected digit map", "Verify selected rules", "Target"])
         if not domain_search:
             return []
-        context = self._context_sections(cot, include_domain_search=False)
+        context = self._context_sections(cot, include_domain_search=False, hide_structural_selected=True)
         out: List[Dict[str, Any]] = []
         for num, header, block in self._split_family_blocks(domain_search):
             if "tests candidate families" not in header:
@@ -260,6 +403,7 @@ class CryptarithmMappingSubtaskGenerator:
         if not domain_search:
             return []
         context = self._context_sections(cot, include_domain_search=False)
+        snapshots = self._domain_state_before_blocks(domain_search)
         out: List[Dict[str, Any]] = []
         for num, header, block in self._split_family_blocks(domain_search):
             if not header.startswith("projection by"):
@@ -269,7 +413,7 @@ class CryptarithmMappingSubtaskGenerator:
                 continue
             # Remove target outputs from prompt: supported projection and apply projection/update.
             prompt_block = self._strip_lines(block, ["supported digit projection:", "apply projection:", "apply update:", "update:"])
-            current_domains = self._current_domains_from_updates(update_text)
+            current_domains = self._current_domains_for_block(block, snapshots.get(num, {}), update_text)
             prompt_lines = self._prompt_prefix(
                 "Task: perform this mapping projection step. From the formula, column reasoning, and current domains, compute the supported digit projection and the domain update."
             )
@@ -305,6 +449,10 @@ class CryptarithmMappingSubtaskGenerator:
                 "Task: apply this local domain update while building the digit map."
             )
             prompt_lines.extend(["", "Context:", context, "", "Local domain operation:", prompt_block])
+            if header.startswith("AllDifferent"):
+                removed_digits = self._removed_digits_from_update(update_text)
+                if removed_digits:
+                    prompt_lines.extend(["", "Digits to remove from the listed non-fixed domains:", self._set_to_domain_values(removed_digits)])
             if current_domains:
                 prompt_lines.extend(["", "Current domains before this update:"])
                 prompt_lines.extend(current_domains)
@@ -331,7 +479,8 @@ class CryptarithmMappingSubtaskGenerator:
             prompt_lines.extend(["", "Selected digit map:", selected_map])
         else:
             prompt_lines.extend(["", "Digit map:", "not needed for a fixed concat target"])
-        prompt_lines.extend(["", "Target section input:", self._strip_lines(target, ["Computed output:", "Final answer:", "\\boxed"]), "", "Return the target calculation. Finish with:", "Answer: <visible output>"])
+        target_input = self._target_prompt_input(target)
+        prompt_lines.extend(["", "Target section input:", target_input, "", "Return the target calculation. Finish with:", "Answer: <visible output>"])
         completion = target.rstrip() + f"\nAnswer: {answer}"
         mode = "cryptarithm_concat_direct_target" if self._is_fixed_concat_direct(cot) else "cryptarithm_target_application"
         return self._row(source_id, source_prompt, source_answer, mode, "target", "\n".join(prompt_lines), completion, answer)
@@ -346,7 +495,7 @@ class CryptarithmMappingSubtaskGenerator:
         if not target:
             return None
         prompt_lines = self._prompt_prefix("Task: solve a fixed positional concat target. Do not assign digit values.")
-        prompt_lines.extend(["", "Transparent concat evidence:", transparent, "", "Structural filtering:", structural, "", "Target input:", self._strip_lines(target, ["Computed output:", "Final answer:", "\\boxed"]), "", "Return the concat output. Finish with:", "Answer: <visible output>"])
+        prompt_lines.extend(["", "Transparent concat evidence:", transparent, "", "Structural filtering:", structural, "", "Target input:", self._target_prompt_input(target), "", "Return the concat output. Finish with:", "Answer: <visible output>"])
         completion = target.rstrip() + f"\nAnswer: {answer}"
         return self._row(source_id, source_prompt, source_answer, "cryptarithm_concat_direct", "concat_direct", "\n".join(prompt_lines), completion, answer)
 
