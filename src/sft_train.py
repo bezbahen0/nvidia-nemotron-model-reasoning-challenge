@@ -973,10 +973,6 @@ def main():
     logger.info(f"train dataset final len: {len(train_dataset)}")
     train_metadata = load_metadata(args.train_path)
 
-    
-    val_dataset = prepare_dataset(args.val_path, eval=True)
-    logger.info(f"val dataset final len: {len(val_dataset)}")
-    eval_metadata = load_metadata(args.val_path)
 
     logger.info("Загрузка модели в bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -1042,14 +1038,11 @@ def main():
     trainer = TelemetrySFTTrainer(
         model=model,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
         peft_config=lora_config,
         args=training_args,
         callbacks=[TimeLimitCallback(max_hours=args.max_hours), MemoryStatsCallback()],
         train_telemetry_metadata=train_metadata,
-        eval_telemetry_metadata=eval_metadata,
         train_telemetry_output_dir=train_telemetry_output_dir,
-        eval_telemetry_output_dir=eval_telemetry_output_dir,
         telemetry_save_steps=args.eval_steps,
         train_telemetry_enabled=args.train_telemetry,
         eval_telemetry_enabled=args.eval_telemetry,
