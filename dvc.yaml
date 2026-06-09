@@ -37,8 +37,7 @@ stages:
       --data ${data.dataset_name}
       --train_path ${data.train_generated}
       --seed ${train.seed}
-      --eval_steps ${train.eval_steps}
-      --val_path ${data.val_prepared}
+      --save_steps ${train.eval_steps}
       --output_dir ${model.sft_output_dir}
       --batch_size ${train.batch_size}
       --grad_accum ${train.grad_accum}
