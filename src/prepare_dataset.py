@@ -10,11 +10,13 @@ import pandas as pd
 from transformers import AutoTokenizer
 
 from src.augmentation.equations.numeral_equations_augment import NumeralEquationAugmentGenerator
-from src.augmentation.equations.cryptarithm_task_generator import CryptarithmAugmentGenerator
+from src.augmentation.equations.cryptarithm_task_generator import (
+    CryptarithmMappingSubtaskGenerator,
+    MappingSubtaskConfig,
+)
 
 from src.augmentation.bit_manipulation import BitMatchingAugmentGenerator, BitMatchingAugmentConfig
 from src.augmentation.encryption import EncryptionTaskGenerator
-from src.augmentation.encryption_cot_augment import EncryptionCotAugmentGenerator, EncryptionCotAugmentConfig
 from src.metric import verify
 from src.log import logger
 
@@ -26,7 +28,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--tokenizer_path", type=str, required=True)
     parser.add_argument("--max_generated_cot_tokens", type=int, default=7800)
-    parser.add_argument("--cryptarithm_generated_count", type=int, default=500)
     
     return parser.parse_args()
 
@@ -76,87 +77,13 @@ def main():
     data = data[~data.computed_answer.isna()].copy()
     data["source"] = len(data) * ["solver"]
 
-    # Keep the full bit-manipulation source before the correctness filter.
-    # Tail-repair augmentation needs failed bit rows because it tries to
-    # construct a corrected final block with answer_hint. The main solver CoT
-    # training rows below should still stay verified-only, as before.
-    bit_aug_source_data = data[data.label == "bit manipulation"].copy()
 
     # skip all answer that not verified for the main solver-generated rows
     data = data[data.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1)].copy()
 
     logger.info(f"Datset countes: \n{data.label.value_counts()}")
-    logger.info(
-        "Bit manipulation augmentation source rows before verify filter: "
-        f"{len(bit_aug_source_data)}"
-    )
-    logger.info(
-        "Bit manipulation rows kept as full solver CoT after verify filter: "
-        f"{len(data[data.label == 'bit manipulation'])}"
-    )
 
-    # bit manipulation
-    # Keep historical bit_matching generation on verified source rows, so the
-    # existing bit_matching distribution does not change just because tail repair
-    # needs failed rows.
-    bit_matching_generator = BitMatchingAugmentGenerator(
-        seed=args.seed,
-        config=BitMatchingAugmentConfig(
-            include_matching=True,
-            include_tail_completion=False,
-            include_tail_repair=False,
-        ),
-    )
-
-    bit_matching_dataset = bit_matching_generator.generate_dataset(
-        source_data=data[data.label == "bit manipulation"].copy(),
-        sample_frac=1.0,
-        only_solver_correct=False,
-        include_matching=True,
-        include_tail_completion=False,
-        include_tail_repair=False,
-    )
-
-    # Tail subtasks are generated from the full bit source before the verify
-    # filter, because tail_repair is defined on failed baseline rows. The
-    # augmenter itself filters emitted tails to correct/leak-free completions.
-    bit_tail_generator = BitMatchingAugmentGenerator(
-        seed=args.seed,
-        config=BitMatchingAugmentConfig(
-            include_matching=False,
-            include_tail_completion=True,
-            include_tail_repair=True,
-            tail_require_correct=True,
-            tail_completion_require_change=True,
-            tail_repair_require_success=True,
-        ),
-    )
-
-    bit_tail_dataset = bit_tail_generator.generate_dataset(
-        source_data=bit_aug_source_data.copy(),
-        sample_frac=1.0,
-        only_solver_correct=False,
-        include_matching=False,
-        include_tail_completion=True,
-        include_tail_repair=True,
-    )
-
-    bit_mp_gen_dataset = pd.concat(
-        [df for df in [bit_matching_dataset, bit_tail_dataset] if df is not None and len(df)],
-        ignore_index=True,
-    ) if len(bit_matching_dataset) or len(bit_tail_dataset) else pd.DataFrame()
-    bit_mp_gen_dataset = with_source(bit_mp_gen_dataset, "solver")
-
-    logger.info("\nBit manipulation augmenter:")
-    logger.info(bit_mp_gen_dataset.columns.tolist())
-    if len(bit_mp_gen_dataset) and "task_mode" in bit_mp_gen_dataset.columns:
-        logger.info(bit_mp_gen_dataset.task_mode.value_counts(dropna=False))
-        logger.info(bit_mp_gen_dataset.label.value_counts(dropna=False))
-    logger.info(f"Generated rows: {len(bit_mp_gen_dataset)}")
-    logger.info(
-        f"Source solver correct rate: "
-        f"{bit_mp_gen_dataset['source_solver_correct'].mean() if len(bit_mp_gen_dataset) and 'source_solver_correct' in bit_mp_gen_dataset.columns else 0.0}"
-    )
+    
 
     # Numeral equations
     # Instead of generating new full AST brute-force tasks, derive small Alice-style
@@ -184,7 +111,6 @@ def main():
 
 
     # Encryption
-
     global_vocab = set()
     for prompt in data[data.label == "encryption"]['prompt']:
         lines = [l.strip() for l in prompt.lower().splitlines() if "->" in l]
@@ -200,66 +126,69 @@ def main():
     encryption_generator = EncryptionTaskGenerator(vocabulary=global_vocab, seed=args.seed)
 
     encryption_gen_dataset = encryption_generator.generate_dataset(
-        int(len(data[data.label == "encryption"]) *  0.5)
+        int(len(data[data.label == "encryption"]) *  1.0)
     )
     encryption_gen_dataset = with_source(encryption_gen_dataset, "generated")
 
-    encryption_cot_augment_generator = EncryptionCotAugmentGenerator(
-        seed=args.seed,
-        config=EncryptionCotAugmentConfig(
-            sample_frac=1.0,
-            only_solver_correct=False,
-            task_modes=(
-                "word_pair_mapping",
-                "apply_mapping_to_target_partial",
-                "pattern_completion",
-                "new_mapping_from_completed_word",
-                "final_reconstruction",
-            ),
-            # Можно ограничить, если word_pair задач станет слишком много:
-            # max_word_pair_tasks_per_row=6,
-        ),
+    # Cryptarithm mapping subtasks
+    # Derive focused subtasks from the v3 cryptarithm training CoTs.  These are
+    # not new random cryptarithms: they slice a solved trace into rule-selection,
+    # projection/domain-update, build-mapping, concat-direct, and target-application
+    # tasks.  Fixed-concat target traces intentionally skip digit-map construction.
+    cryptarithm_mapping_augment_generator = CryptarithmMappingSubtaskGenerator(
+        config=MappingSubtaskConfig(
+            include_build_mapping=True,
+            include_rule_selection=True,
+            include_projection_step=True,
+            include_domain_update=True,
+            include_target_application=True,
+            include_concat_direct=True,
+            include_rule_legend=True,
+            skip_fixed_concat_build_mapping=True,
+        )
+    )
+    cryptarithm_mapping_aug_dataset = cryptarithm_mapping_augment_generator.generate_dataset(
+        source_data=data[data.label == "cryptarithm"].copy()
+    )
+    cryptarithm_mapping_aug_dataset = with_source(cryptarithm_mapping_aug_dataset, "solver")
+
+    logger.info("\nCryptarithm mapping subtasks augmenter:")
+    logger.info(cryptarithm_mapping_aug_dataset.columns.tolist())
+    if len(cryptarithm_mapping_aug_dataset) and "task_mode" in cryptarithm_mapping_aug_dataset.columns:
+        logger.info(cryptarithm_mapping_aug_dataset.task_mode.value_counts(dropna=False))
+        logger.info(cryptarithm_mapping_aug_dataset.label.value_counts(dropna=False))
+    logger.info(f"Generated rows: {len(cryptarithm_mapping_aug_dataset)}")
+    logger.info(
+        f'Accuracy: '
+        f'{cryptarithm_mapping_aug_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean() if len(cryptarithm_mapping_aug_dataset) else 0.0}'
     )
 
-    encryption_cot_aug_dataset = encryption_cot_augment_generator.generate_dataset(
-        source_data=data[data.label == "encryption"].copy(),
+        # bit manipulation
+    bit_matching_generator = BitMatchingAugmentGenerator(seed=args.seed)
+
+    bit_mp_gen_dataset = bit_matching_generator.generate_dataset(
+        source_data=data[data.label == "bit manipulation"].copy(),
         sample_frac=1.0,
         only_solver_correct=False,
     )
+    bit_mp_gen_dataset = with_source(bit_mp_gen_dataset, "solver")
 
-    encryption_cot_aug_dataset = with_source(encryption_cot_aug_dataset, "solver")
-
-    # Cryptarithm
-    # Fully synthetic concat-only Alice-style tasks. The generator creates the
-    # prompt, computes the intended answer, calls CryptarithmSolver immediately,
-    # and stores solver output as generated_cot/computed_answer.
-    cryptarithm_generator = CryptarithmAugmentGenerator(seed=args.seed)
-    cryptarithm_gen_dataset = pd.DataFrame(
-        cryptarithm_generator.generate_dataset(
-            n=args.cryptarithm_generated_count,
-            include_metadata=False,
-            validate=True,
-        )
-    )
-    if len(cryptarithm_gen_dataset):
-        cryptarithm_gen_dataset["label"] = "cryptarithm"
-    cryptarithm_gen_dataset = with_source(cryptarithm_gen_dataset, "generated")
-
-    logger.info("\nCryptarithm generator:")
-    logger.info(cryptarithm_gen_dataset.columns.tolist())
-    logger.info(f"Generated rows: {len(cryptarithm_gen_dataset)}")
+    logger.info("\nBit matching augmenter:")
+    logger.info(bit_mp_gen_dataset.columns.tolist())
+    logger.info(bit_mp_gen_dataset.task_mode.value_counts(normalize=True))
+    logger.info(f"Generated rows: {len(bit_mp_gen_dataset)}")
     logger.info(
-        f'Accuracy: '
-        f'{cryptarithm_gen_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean() if len(cryptarithm_gen_dataset) else 0.0}'
+        f"Source solver correct rate: "
+        f"{bit_mp_gen_dataset['source_solver_correct'].mean() if len(bit_mp_gen_dataset) else 0.0}"
     )
 
 
     generated_parts = [
         numeral_equations_aug_dataset,           # subtasks from real solver numeral equations
         encryption_gen_dataset,                  # synthetic encryption tasks
-        encryption_cot_aug_dataset,
+        #encryption_cot_aug_dataset,
         bit_mp_gen_dataset,                      # subtasks from real solver bit-manipulation tasks
-        cryptarithm_gen_dataset,                 # synthetic concat-only cryptarithm tasks
+        cryptarithm_mapping_aug_dataset,         # mapping-focused subtasks from real cryptarithm CoTs
     ]
     generated_parts = [normalize_generated_columns(df) for df in generated_parts if df is not None and len(df)]
     data_gen = pd.concat(generated_parts, ignore_index=True) if generated_parts else pd.DataFrame(
