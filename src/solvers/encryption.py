@@ -1,145 +1,483 @@
+from __future__ import annotations
+
 import re
+from collections import defaultdict
+from functools import lru_cache
+from pathlib import Path
+from typing import Iterable
+
+
+_WONDERLAND_PATH = Path(__file__).with_name("wonderland.txt")
+_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
+_DASH = "–"
+
+DEFAULT_WONDERLAND_WORDS: tuple[str, ...] = tuple(
+    """
+    above alice ancient around beyond bird book bright castle cat cave chases clever
+    colorful creates crystal curious dark discovers door dragon draws dreams explores
+    follows forest found garden golden hatter hidden imagines in inside island key king
+    knight library magical map message mirror mountain mouse mysterious near ocean
+    palace potion princess puzzle queen rabbit reads school secret sees silver story
+    strange student studies teacher the through tower treasure turtle under valley
+    village watches wise wizard wonderland writes
+    """.split()
+)
+
+
+def _clean_phrase(text: str) -> str:
+    """Keep lowercase latin words separated by a single space."""
+    return " ".join(re.findall(r"[a-z]+", str(text).lower()))
+
+
+@lru_cache(maxsize=1)
+def _load_wonderland_words() -> tuple[str, ...]:
+    """Load the task vocabulary, sorted deterministically."""
+    if _WONDERLAND_PATH.exists():
+        text = _WONDERLAND_PATH.read_text(encoding="utf-8")
+        words = [_clean_phrase(w) for w in text.split()]
+        return tuple(sorted(w for w in words if w))
+    return tuple(sorted(DEFAULT_WONDERLAND_WORDS))
+
+
+def _word_pattern(word: str) -> tuple[int, ...]:
+    """Repeated-letter pattern: 'paper' -> (0, 1, 0, 2, 3)."""
+    seen: dict[str, int] = {}
+    pattern: list[int] = []
+    for ch in word:
+        if ch not in seen:
+            seen[ch] = len(seen)
+        pattern.append(seen[ch])
+    return tuple(pattern)
+
+
+def _pattern_str(word: str) -> str:
+    return "-".join(str(x) for x in _word_pattern(word))
+
 
 class EncryptionSolver:
-    """Решатель для моноалфавитного шифра с использованием детерминированного словаря."""
-    
-    def __init__(self, vocabulary: set):
-        self.vocab = vocabulary
+    """Wonderland monoalphabetic substitution-cipher reasoning generator.
 
-    def generate_cot(self, prompt: str, answer_hint: str = None) -> str:
-        prompt = prompt.lower()
-        
-        target_match = re.search(r"now[, ]*decrypt(?: the)?(?: following)?(?: text)?:\s*([a-z\s]+)", prompt)
-        if not target_match:
-            return "The target ciphertext could not be found in the prompt.\nFinal answer: nan"
-        target_cipher = target_match.group(1).strip()
-        
-        lines = [l.strip() for l in prompt.splitlines() if "->" in l]
-        pairs = []
-        for line in lines:
-            ciph, plain = line.split("->", 1)
-            pairs.append((re.sub(r"[^a-z\s]", "", ciph).strip(), 
-                          re.sub(r"[^a-z\s]", "", plain).strip()))
-            
-        cot = [
-            "The task is to solve a monoalphabetic substitution cipher. First, we need to extract the known letter mappings from the provided examples."
-        ]
-        
-        cot.append("Let's align the words from the examples to deduce the initial letter mappings by matching word lengths and positions.")
-        
-        mapping = {}
-        for i, (ciph, plain) in enumerate(pairs, 1):
-            c_words = ciph.split()
+    This solver intentionally does not use answer_hint. It follows the same
+    core constraints as the reference reasoner:
+      * deterministic Wonderland vocabulary;
+      * cipher->plain consistency;
+      * plain->cipher consistency, so the mapping is bijective;
+      * repeated-letter pattern equality between cipher and candidate words.
+
+    By default, vocabulary passed by the caller is ignored because the benchmark
+    task vocabulary is wonderland.txt. Set force_wonderland=False only if you
+    intentionally want to solve against a custom vocabulary.
+    """
+
+    def __init__(self, vocabulary: Iterable[str] | None = None, *, force_wonderland: bool = True):
+        raw_words = _load_wonderland_words() if force_wonderland or vocabulary is None else vocabulary
+        words = {_clean_phrase(w) for w in raw_words}
+        words.discard("")
+        self.vocab: tuple[str, ...] = tuple(sorted(words))
+        self.vocab_set: set[str] = set(self.vocab)
+        self._by_len: dict[int, list[str]] = defaultdict(list)
+        for word in self.vocab:
+            self._by_len[len(word)].append(word)
+
+    # ------------------------------------------------------------------
+    # Prompt parsing
+    # ------------------------------------------------------------------
+    def _extract_target(self, prompt: str) -> str | None:
+        lines = prompt.lower().splitlines()
+        marker = re.compile(
+            r"now[, ]*decrypt(?: the)?(?: following)?(?: text)?\s*:?\s*(.*)$",
+            re.IGNORECASE,
+        )
+        for idx, line in enumerate(lines):
+            m = marker.search(line)
+            if not m:
+                continue
+            same_line = _clean_phrase(m.group(1))
+            if same_line:
+                return same_line
+            for nxt in lines[idx + 1:]:
+                cleaned = _clean_phrase(nxt)
+                if cleaned:
+                    return cleaned
+
+        m = re.search(
+            r"now[, ]*decrypt(?: the)?(?: following)?(?: text)?\s*:?\s*([a-z]+(?:[ \t]+[a-z]+)*)",
+            prompt.lower(),
+        )
+        return _clean_phrase(m.group(1)) if m else None
+
+    def _extract_examples(self, prompt: str) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        for raw_line in prompt.lower().splitlines():
+            if "->" not in raw_line:
+                continue
+            left, right = raw_line.split("->", 1)
+            if ":" in left:
+                left = left.rsplit(":", 1)[1]
+            # Some prompts include comments/explanations after the pair.
+            right = right.split("/", 1)[0]
+            cipher = _clean_phrase(left)
+            plain = _clean_phrase(right)
+            if cipher and plain:
+                pairs.append((cipher, plain))
+        return pairs
+
+    # ------------------------------------------------------------------
+    # Mapping and candidate helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _add_mapping(c2p: dict[str, str], p2c: dict[str, str], c: str, p: str) -> bool:
+        if c in c2p:
+            return c2p[c] == p
+        if p in p2c:
+            return p2c[p] == c
+        c2p[c] = p
+        p2c[p] = c
+        return True
+
+    def _decode_word(self, cipher_word: str, c2p: dict[str, str]) -> str:
+        return "".join(c2p.get(ch, "?") for ch in cipher_word)
+
+    def _candidate_words(self, cipher_word: str, c2p: dict[str, str], p2c: dict[str, str]) -> list[str]:
+        candidates: list[str] = []
+        cipher_pattern = _word_pattern(cipher_word)
+        for word in self._by_len.get(len(cipher_word), []):
+            if _word_pattern(word) != cipher_pattern:
+                continue
+
+            local_c2p: dict[str, str] = {}
+            local_p2c: dict[str, str] = {}
+            ok = True
+            for cc, pc in zip(cipher_word, word):
+                if cc in c2p and c2p[cc] != pc:
+                    ok = False
+                    break
+                if pc in p2c and p2c[pc] != cc:
+                    ok = False
+                    break
+                if cc in local_c2p and local_c2p[cc] != pc:
+                    ok = False
+                    break
+                if pc in local_p2c and local_p2c[pc] != cc:
+                    ok = False
+                    break
+                local_c2p[cc] = pc
+                local_p2c[pc] = cc
+            if ok:
+                candidates.append(word)
+        return candidates
+
+    def _apply_word_mapping(
+        self,
+        cipher_word: str,
+        plain_word: str,
+        c2p: dict[str, str],
+        p2c: dict[str, str],
+    ) -> tuple[dict[str, str], dict[str, str]] | None:
+        new_c2p = dict(c2p)
+        new_p2c = dict(p2c)
+        for c, p in zip(cipher_word, plain_word):
+            if not self._add_mapping(new_c2p, new_p2c, c, p):
+                return None
+        return new_c2p, new_p2c
+
+    def _initial_mappings(self, pairs: list[tuple[str, str]]) -> tuple[dict[str, str], dict[str, str], bool, list[str]]:
+        c2p: dict[str, str] = {}
+        p2c: dict[str, str] = {}
+        ok = True
+        trace: list[str] = []
+
+        for cipher, plain in pairs:
+            c_words = cipher.split()
             p_words = plain.split()
-            
-            # Проверяем, совпадает ли количество слов для безопасного выравнивания
             if len(c_words) == len(p_words):
-                cot.append(f"\nAnalyzing Example {i}: '{ciph}' -> '{plain}'.")
-                
-                for cw, pw in zip(c_words, p_words):
-                    # Сопоставляем только слова одинаковой длины
-                    if len(cw) == len(pw):
-                        new_mappings = []
-                        for c, p in zip(cw, pw):
-                            if c not in mapping:
-                                mapping[c] = p
-                                new_mappings.append(f"'{c}'='{p}'")
-                                
-                        if new_mappings:
-                            cot.append(f"Word '{cw}' ({len(cw)} letters) maps to '{pw}'. Extracted: {', '.join(new_mappings)}.")
+                word_pairs = zip(c_words, p_words)
             else:
-                # Фолбэк на случай, если структура предложений не совпадает
-                c_chars = ciph.replace(" ", "")
-                p_chars = plain.replace(" ", "")
-                for c, p in zip(c_chars, p_chars):
-                    if c not in mapping:
-                        mapping[c] = p
+                word_pairs = [(cipher.replace(" ", ""), plain.replace(" ", ""))]
 
-        if mapping:
-            map_display = ", ".join([f"'{k}' -> '{v}'" for k, v in sorted(mapping.items())])
-            cot.append(f"\nCombining these extracted rules, we establish the overall initial dictionary: {map_display}.")
+            for cw, pw in word_pairs:
+                if len(cw) != len(pw):
+                    trace.append(f"Skipped {cw}->{pw}: different lengths.")
+                    ok = False
+                    continue
+                for cc, pc in zip(cw, pw):
+                    if not self._add_mapping(c2p, p2c, cc, pc):
+                        trace.append(f"Conflict: {cc} cannot map to {pc}.")
+                        ok = False
+        return c2p, p2c, ok, trace
+
+    def _solve_target(
+        self,
+        target_words: list[str],
+        c2p: dict[str, str],
+        p2c: dict[str, str],
+    ) -> tuple[list[str], dict[str, str], list[dict[str, object]]] | None:
+        """Backtracking with minimum-candidate-first word choice."""
+
+        def recurse(
+            cur_c2p: dict[str, str],
+            cur_p2c: dict[str, str],
+            cur_steps: list[dict[str, object]],
+        ) -> tuple[list[str], dict[str, str], list[dict[str, object]]] | None:
+            decoded = [self._decode_word(w, cur_c2p) for w in target_words]
+            if all("?" not in w for w in decoded):
+                if all(w in self.vocab_set for w in decoded):
+                    return decoded, cur_c2p, cur_steps
+                return None
+
+            best_idx: int | None = None
+            best_candidates: list[str] | None = None
+            for idx, cipher_word in enumerate(target_words):
+                if "?" not in decoded[idx]:
+                    continue
+                candidates = self._candidate_words(cipher_word, cur_c2p, cur_p2c)
+                if not candidates:
+                    return None
+                if best_candidates is None or len(candidates) < len(best_candidates):
+                    best_idx = idx
+                    best_candidates = candidates
+                    if len(candidates) == 1:
+                        break
+
+            assert best_idx is not None and best_candidates is not None
+            cipher_word = target_words[best_idx]
+            partial = decoded[best_idx]
+
+            for candidate in best_candidates:
+                applied = self._apply_word_mapping(cipher_word, candidate, cur_c2p, cur_p2c)
+                if applied is None:
+                    continue
+                next_c2p, next_p2c = applied
+                new_mappings = [
+                    f"{cc}->{pc}"
+                    for cc, pc in zip(cipher_word, candidate)
+                    if cc not in cur_c2p
+                ]
+                step = {
+                    "cipher_word": cipher_word,
+                    "partial": partial,
+                    "candidate_count": len(best_candidates),
+                    "candidates": list(best_candidates),
+                    "chosen": candidate,
+                    "new_mappings": new_mappings,
+                    "mapping_before": dict(cur_c2p),
+                }
+                solved = recurse(next_c2p, next_p2c, cur_steps + [step])
+                if solved is not None:
+                    return solved
+            return None
+
+        return recurse(dict(c2p), dict(p2c), [])
+
+    # ------------------------------------------------------------------
+    # CoT formatting
+    # ------------------------------------------------------------------
+    def _append_examples_cot(self, cot: list[str], pairs: list[tuple[str, str]], c2p: dict[str, str]) -> None:
+        running: dict[str, str] = {}
+        p_running: dict[str, str] = {}
+        for cipher, plain in pairs:
+            cot.append("")
+            plain_quoted = " ".join(f"【{w}】" for w in plain.split())
+            cot.append(f"【{cipher}】 -> 【{plain}】 / {plain_quoted}:")
+
+            c_words = cipher.split()
+            p_words = plain.split()
+            if len(c_words) == len(p_words):
+                word_pairs = zip(c_words, p_words)
+            else:
+                word_pairs = [(cipher.replace(" ", ""), plain.replace(" ", ""))]
+
+            for wi, (cw, pw) in enumerate(word_pairs):
+                if len(cw) != len(pw):
+                    cot.append(f"Skipping 【{cw}】 -> 【{pw}】 because lengths differ.")
+                    continue
+                if wi > 0:
+                    cot.append("")
+                cot.append(f"【{cw}】->【{pw}】")
+                cot.append(f"{_DASH.join(cw)}->{_DASH.join(pw)}")
+                for cc, pc in zip(cw, pw):
+                    status = "same" if cc in running else "new"
+                    if cc not in running and pc not in p_running:
+                        running[cc] = pc
+                        p_running[pc] = cc
+                    cot.append(f"{cc}->{pc} {status}")
+
+        mapping_lines = "\n".join(f"{c}->{c2p.get(c, '?')}" for c in _ALPHABET)
+        inv = {v: k for k, v in c2p.items()}
+        inv_lines = "\n".join(f"{p}->{inv.get(p, '?')}" for p in _ALPHABET)
+        unknown = "\n".join(c for c in _ALPHABET if c not in c2p)
+        unmapped = "\n".join(p for p in _ALPHABET if p not in inv)
+        cot.append("")
+        cot.append(f"Mapping so far\n{mapping_lines}")
+        cot.append(f"Inverse mapping\n{inv_lines}")
+        cot.append(f"Unknown characters\n{unknown}")
+        cot.append(f"Unmapped target letters\n{unmapped}")
+
+    def _append_target_initial_cot(
+        self,
+        cot: list[str],
+        target_cipher: str,
+        target_words: list[str],
+        c2p: dict[str, str],
+    ) -> None:
+        cot.append("")
+        cot.append(f"Now decrypting 【 {target_cipher}】:")
+        decoded_parts: list[str] = []
+        all_unknown: set[str] = set()
+
+        for i, cw in enumerate(target_words):
+            if i > 0:
+                cot.append("")
+            display_chars: list[str] = []
+            step_lines: list[str] = []
+            for cc in cw:
+                if cc in c2p:
+                    display_chars.append(c2p[cc])
+                    step_lines.append(f"{cc}->{c2p[cc]}")
+                else:
+                    display_chars.append(f"({cc})")
+                    step_lines.append(f"{cc}->?")
+                    all_unknown.add(cc)
+            partial_display = _DASH.join(display_chars)
+            plain_word = "".join(c2p.get(cc, "?") for cc in cw)
+            decoded_parts.append(plain_word if "?" not in plain_word else partial_display)
+            cot.append(f"【 {cw}】")
+            cot.append(_DASH.join(cw))
+            cot.extend(step_lines)
+            cot.append(f"{partial_display}->【{plain_word if '?' not in plain_word else partial_display}】")
+
+        cot.append("")
+        cot.append("The sentence currently is")
+        cot.append(" ".join(decoded_parts))
+        cot.append("")
+        if all_unknown:
+            cot.append("Iterating over the unknown letters to see if they are in the question")
+            cot.extend(f"{c} {'yes' if c in all_unknown else 'no'}" for c in _ALPHABET if c not in c2p)
+            cot.append("")
+            cot.append("The unknown letters")
+            cot.extend(sorted(all_unknown))
+            cot.append("")
+            cot.append("Let me find the best matching wonderland words:")
         else:
-            cot.append("There are no valid examples provided to extract initial mappings.")
+            cot.append("There are no unknown letters in the question.")
+
+    def _append_solution_steps_cot(self, cot: list[str], steps: list[dict[str, object]]) -> None:
+        for step in steps:
+            cipher_word = str(step["cipher_word"])
+            partial = str(step["partial"])
+            candidates = list(step["candidates"])
+            chosen = str(step["chosen"])
+            mapping_before = dict(step["mapping_before"])
+            new_mappings = list(step["new_mappings"])
+
+            display_dashed = _DASH.join(mapping_before.get(cc, f"({cc})") for cc in cipher_word)
+            cot.append("")
+            cot.append(f"【{display_dashed}】")
+            cot.append(f"The length of the word is {len(cipher_word)}.")
+            cot.append(f"The cipher pattern is {_pattern_str(cipher_word)}.")
+            cot.append(f"The partial plaintext pattern is {partial}.")
+            cot.append("Checking Wonderland words with the same length, same repeated-letter pattern, and bijective mapping:")
+
+            if candidates:
+                for cand in candidates:
+                    cand_dashed = _DASH.join(cand)
+                    marker = "best" if cand == chosen else "possible"
+                    cot.append(f"{cand} {len(cand)} 【{cand_dashed}】 {marker}")
+            else:
+                cot.append("No candidates.")
+
+            cot.append(f"Best match: 【{chosen}】")
+            cot.append(f"【{display_dashed}】->【{_DASH.join(chosen)}】")
+            for cc, pc in zip(cipher_word, chosen):
+                if cc in mapping_before:
+                    cot.append(f"【{mapping_before[cc]}】->【{pc}】same")
+                else:
+                    cot.append(f"【({cc})】->【{pc}】 new")
+            if new_mappings:
+                cot.append("Added mappings")
+                cot.extend(str(x) for x in new_mappings)
+            else:
+                cot.append("Added mappings\nnone")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def generate_cot(self, prompt: str, ) -> str:
+        prompt = str(prompt).lower()
+        target_cipher = self._extract_target(prompt)
+        if not target_cipher:
+            return "The target ciphertext could not be found in the prompt.\nFinal Answer: nan"
+
+        pairs = self._extract_examples(prompt)
+        c2p, p2c, ok, trace = self._initial_mappings(pairs)
+        if not ok:
+            details = "\n".join(trace)
+            return f"Algorithmic Error: inconsistent examples were found.\n{details}\nFinal Answer: nan"
 
         target_words = target_cipher.split()
-        decoded_words = []
-        
-        cot.append(f"\nNow, let's apply these known substitutions to the target encrypted text: '{target_cipher}'.")
-        
-        for word in target_words:
-            dec_word = "".join([mapping.get(char, "?") for char in word])
-            decoded_words.append(dec_word)
-            
-        partial_decode = " ".join(decoded_words)
-        cot.append(f"Substituting the known letters, we get a partial decryption: '{partial_decode}'.")
-        
-        if "?" in partial_decode:
-            cot.append("\nSince some letters are still unknown, we are left with incomplete words. We need to deduce the missing characters by treating these incomplete words as vocabulary puzzles.")
-            
-            changed = True
-            while changed and "?" in "".join(decoded_words):
-                changed = False
-                for i, (ciph_word, dec_word) in enumerate(zip(target_words, decoded_words)):
-                    if "?" not in dec_word:
-                        continue
-                        
-                    pattern = "^" + dec_word.replace("?", ".") + "$"
-                    regex = re.compile(pattern)
-                    
-                    matches = [w for w in self.vocab if regex.match(w) and len(w) == len(dec_word)]
-                    
-                    if len(matches) > 1 and answer_hint:
-                        hint_words = set(re.sub(r"[^a-z\s]", "", str(answer_hint).lower()).split())
-                        refined_matches = [m for m in matches if m in hint_words]
-                        if len(refined_matches) == 1:
-                            matches = refined_matches
-                    
-                    if len(matches) > 0:
-                        matched_word = matches[0]
-                        
-                        # Демонстрируем модели процесс подбора (показываем до 3 вариантов)
-                        candidates_to_show = matches[:3]
-                        cand_str = ", ".join([f"'{m}'" for m in candidates_to_show])
-                        if len(matches) > 3:
-                            cand_str += ", and others"
-                            
-                        cot.append(f"\nLet's analyze the incomplete word '{dec_word}'.")
-                        cot.append(f"Looking at English vocabulary, possible words that fit this exact pattern and length include: {cand_str}.")
-                        cot.append(f"Given the context, '{matched_word}' is the most logical fit.")
-                        
-                        new_mappings_found = []
-                        for c_char, p_char, a_char in zip(ciph_word, dec_word, matched_word):
-                            if p_char == "?":
-                                mapping[c_char] = a_char
-                                new_mappings_found.append(f"'{c_char}' -> '{a_char}'")
-                                
-                        if new_mappings_found:
-                            cot.append(f"If the word is '{matched_word}', we can deduce the following new letter mappings: {', '.join(new_mappings_found)}.")
-                                
-                        # Обновляем все слова с учетом новых букв
-                        decoded_words = []
-                        for cw in target_words:
-                            decoded_words.append("".join([mapping.get(ch, "?") for ch in cw]))
-                        
-                        cot.append(f"Applying these new rules, our current overall text becomes: '{" ".join(decoded_words)}'.")
-                        changed = True
-                        break # Начинаем цикл заново, так как открылись новые буквы
-            
-            final_decode = " ".join(decoded_words)
-            if "?" in final_decode:
-                return f"Algorithmic Error: Unable to resolve ambiguous or missing words. The process is stuck at '{final_decode}'.\n nan"
-            else:
-                cot.append(f"\nAll characters have been successfully identified through logical deduction.")
-                final_answer = final_decode
-        else:
-            final_answer = partial_decode
 
-        cot.append(f"The final fully decrypted text is complete.")
-        cot.append(f"\nFinal Answer: \\boxed{{{final_answer}}}")
+        cot: list[str] = []
+        cot.append("We need to find the encryption mapping from the examples. It looks like a substitution cipher.")
+        cot.append("I will put my final answer inside \\boxed{}.")
+        
+        cot.append("")
+        cot.append("Listing the input words:")
+        for cipher, _plain in pairs:
+            cot.append("")
+            cot.append(f"【{cipher}】")
+            for word in cipher.split():
+                cot.append(f" {word}")
+        cot.append("")
+        cot.append(f"【 {target_cipher}】")
+        for word in target_words:
+            cot.append(f" {word}")
+
+        cot.append("")
+        cot.append("Breaking down into characters:")
+        for cipher, _plain in pairs:
+            cot.append("")
+            cot.append(f"【{cipher}】")
+            for word in cipher.split():
+                cot.append(_DASH.join(word))
+        cot.append("")
+        cot.append(f"【 {target_cipher}】")
+        for word in target_words:
+            cot.append(_DASH.join(word))
+
+        self._append_examples_cot(cot, pairs, c2p)
+        self._append_target_initial_cot(cot, target_cipher, target_words, c2p)
+
+        solved = self._solve_target(target_words, c2p, p2c)
+        if solved is None:
+            cot.append("")
+            cot.append("Algorithmic Error: no vocabulary-consistent bijective solution was found.")
+            cot.append("Final Answer: nan")
+            return "\n".join(cot)
+
+        decoded_words, final_c2p, steps = solved
+        self._append_solution_steps_cot(cot, steps)
+
+        final_answer = " ".join(decoded_words)
+        final_map = "\n".join(f"{c}->{final_c2p.get(c, '?')}" for c in _ALPHABET)
+        cot.append("")
+        cot.append(f"Final mapping\n{final_map}")
+        cot.append("I will now return the answer in \\boxed{}")
+        cot.append(f"The answer is \\boxed{{{final_answer}}}")
         return "\n".join(cot)
 
     def extract_answer(self, cot_text: str) -> str:
-        if not cot_text or "Error" in str(cot_text):
+        if not cot_text:
             return "nan"
-        match = re.search(r"\\boxed\{([a-z\s]+)\}", str(cot_text))
-        return match.group(1) if match else "nan"
+        text = str(cot_text)
+        lowered = text.lower()
+        if "final answer: nan" in lowered or "algorithmic error" in lowered:
+            return "nan"
+        # The CoT intentionally contains an empty \boxed{} in the instruction line,
+        # so use the last non-empty boxed value rather than the first one.
+        boxed_values = re.findall(r"\\boxed\{([^}]*)\}", text)
+        for value in reversed(boxed_values):
+            cleaned = _clean_phrase(value)
+            if cleaned:
+                return cleaned
+        match = re.search(r"final answer:\s*([a-z ]+)", lowered)
+        return _clean_phrase(match.group(1)) if match else "nan"

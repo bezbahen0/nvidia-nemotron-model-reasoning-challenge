@@ -10,10 +10,6 @@ import pandas as pd
 from transformers import AutoTokenizer
 
 from src.augmentation.equations.numeral_equations_augment import NumeralEquationAugmentGenerator
-from src.augmentation.equations.cryptarithm_task_generator import (
-    CryptarithmMappingSubtaskGenerator,
-    MappingSubtaskConfig,
-)
 
 from src.augmentation.bit_manipulation import BitMatchingAugmentGenerator, BitMatchingAugmentConfig
 from src.augmentation.encryption import EncryptionTaskGenerator
@@ -130,40 +126,7 @@ def main():
     )
     encryption_gen_dataset = with_source(encryption_gen_dataset, "generated")
 
-    # Cryptarithm mapping subtasks
-    # Derive focused subtasks from the v3 cryptarithm training CoTs.  These are
-    # not new random cryptarithms: they slice a solved trace into rule-selection,
-    # projection/domain-update, build-mapping, concat-direct, and target-application
-    # tasks.  Fixed-concat target traces intentionally skip digit-map construction.
-    cryptarithm_mapping_augment_generator = CryptarithmMappingSubtaskGenerator(
-        config=MappingSubtaskConfig(
-            include_build_mapping=True,
-            include_rule_selection=True,
-            include_projection_step=True,
-            include_domain_update=True,
-            include_target_application=True,
-            include_concat_direct=True,
-            include_rule_legend=True,
-            skip_fixed_concat_build_mapping=True,
-        )
-    )
-    cryptarithm_mapping_aug_dataset = cryptarithm_mapping_augment_generator.generate_dataset(
-        source_data=data[data.label == "cryptarithm"].copy()
-    )
-    cryptarithm_mapping_aug_dataset = with_source(cryptarithm_mapping_aug_dataset, "solver")
-
-    logger.info("\nCryptarithm mapping subtasks augmenter:")
-    logger.info(cryptarithm_mapping_aug_dataset.columns.tolist())
-    if len(cryptarithm_mapping_aug_dataset) and "task_mode" in cryptarithm_mapping_aug_dataset.columns:
-        logger.info(cryptarithm_mapping_aug_dataset.task_mode.value_counts(dropna=False))
-        logger.info(cryptarithm_mapping_aug_dataset.label.value_counts(dropna=False))
-    logger.info(f"Generated rows: {len(cryptarithm_mapping_aug_dataset)}")
-    logger.info(
-        f'Accuracy: '
-        f'{cryptarithm_mapping_aug_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean() if len(cryptarithm_mapping_aug_dataset) else 0.0}'
-    )
-
-        # bit manipulation
+    # bit manipulation
     bit_matching_generator = BitMatchingAugmentGenerator(seed=args.seed)
 
     bit_mp_gen_dataset = bit_matching_generator.generate_dataset(
@@ -188,7 +151,6 @@ def main():
         encryption_gen_dataset,                  # synthetic encryption tasks
         #encryption_cot_aug_dataset,
         bit_mp_gen_dataset,                      # subtasks from real solver bit-manipulation tasks
-        cryptarithm_mapping_aug_dataset,         # mapping-focused subtasks from real cryptarithm CoTs
     ]
     generated_parts = [normalize_generated_columns(df) for df in generated_parts if df is not None and len(df)]
     data_gen = pd.concat(generated_parts, ignore_index=True) if generated_parts else pd.DataFrame(
