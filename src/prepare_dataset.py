@@ -12,7 +12,9 @@ from transformers import AutoTokenizer
 from src.augmentation.equations.numeral_equations_augment import NumeralEquationAugmentGenerator
 
 from src.augmentation.bit_manipulation import BitMatchingAugmentGenerator, BitMatchingAugmentConfig
-from src.augmentation.encryption import EncryptionTaskGenerator
+from src.augmentation.encryption import EncryptionSpellingAugmentGenerator, EncryptionSpellingAugmentConfig
+from src.augmentation.equations.cryptarithm_task_generator import CryptarithmAugmentGenerator
+
 from src.metric import verify
 from src.log import logger
 
@@ -24,6 +26,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--tokenizer_path", type=str, required=True)
     parser.add_argument("--max_generated_cot_tokens", type=int, default=7800)
+    parser.add_argument("--cryptarithm_generated_count", type=int, default=400)
+
     
     return parser.parse_args()
 
@@ -106,25 +110,39 @@ def main():
     )
 
 
-    # Encryption
-    global_vocab = set()
-    for prompt in data[data.label == "encryption"]['prompt']:
-        lines = [l.strip() for l in prompt.lower().splitlines() if "->" in l]
-        for line in lines:
-            plain = line.split("->", 1)[1]
-            words = re.sub(r"[^a-z\s]", "", plain).split()
-            global_vocab.update(words)
-
-    for ans in data[data.label == "encryption"]['answer']:
-        if isinstance(ans, str):
-             global_vocab.update(re.sub(r"[^a-z\s]", "", ans.lower()).split())
-
-    encryption_generator = EncryptionTaskGenerator(vocabulary=global_vocab, seed=args.seed)
-
-    encryption_gen_dataset = encryption_generator.generate_dataset(
-        int(len(data[data.label == "encryption"]) *  1.0)
+    # Encryption spelling augmenter
+    # Replace random synthetic encryption generation with prompt-derived spelling
+    # subtasks. This follows the bit-matching pattern: derive small training
+    # tasks from existing solver-correct encryption prompts instead of inventing
+    # new full encryption examples.
+    encryption_spelling_generator = EncryptionSpellingAugmentGenerator(
+        seed=args.seed,
+        config=EncryptionSpellingAugmentConfig(
+            sample_frac=1.0,
+            only_solver_correct=False,
+            lines_per_problem=100,
+            demo_lines=3,
+            words_per_line=3,
+            include_prompt_fixed_text=False,
+        ),
     )
-    encryption_gen_dataset = with_source(encryption_gen_dataset, "generated")
+
+    encryption_gen_dataset = encryption_spelling_generator.generate_dataset(
+        source_data=data[data.label == "encryption"].copy(),
+        sample_frac=1.0,
+        only_solver_correct=False,
+    )
+    encryption_gen_dataset = with_source(encryption_gen_dataset, "solver")
+
+    logger.info("\nEncryption spelling augmenter:")
+    logger.info(encryption_gen_dataset.columns.tolist())
+    if len(encryption_gen_dataset):
+        logger.info(encryption_gen_dataset.task_mode.value_counts(normalize=True))
+    logger.info(f"Generated rows: {len(encryption_gen_dataset)}")
+    logger.info(
+        f"Source solver correct rate: "
+        f"{encryption_gen_dataset['source_solver_correct'].mean() if len(encryption_gen_dataset) else 0.0}"
+    )
 
     # bit manipulation
     bit_matching_generator = BitMatchingAugmentGenerator(seed=args.seed)
@@ -145,12 +163,32 @@ def main():
         f"{bit_mp_gen_dataset['source_solver_correct'].mean() if len(bit_mp_gen_dataset) else 0.0}"
     )
 
+    cryptarithm_generator = CryptarithmAugmentGenerator(seed=args.seed)
+    cryptarithm_gen_dataset = pd.DataFrame(
+        cryptarithm_generator.generate_dataset(
+            n=args.cryptarithm_generated_count,
+            include_metadata=False,
+            validate=True,
+        )
+    )
+    if len(cryptarithm_gen_dataset):
+        cryptarithm_gen_dataset["label"] = "cryptarithm"
+    cryptarithm_gen_dataset = with_source(cryptarithm_gen_dataset, "generated")
+
+    logger.info("\nCryptarithm generator:")
+    logger.info(cryptarithm_gen_dataset.columns.tolist())
+    logger.info(f"Generated rows: {len(cryptarithm_gen_dataset)}")
+    logger.info(
+        f'Accuracy: '
+        f'{cryptarithm_gen_dataset.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1).mean() if len(cryptarithm_gen_dataset) else 0.0}'
+    )
+
 
     generated_parts = [
-        numeral_equations_aug_dataset,           # subtasks from real solver numeral equations
-        encryption_gen_dataset,                  # synthetic encryption tasks
-        #encryption_cot_aug_dataset,
-        bit_mp_gen_dataset,                      # subtasks from real solver bit-manipulation tasks
+        numeral_equations_aug_dataset,
+        encryption_gen_dataset,
+        cryptarithm_gen_dataset,
+        bit_mp_gen_dataset,
     ]
     generated_parts = [normalize_generated_columns(df) for df in generated_parts if df is not None and len(df)]
     data_gen = pd.concat(generated_parts, ignore_index=True) if generated_parts else pd.DataFrame(
