@@ -9,8 +9,8 @@ data:
   
 model:
   id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-  sft_output_dir: models/sft_v0.0.28
-  dense_sft_output_dir: models/dense_sft_v0.0.28
+  sft_output_dir: models/sft_v0.0.29
+  dense_sft_output_dir: models/dense_sft_v0.0.29
 
 split:
   val_size: 0.0
@@ -29,7 +29,7 @@ train:
   max_seq_len: 8192
 
 wandb:
-  wandb_base_run_name: sft_v0.0.28
+  wandb_base_run_name: sft_v0.0.29
 
 dense:
   label_weights: '{"cryptarithm": 1.0, "bit manipulation": 4.0, "bit_matching": 0.8, "bit_tail_completion": 2.8, "bit_tail_repair": 2.4, "numeral equations": 2.5, "numeral equations_rule_application": 1.5, "numeral equations_family_matching": 0.8, "encryption": 2.5, "encryption_apply_mapping_to_target_partial": 2.0, "encryption_new_mapping_from_completed_word": 1.3, "encryption_final_reconstruction": 1.4, "encryption_pattern_completion": 0.8, "encryption_word_pair_mapping": 0.8, "unit conversion": 0.5, "gravitational": 0.5, "conversion to diff numeral system": 0.5}'
