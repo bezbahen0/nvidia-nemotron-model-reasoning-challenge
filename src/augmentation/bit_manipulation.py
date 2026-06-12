@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -108,13 +108,15 @@ class BitMatchingAugmentGenerator:
         if section not in TERNARY_SECTIONS:
             return section_records, per_bit
 
-        chosen_labels: set[str] = set()
-        for rule in getattr(analysis, "selected", []):
-            if getattr(rule, "family", None) != section:
-                continue
-            operands = getattr(rule, "operands", ())
-            if operands:
-                chosen_labels.add(compact_rule(rule))
+        # Keep every record that belongs to the injected exact program.
+        # Reading program_key directly is safer than inferring the chain from
+        # analysis.selected, which may contain mixed fallback rules.
+        chosen_labels: set[str] = {
+            compact_rule(cand)
+            for bit_cands in per_bit
+            for cand in bit_cands
+            if getattr(cand, "program_key", None) is not None
+        }
 
         covered: set[int] = set()
         for rec in section_records:
@@ -140,6 +142,35 @@ class BitMatchingAugmentGenerator:
                 if getattr(cand, "expr", "") in allowed_exprs
                 or getattr(cand, "program_key", None) is not None
             ])
+
+        # An injected exact-program rule is stored in analysis.matches only at
+        # its intended output position so Left/Right can recover one coherent
+        # eight-bit program. Its Record, however, can legitimately match other
+        # output columns with identical demonstration vectors. Matching tasks
+        # must expose those matches too. Add plain (program_key-free) copies at
+        # every additional matching output bit while retaining the keyed copy
+        # at the intended position.
+        templates: Dict[str, Any] = {}
+        for bit_cands in per_bit:
+            for cand in bit_cands:
+                label = compact_rule(cand)
+                if label in chosen_labels:
+                    current = templates.get(label)
+                    if current is None or (
+                        getattr(current, "program_key", None) is not None
+                        and getattr(cand, "program_key", None) is None
+                    ):
+                        templates[label] = cand
+
+        for rec in filtered_records:
+            template = templates.get(rec.label)
+            if template is None:
+                continue
+            for out_bit in rec.matches:
+                if any(compact_rule(cand) == rec.label for cand in filtered_matches[out_bit]):
+                    continue
+                filtered_matches[out_bit].append(replace(template, program_key=None))
+
         return filtered_records, filtered_matches
 
     @staticmethod
