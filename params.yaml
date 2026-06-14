@@ -19,7 +19,7 @@ train:
   lr: 2e-4
   batch_size: 4
   grad_accum: 8
-  epochs: 1
+  epochs: 4
   seed: 31231
   eval_steps: 320
   dense_eval_steps: 150
