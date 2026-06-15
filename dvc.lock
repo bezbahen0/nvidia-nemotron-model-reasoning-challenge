@@ -10,18 +10,18 @@ stages:
       size: 3069304
     - path: src/generate_cot.py
       hash: md5
-      md5: 6696d50e74d84fe5e50712a0a7250ba1
-      size: 8016
+      md5: 41b34055b75e546178bafce15a3c5b84
+      size: 4861
     - path: src/solvers
       hash: md5
-      md5: 0f1ad7c3f539fe8d7e20c67e9202409e.dir
-      size: 308075
-      nfiles: 20
+      md5: 349c4750f764785baafdc990cfcfc391.dir
+      size: 398112
+      nfiles: 21
     outs:
     - path: data/solved/train-cot.csv
       hash: md5
-      md5: 9fbeaf692eec602ef51197cd61d34f50
-      size: 57516969
+      md5: 144f5d7db2286334f88bfec8e605d60b
+      size: 35212883
   split_data:
     cmd: "python -m src.split_data --data_path data/solved/train-cot.csv --train_path
       data/prepared/train_stratified.csv --seed 31231 --val_path data/prepared/val_stratified.csv
@@ -49,18 +49,17 @@ stages:
       md5: 954ed7c56822e3f8fbc623f90eef9060
       size: 5760948
   prepare_data:
-    cmd: "python -m src.prepare_dataset --data_path data/prepared/train_stratified.csv
-      --output_path data/generated/train_with_syntetic.csv --seed 31231 --tokenizer_path
-      /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1\n"
+    cmd: "python -m src.prepare_dataset --data_path data/solved/train-cot.csv --output_path
+      data/generated/train_with_syntetic.csv --seed 31231 --tokenizer_path /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1\n"
     deps:
-    - path: data/prepared/train_stratified.csv
+    - path: data/solved/train-cot.csv
       hash: md5
-      md5: a55f015e9de22cc4e6a8f1deceecbad2
-      size: 51758288
+      md5: 144f5d7db2286334f88bfec8e605d60b
+      size: 35212883
     - path: src/prepare_dataset.py
       hash: md5
-      md5: 2abce7991b87257ffde2bd45eba7a4b0
-      size: 12949
+      md5: 95e01e9295a443fdde9ecfedf5ccde45
+      size: 9550
     params:
       params.yaml:
         model.id: 
@@ -69,36 +68,31 @@ stages:
     outs:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 6e89e0e0b390eaf684f232ac7d5e79db
-      size: 61635788
+      md5: 8546943903620a6d940df63c7810a0af
+      size: 52187671
   base_sft_train:
-    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.23_base_sft_train
+    cmd: "python -m src.sft_train  --wandb_run_basename sft_v0.0.29_base_sft_train
       --model_id /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
       --data algorithmic_cot --train_path data/generated/train_with_syntetic.csv --seed
-      31231 --eval_steps 320 --val_path data/prepared/val_stratified.csv --output_dir
-      models/sft_v0.0.23 --batch_size 4 --grad_accum 8 --epochs 1 --max_hours 11.0
-      --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len 8192 --train_telemetry
-      --eval_telemetry --loss_impl cce --cce_impl cce --cce_compare_default_loss_once\n"
+      31231 --save_steps 320 --output_dir models/sft_v0.0.29 --batch_size 4 --grad_accum
+      8 --epochs 4 --max_hours 11.0 --lr 0.0002 --lora_r 32 --lora_alpha 64 --max_seq_len
+      8192 --train_telemetry --loss_impl cce --cce_impl cce --cce_compare_default_loss_once\n"
     deps:
     - path: data/generated/train_with_syntetic.csv
       hash: md5
-      md5: 6e89e0e0b390eaf684f232ac7d5e79db
-      size: 61635788
-    - path: data/prepared/val_stratified.csv
-      hash: md5
-      md5: 954ed7c56822e3f8fbc623f90eef9060
-      size: 5760948
+      md5: 8546943903620a6d940df63c7810a0af
+      size: 52187671
     - path: src/sft_train.py
       hash: md5
-      md5: cd4812bed7b5224deb06947ad772f36f
-      size: 37712
+      md5: 755ee77b3fd444c17d0c97320a00c536
+      size: 36675
     params:
       params.yaml:
         data.dataset_name: algorithmic_cot
         model.id: 
           /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1
         train.batch_size: 4
-        train.epochs: 1
+        train.epochs: 4
         train.eval_steps: 320
         train.grad_accum: 8
         train.lora_alpha: 64
@@ -107,13 +101,13 @@ stages:
         train.max_hours: 11.0
         train.max_seq_len: 8192
         train.seed: 31231
-        wandb.wandb_base_run_name: sft_v0.0.23
+        wandb.wandb_base_run_name: sft_v0.0.29
     outs:
-    - path: models/sft_v0.0.23
+    - path: models/sft_v0.0.29
       hash: md5
-      md5: ba034260c699f2b0b819a118cc1119ad.dir
-      size: 10760412884
-      nfiles: 29
+      md5: 8483b4592ced1a67db0f4497f16c789a.dir
+      size: 10771623121
+      nfiles: 27
   analyze_sft_train_telemetry:
     cmd: "python -m src.analyze_sft_telemetry --telemetry_dir models/sft_v0.0.23/train_telemetry
       --train_path data/generated/train_with_syntetic.csv --output_dir models/sft_v0.0.23_train_telemetry_analysis
