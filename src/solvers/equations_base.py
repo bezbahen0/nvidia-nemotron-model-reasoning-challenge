@@ -70,13 +70,13 @@ class BaseEquationSolver:
         
         if task_type == "numeral equations":
             result = self.ast_solver.solve(examples, target)
+            cot += result["debug"]
         elif task_type == "cryptarithm":
             result = self.csp_solver.solve(examples, target)
+            cot.append(result["solution"])
         else:
             cot += ["I can't solve this type of problem"]
             return "\n".join(cot)
 
-        
-        cot += result["debug"]
 
         return "\n".join(cot)

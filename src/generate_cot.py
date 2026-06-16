@@ -4,7 +4,7 @@ import pandas as pd
 from pandarallel import pandarallel
 from tqdm import tqdm
 
-pandarallel.initialize(progress_bar=False)
+pandarallel.initialize(progress_bar=False, nb_workers=2)
 
 from src.solvers.bit_manipulation import BitManipulationSolver
 from src.solvers.equations_base import BaseEquationSolver
@@ -95,33 +95,6 @@ def main():
 
     data = pd.concat(processed_dfs, ignore_index=True)
 
-    enc_mask = data["label"] == "encryption"
-    enc_df = data[enc_mask].copy()
-    failed_mask = enc_df["computed_answer"].isna()
-
-    if failed_mask.sum() > 0:
-        enc_solver = task_solvers_map["encryption"]
-
-        def solve_with_fallback(row):
-            return enc_solver.generate_cot(row["prompt"], answer_hint=row["answer"])
-
-        enc_df.loc[failed_mask, "generated_cot"] = enc_df[failed_mask].apply(
-            solve_with_fallback,
-            axis=1,
-        )
-
-        enc_df.loc[failed_mask, "computed_answer"] = enc_df.loc[
-            failed_mask,
-            "generated_cot",
-        ].apply(enc_solver.extract_answer)
-
-        enc_df["is_correct"] = (
-            enc_df["computed_answer"].astype(str).str.lower().str.strip()
-            == enc_df["answer"].astype(str).str.lower().str.strip()
-        )
-
-        data.update(enc_df)
-
     data["is_correct"] = (
         data["computed_answer"].astype(str).str.lower().str.strip()
         == data["answer"].astype(str).str.lower().str.strip()
@@ -159,7 +132,8 @@ def main():
     results_df = pd.DataFrame.from_records(records)
 
     logger.info("\n" + results_df.to_string(index=False, justify="center"))
-    logger.info(f"Teoretical global accuracy: {sum(result) / len(result)}")
+    weighted_global_accuracy = data["is_correct_rounded"].mean() * 100
+    logger.info(f"Weighted global accuracy: {weighted_global_accuracy:.2f}")
 
 
 if __name__ == "__main__":

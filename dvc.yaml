@@ -11,33 +11,16 @@ stages:
     outs:
       - ${data.raw_working}
 
-  split_data:
-    cmd: >
-      python -m src.split_data
-      --data_path ${data.raw_working}
-      --train_path ${data.train_prepared}
-      --seed ${train.seed}
-      --val_path ${data.val_prepared}
-      --val_size ${split.val_size}
-    deps:
-      - ${data.raw_working}
-      - src/split_data.py
-    params:
-      - train.seed
-      - split.val_size
-    outs:
-      - ${data.train_prepared}
-      - ${data.val_prepared}
 
   prepare_data:
     cmd: >
       python -m src.prepare_dataset
-      --data_path ${data.train_prepared}
+      --data_path ${data.raw_working}
       --output_path ${data.train_generated}
       --seed ${train.seed}
       --tokenizer_path ${model.id}
     deps:
-      - ${data.train_prepared}
+      - ${data.raw_working}
       - src/prepare_dataset.py
     params:
       - train.seed
@@ -54,8 +37,7 @@ stages:
       --data ${data.dataset_name}
       --train_path ${data.train_generated}
       --seed ${train.seed}
-      --eval_steps ${train.eval_steps}
-      --val_path ${data.val_prepared}
+      --save_steps ${train.eval_steps}
       --output_dir ${model.sft_output_dir}
       --batch_size ${train.batch_size}
       --grad_accum ${train.grad_accum}
@@ -66,13 +48,11 @@ stages:
       --lora_alpha ${train.lora_alpha}
       --max_seq_len ${train.max_seq_len}
       --train_telemetry
-      --eval_telemetry
       --loss_impl cce
       --cce_impl cce
       --cce_compare_default_loss_once
     deps:
       - ${data.train_generated}
-      - ${data.val_prepared}
       - src/sft_train.py
     params:
       - wandb.wandb_base_run_name
@@ -90,119 +70,4 @@ stages:
       - train.max_seq_len
     outs:
       - ${model.sft_output_dir}:
-          persist: true
-  
-  analyze_sft_train_telemetry:
-    cmd: >
-      python -m src.analyze_sft_telemetry
-      --telemetry_dir ${model.sft_output_dir}/train_telemetry
-      --train_path ${data.train_generated}
-      --output_dir ${model.sft_output_dir}_train_telemetry_analysis
-      --use_all_records
-    deps:
-      - ${data.train_generated}
-      - ${model.sft_output_dir}
-      - src/analyze_sft_telemetry.py
-    outs:
-      - ${model.sft_output_dir}_train_telemetry_analysis
-
-  analyze_sft_eval_telemetry:
-    cmd: >
-      python -m src.analyze_sft_telemetry
-      --telemetry_dir ${model.sft_output_dir}/eval_telemetry
-      --train_path ${data.val_prepared}
-      --output_dir ${model.sft_output_dir}_eval_telemetry_analysis
-      --use_all_records
-    deps:
-      - ${data.val_prepared}
-      - ${model.sft_output_dir}
-      - src/analyze_sft_telemetry.py
-    outs:
-      - ${model.sft_output_dir}_eval_telemetry_analysis
-
-  build_dense_dataset:
-    cmd: >
-      python -m src.build_dense_dataset
-      --input_path ${data.train_generated}
-      --output_path ${data.train_dense}
-      --train_telemetry_dir ${model.sft_output_dir}/train_telemetry
-      --eval_telemetry_dir ${model.sft_output_dir}/eval_telemetry
-      --label_weights '${dense.label_weights}'
-      --train_hard_multiplier ${dense.train_hard_multiplier}
-      --train_very_hard_multiplier ${dense.train_very_hard_multiplier}
-      --train_easy_multiplier ${dense.train_easy_multiplier}
-      --eval_hard_multiplier ${dense.eval_hard_multiplier}
-      --eval_very_hard_multiplier ${dense.eval_very_hard_multiplier}
-      --eval_easy_multiplier ${dense.eval_easy_multiplier}
-      --max_repeat ${dense.max_repeat}
-      --hard_boxed_answer_total_nll ${dense.hard_boxed_answer_total_nll}
-      --very_hard_boxed_answer_total_nll ${dense.very_hard_boxed_answer_total_nll}
-      --easy_boxed_answer_total_nll ${dense.easy_boxed_answer_total_nll}
-      --shuffle
-      --seed ${train.seed}
-    deps:
-      - ${model.sft_output_dir}_train_telemetry_analysis
-      - ${model.sft_output_dir}_eval_telemetry_analysis
-      - ${data.train_generated}
-      - ${model.sft_output_dir}/train_telemetry
-      - ${model.sft_output_dir}/eval_telemetry
-      - src/build_dense_dataset.py
-    params:
-      - dense.hard_boxed_answer_total_nll
-      - dense.very_hard_boxed_answer_total_nll
-      - dense.easy_boxed_answer_total_nll
-      - dense.label_weights
-      - dense.train_hard_multiplier
-      - dense.train_very_hard_multiplier
-      - dense.train_easy_multiplier
-      - dense.eval_hard_multiplier
-      - dense.eval_very_hard_multiplier
-      - dense.eval_easy_multiplier
-      - dense.max_repeat
-      - train.seed
-    outs:
-      - ${data.train_dense}
-
-  dense_sft_train:
-    cmd: >
-      python -m src.sft_train 
-      --wandb_run_basename ${wandb.wandb_base_run_name}_dense_sft_train
-      --model_id ${model.id}
-      --data ${data.dataset_name}_dense
-      --train_path ${data.train_dense}
-      --seed ${train.seed}
-      --eval_steps ${train.dense_eval_steps}
-      --val_path ${data.val_prepared}
-      --output_dir ${model.dense_sft_output_dir}
-      --batch_size ${train.batch_size}
-      --grad_accum ${train.grad_accum}
-      --epochs ${train.epochs}
-      --max_hours ${train.max_hours}
-      --lr ${train.lr}
-      --lora_r ${train.lora_r}
-      --lora_alpha ${train.lora_alpha}
-      --max_seq_len ${train.max_seq_len}
-      --loss_impl cce
-      --cce_impl cce
-    deps:
-      - ${data.train_dense}
-      - ${data.val_prepared}
-      - src/sft_train.py
-    params:
-      - wandb.wandb_base_run_name
-      - model.id
-      - data.dataset_name
-      - model.dense_sft_output_dir
-      - train.max_hours
-      - train.batch_size
-      - train.grad_accum
-      - train.epochs
-      - train.dense_eval_steps
-      - train.seed
-      - train.lr
-      - train.lora_r
-      - train.lora_alpha
-      - train.max_seq_len
-    outs:
-      - ${model.dense_sft_output_dir}:
           persist: true

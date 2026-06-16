@@ -19,7 +19,6 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 from trl import SFTTrainer, SFTConfig
-from src.metric import verify
 from src.log import logger
 
 def parse_args():
@@ -30,7 +29,6 @@ def parse_args():
     parser.add_argument("--model_id", type=str, default="nemotron-3-nano-30b-a3b-bf16")
     parser.add_argument("--data", type=str, required=True, help="dataset name for log W&B")
     parser.add_argument("--train_path", type=str, required=True, help="train.csv")
-    parser.add_argument("--val_path", type=str, required=True, help="val.csv")
     parser.add_argument("--output_dir", type=str, default="./models/sft_baseline_v1")
     
     # train params
@@ -40,7 +38,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--max_seq_len", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--eval_steps", type=int, default=50)
+    parser.add_argument("--save_steps", type=int, default=50, help="checkpoint save interval in training steps")
     parser.add_argument("--max_hours", type=float, required=True)
     
     # LoRA
@@ -77,7 +75,6 @@ def parse_args():
 
     # telemetry
     parser.add_argument("--train_telemetry", action="store_true")
-    parser.add_argument("--eval_telemetry", action="store_true")
     
     return parser.parse_args()
 
@@ -109,19 +106,8 @@ def load_metadata(data_path):
     return metadata
 
 
-def prepare_dataset(csv_path, eval=False):
+def prepare_dataset(csv_path):
     df = pd.read_csv(csv_path)
-
-    if eval:
-        before_len = len(df)
-        
-        df = df[df.computed_answer.notna()]
-        df = df[df.apply(lambda row: verify(row["answer"], row["computed_answer"]), axis=1)]
-
-
-        logger.info(
-            f"Eval dataset filtered by is_correct=True: {before_len} -> {len(df)}"
-        )
 
     instruction_suffix = "\nPlease put your final answer inside `\\boxed{}`. For example: `\\boxed{your answer}`"
 
@@ -973,10 +959,6 @@ def main():
     logger.info(f"train dataset final len: {len(train_dataset)}")
     train_metadata = load_metadata(args.train_path)
 
-    
-    val_dataset = prepare_dataset(args.val_path, eval=True)
-    logger.info(f"val dataset final len: {len(val_dataset)}")
-    eval_metadata = load_metadata(args.val_path)
 
     logger.info("Загрузка модели в bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -1004,21 +986,17 @@ def main():
     training_args = SFTConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         num_train_epochs=args.epochs,
         bf16=True,
         logging_steps=10,
-        
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
+
+        eval_strategy="no",
         save_strategy="steps",
-        save_steps=args.eval_steps,
-        save_total_limit=2, 
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        
+        save_steps=args.save_steps,
+        save_total_limit=2,
+
         optim="paged_adamw_8bit",
         gradient_checkpointing=True,
         lr_scheduler_type="cosine",
@@ -1037,22 +1015,17 @@ def main():
     )
 
     train_telemetry_output_dir = os.path.join(args.output_dir, "train_telemetry")
-    eval_telemetry_output_dir = os.path.join(args.output_dir, "eval_telemetry")
-
     trainer = TelemetrySFTTrainer(
         model=model,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
         peft_config=lora_config,
         args=training_args,
         callbacks=[TimeLimitCallback(max_hours=args.max_hours), MemoryStatsCallback()],
         train_telemetry_metadata=train_metadata,
-        eval_telemetry_metadata=eval_metadata,
         train_telemetry_output_dir=train_telemetry_output_dir,
-        eval_telemetry_output_dir=eval_telemetry_output_dir,
-        telemetry_save_steps=args.eval_steps,
+        telemetry_save_steps=args.save_steps,
         train_telemetry_enabled=args.train_telemetry,
-        eval_telemetry_enabled=args.eval_telemetry,
+        eval_telemetry_enabled=False,
         telemetry_tokenizer=tokenizer,
         loss_impl=args.loss_impl,
         cce_impl=args.cce_impl,

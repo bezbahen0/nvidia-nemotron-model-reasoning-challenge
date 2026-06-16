@@ -60,7 +60,7 @@ class EvalStep:
     lines: List[str]
 
 
-class ASTBruteForceSolver:
+class _BaseASTBruteForceSolver:
     """
     Equation solver with reduced search space and replay-complete family-search trace.
 
@@ -1218,3 +1218,386 @@ class ASTBruteForceSolver:
     def _failure(message: str) -> Dict[str, Any]:
         lines = ["Failed to solve", message, "Final answer: nan"]
         return {"answer": "nan", "debug": lines, "trace": lines, "solution": "\n".join(lines)}
+
+
+
+class ASTBruteForceSolver(_BaseASTBruteForceSolver):
+    """Context-aware version.
+
+    Changes vs the original target-first solver:
+      1. Prefer signed subtraction families before abs-difference families.
+      2. Treat negative display format as latent for non-minus operators when all
+         observed examples are positive (operator-prefix by default for seen target).
+      3. If the target operator is absent from the examples, infer the dominant
+         operand/result transform from the visible operators in the prompt and use
+         that contextual transform in the fallback rule.
+
+    The unseen-target fallback deliberately does NOT use exact arbitrary-symbol
+    lookup tables, because those overfit public data and do not survive
+    leave-symbol-out validation.  It only uses natural semantics for + - * / and
+    otherwise falls back to abs_diff with the prompt-inferred transform.
+    """
+
+    _NATURAL_OPS = {
+        '+': 'add',
+        '-': 'sub',
+        '*': 'mul',
+        '/': 'div',
+    }
+
+    def _family_search_order(self) -> List[Tuple[str, str, List[str]]]:
+        """Family order with signed subtraction before absolute difference."""
+        return [
+            ("concat", "cat/rev_cat", ["cat", "rev_cat"]),
+            ("add_offset", "add/add1/addm1", ["add", "add1", "addm1"]),
+            ("sub_offset", "sub/sub1/subm1", ["sub", "sub1", "subm1"]),
+            ("single_rev_sub", "rev_sub", ["rev_sub"]),
+            ("abs_diff_sign", "abs_diff/neg_abs_diff", ["abs_diff", "neg_abs_diff"]),
+            ("mul_offset", "mul/mul1/mulm1", ["mul", "mul1", "mulm1"]),
+            ("mod_family", "max_mod_min/mod/rev_mod", ["max_mod_min", "mod", "rev_mod"]),
+            ("div_family", "div/rev_div", ["div", "rev_div"]),
+        ]
+
+    def _detect_format(self, op: str, group: List[Example]) -> str:
+        # Hard evidence first.
+        if op != "-" and any(ex.raw_out.startswith(op) and len(ex.raw_out) > len(op) for ex in group):
+            return "neg_prefix"
+        if op != "-" and any(ex.raw_out.endswith(op) and len(ex.raw_out) > len(op) for ex in group):
+            return "neg_suffix"
+        if any(ex.raw_out.endswith("-") and len(ex.raw_out) > 1 for ex in group):
+            return "neg_suffix_dash"
+        # Latent negative display for non-minus target operators.  Positive
+        # examples cannot distinguish num vs prefix; prefix is safer on this task
+        # family when the target result later becomes negative.
+        if op != "-":
+            return "neg_prefix"
+        return "num"
+
+    def solve(self, examples_text: str, target_text: str) -> Dict[str, Any]:
+        qm = self._numeric_re.fullmatch(str(target_text).strip())
+        if not qm:
+            return self._failure("target expression must look like '<number><operator><number>'")
+
+        q_a, q_op, q_b = qm.group(1), qm.group(2).strip(), qm.group(3)
+        raw_examples = self._parse_examples(examples_text)
+        if not raw_examples:
+            return self._failure("no valid examples found")
+
+        # If target operator is present, keep the normal target-first solver, but
+        # with the overridden family order and latent display-format policy above.
+        if any(ex.op == q_op for ex in raw_examples):
+            return super().solve(examples_text, target_text)
+
+        # If target operator is absent, do not use a constant fallback.  Infer the
+        # dominant prompt-level transform from the operators that are visible.
+        hyp, context_lines = self._contextual_unseen_hypothesis(q_op, raw_examples)
+        final, target_lines = self._render_contextual_unseen_target(q_a, q_op, q_b, hyp, context_lines)
+
+        # Parser-stable CoT for augmentation.  The old contextual solver returned
+        # only the fallback block; this keeps answer behavior unchanged but exposes
+        # Examples/Target and named context sections to downstream augmenters.
+        examples_for_header = [Example(a=e.a, op=e.op, b=e.b, raw_out=e.raw_out, norm_out=e.raw_out) for e in raw_examples]
+        lines: List[str] = []
+        lines.append("We need to infer the target even though its operator is not shown in the examples.")
+        lines.append("This solver first extracts visible-operator context, then applies a contextual fallback rule.")
+        lines.append("")
+        lines.extend(self._render_header(examples_for_header, f"{q_a}{q_op}{q_b}"))
+        lines.append("Visible operator context and fallback")
+        lines.extend(target_lines)
+        return self._success(final, lines, "contextual_fallback_for_unseen_operator", q_op, hyp, True)
+
+    def _strict_detect_format_for_context(self, op: str, group: List[Example]) -> str:
+        """Detect only formats proven by visible examples; no latent default."""
+        if op != "-" and any(ex.raw_out.startswith(op) and len(ex.raw_out) > len(op) for ex in group):
+            return "neg_prefix"
+        if op != "-" and any(ex.raw_out.endswith(op) and len(ex.raw_out) > len(op) for ex in group):
+            return "neg_suffix"
+        if any(ex.raw_out.endswith("-") and len(ex.raw_out) > 1 for ex in group):
+            return "neg_suffix_dash"
+        return "num"
+
+    def _normalize_group_for_context(self, op: str, group: List[Example], fmt: str) -> List[Example]:
+        return [
+            Example(
+                a=ex.a,
+                op=ex.op,
+                b=ex.b,
+                raw_out=ex.raw_out,
+                norm_out=self._normalize_output_for_format(ex.raw_out, op, fmt),
+            )
+            for ex in group
+        ]
+
+    def _contextual_unseen_hypothesis(self, q_op: str, raw_examples: List[Example]) -> Tuple[Hypothesis, List[str]]:
+        from collections import Counter, defaultdict
+
+        raw_groups: Dict[str, List[Example]] = defaultdict(list)
+        for ex in raw_examples:
+            raw_groups[ex.op].append(ex)
+
+        transform_votes: Counter = Counter()
+        soft_transform_votes: Counter = Counter()
+        format_votes: Counter = Counter()
+        solved: List[Tuple[str, int, Hypothesis]] = []
+
+        for op, raw_group in raw_groups.items():
+            fmt = self._strict_detect_format_for_context(op, raw_group)
+            group = self._normalize_group_for_context(op, raw_group, fmt)
+            found, _attempts = self._match_operator(op, group, fmt)
+            if found is None:
+                continue
+            op_name, rev_ops, rev_res, out_fmt = found
+            weight = max(1, len(raw_group))
+            solved.append((op, weight, found))
+            transform_votes[(rev_ops, rev_res)] += weight
+            format_votes[out_fmt] += weight
+
+            # A small soft vote: count every transform that can explain the group
+            # with at least one searched family.  This avoids over-trusting a single
+            # ambiguous one-example visible operator.
+            for tr in self.transform_order:
+                if self._any_rule_matches_transform(op, raw_group, fmt, tr):
+                    soft_transform_votes[tr] += max(1, weight / 2)
+
+        # Transform: use selected visible rules if there is a reasonably strong
+        # majority; otherwise use the softer all-matching transform evidence.
+        if transform_votes:
+            best_tr, best_w = transform_votes.most_common(1)[0]
+            frac = best_w / sum(transform_votes.values())
+            if frac >= 0.60:
+                rev_ops, rev_res = best_tr
+            elif soft_transform_votes:
+                rev_ops, rev_res = soft_transform_votes.most_common(1)[0][0]
+            else:
+                rev_ops, rev_res = best_tr
+        elif soft_transform_votes:
+            rev_ops, rev_res = soft_transform_votes.most_common(1)[0][0]
+        else:
+            rev_ops, rev_res = False, False
+
+        # Format: only reuse non-numeric display when it is strongly evidenced by
+        # other operators.  Otherwise keep normal numeric display.
+        fmt = "num"
+        if q_op != "-" and format_votes:
+            best_fmt, best_fmt_w = format_votes.most_common(1)[0]
+            if best_fmt != "num" and best_fmt_w / sum(format_votes.values()) >= 0.67:
+                fmt = best_fmt
+
+        op_name = self._NATURAL_OPS.get(q_op, "abs_diff")
+        hyp: Hypothesis = (op_name, rev_ops, rev_res, fmt)
+
+        lines = [
+            "Contextual fallback",
+            "Visible operator context",
+            f"Target operator {self._literal(q_op)} was not found in the examples.",
+            "Infer prompt-level operand/result transform from visible operators instead of using a constant abs-diff fallback.",
+        ]
+        if solved:
+            for op, weight, found in solved:
+                lines.append(f"- visible operator {self._literal(op)} with weight {weight}: {self._hypothesis_name(found)}")
+        else:
+            lines.append("- no visible operator received a reduced-family rule; use neutral transform.")
+        lines.append(f"Chosen contextual fallback rule: {self._hypothesis_name(hyp)}")
+        lines.append("")
+        return hyp, lines
+
+    def _any_rule_matches_transform(
+        self,
+        op: str,
+        raw_group: List[Example],
+        fmt: str,
+        transform: Tuple[bool, bool],
+    ) -> bool:
+        group = self._normalize_group_for_context(op, raw_group, fmt)
+        rev_ops, rev_res = transform
+        rows = self._required_rows_for_transform(op, group, rev_ops, rev_res)
+        for family, _label, _ops in self._family_search_order():
+            result = self._compute_family_result(family, rows)
+            if any(result.op_passes.values()):
+                return True
+        return False
+
+    def _render_contextual_unseen_target(
+        self,
+        q_a: str,
+        q_op: str,
+        q_b: str,
+        hyp: Hypothesis,
+        context_lines: List[str],
+    ) -> Tuple[str, List[str]]:
+        op_name, rev_ops, rev_res, fmt = hyp
+        step = self._eval_example(q_a, q_b, q_op, op_name, rev_ops, rev_res, fmt, expected=None)
+        lines = []
+        lines.extend(context_lines)
+        lines.extend([
+            "Target application",
+            "Target",
+            f"Replay contextual fallback on target {q_a} {q_op} {q_b}:",
+        ])
+        for detail in step.lines:
+            lines.append(f"  {detail}")
+        lines.append(f"Final answer: {step.final_output}")
+        return step.final_output, lines
+
+
+
+# ---------------------------------------------------------------------------
+# V3: prompt-structure fallback with parser-stable contextual CoT sections.
+#
+# This class intentionally reuses the contextual solver above for seen targets
+# and for standard unseen symbols (+ - * /).  The only extra logic is for
+# absent non-standard target operators: instead of always using abs_diff, choose
+# the operation family from the set of visible solved families in the prompt.
+# The table below was learned from operator-dropout prompts generated from the
+# available solved examples, not from the real absent-target labels.
+
+class ASTBruteForceSolver(ASTBruteForceSolver):  # type: ignore[misc, no-redef]
+    _FAMILY_CANONICAL_OP = {
+        "concat": "cat",
+        "add_offset": "add",
+        "sub_offset": "sub",
+        "single_rev_sub": "rev_sub",
+        "abs_diff_sign": "abs_diff",
+        "mul_offset": "mul",
+        "mod_family": "max_mod_min",
+        "div_family": "div",
+    }
+
+    _GLOBAL_MISSING_FAMILY_ORDER = [
+        "add_offset",
+        "mul_offset",
+        "abs_diff_sign",
+        "concat",
+        "sub_offset",
+        "mod_family",
+        "single_rev_sub",
+        "div_family",
+    ]
+
+    _MISSING_FAMILY_BY_VISIBLE_SET = {
+        ("abs_diff_sign",): "add_offset",
+        ("add_offset",): "mul_offset",
+        ("concat",): "add_offset",
+        ("mod_family",): "mul_offset",
+        ("mul_offset",): "add_offset",
+        ("single_rev_sub",): "mul_offset",
+        ("sub_offset",): "add_offset",
+        ("abs_diff_sign", "add_offset"): "mul_offset",
+        ("abs_diff_sign", "concat"): "add_offset",
+        ("abs_diff_sign", "mul_offset"): "add_offset",
+        ("add_offset", "concat"): "abs_diff_sign",
+        ("add_offset", "mod_family"): "mul_offset",
+        ("add_offset", "mul_offset"): "abs_diff_sign",
+        ("add_offset", "single_rev_sub"): "mul_offset",
+        ("add_offset", "sub_offset"): "mul_offset",
+        ("concat", "mod_family"): "add_offset",
+        ("concat", "mul_offset"): "abs_diff_sign",
+        ("concat", "single_rev_sub"): "add_offset",
+        ("concat", "sub_offset"): "add_offset",
+        ("mod_family", "mul_offset"): "add_offset",
+        ("mul_offset", "single_rev_sub"): "add_offset",
+        ("mul_offset", "sub_offset"): "add_offset",
+    }
+
+    def _op_to_family_map(self) -> Dict[str, str]:
+        m: Dict[str, str] = {}
+        for family, _label, ops in self._family_search_order():
+            for op_name in ops:
+                m[op_name] = family
+        return m
+
+    def _choose_missing_family_for_nonstandard_unseen(self, visible_families: Iterable[str]) -> Tuple[str, str]:
+        visible_set = set(visible_families)
+        key = tuple(sorted(visible_set))
+        if key in self._MISSING_FAMILY_BY_VISIBLE_SET:
+            family = self._MISSING_FAMILY_BY_VISIBLE_SET[key]
+            return family, f"operator-dropout table for visible family set {key!r}"
+        for family in self._GLOBAL_MISSING_FAMILY_ORDER:
+            if family not in visible_set:
+                return family, f"global missing-family backoff; visible family set {key!r}"
+        return "abs_diff_sign", f"all known families visible; conservative abs-diff backoff for {key!r}"
+
+    def _contextual_unseen_hypothesis(self, q_op: str, raw_examples: List[Example]) -> Tuple[Hypothesis, List[str]]:
+        from collections import Counter, defaultdict
+
+        raw_groups: Dict[str, List[Example]] = defaultdict(list)
+        for ex in raw_examples:
+            raw_groups[ex.op].append(ex)
+
+        family_by_op = self._op_to_family_map()
+        transform_votes: Counter = Counter()
+        soft_transform_votes: Counter = Counter()
+        format_votes: Counter = Counter()
+        visible_family_votes: Counter = Counter()
+        solved: List[Tuple[str, int, Hypothesis, str]] = []
+
+        for op, raw_group in raw_groups.items():
+            fmt = self._strict_detect_format_for_context(op, raw_group)
+            group = self._normalize_group_for_context(op, raw_group, fmt)
+            found, _attempts = self._match_operator(op, group, fmt)
+            if found is None:
+                continue
+            op_name, rev_ops, rev_res, out_fmt = found
+            family = family_by_op.get(op_name, "unknown")
+            weight = max(1, len(raw_group))
+            solved.append((op, weight, found, family))
+            transform_votes[(rev_ops, rev_res)] += weight
+            format_votes[out_fmt] += weight
+            visible_family_votes[family] += weight
+
+            for tr in self.transform_order:
+                if self._any_rule_matches_transform(op, raw_group, fmt, tr):
+                    soft_transform_votes[tr] += max(1, weight / 2)
+
+        if transform_votes:
+            best_tr, best_w = transform_votes.most_common(1)[0]
+            frac = best_w / sum(transform_votes.values())
+            if frac >= 0.60:
+                rev_ops, rev_res = best_tr
+            elif soft_transform_votes:
+                rev_ops, rev_res = soft_transform_votes.most_common(1)[0][0]
+            else:
+                rev_ops, rev_res = best_tr
+        elif soft_transform_votes:
+            rev_ops, rev_res = soft_transform_votes.most_common(1)[0][0]
+        else:
+            rev_ops, rev_res = False, False
+
+        fmt = "num"
+        if q_op != "-" and format_votes:
+            best_fmt, best_fmt_w = format_votes.most_common(1)[0]
+            if best_fmt != "num" and best_fmt_w / sum(format_votes.values()) >= 0.67:
+                fmt = best_fmt
+
+        family_reason = ""
+        if q_op in self._NATURAL_OPS:
+            op_name = self._NATURAL_OPS[q_op]
+            family_reason = f"standard target symbol {self._literal(q_op)} uses natural operation {op_name}"
+        else:
+            family, family_reason = self._choose_missing_family_for_nonstandard_unseen(visible_family_votes.keys())
+            op_name = self._FAMILY_CANONICAL_OP.get(family, "abs_diff")
+
+        hyp: Hypothesis = (op_name, rev_ops, rev_res, fmt)
+
+        lines = [
+            "Contextual fallback",
+            "Visible operator context",
+            f"Target operator {self._literal(q_op)} was not found in the examples.",
+            "Infer prompt-level operand/result transform from visible operators instead of using a constant abs-diff fallback.",
+        ]
+        if solved:
+            for op, weight, found, family in solved:
+                lines.append(
+                    f"- visible operator {self._literal(op)} with weight {weight}: {self._hypothesis_name(found)}; family={family}"
+                )
+        else:
+            lines.append("- no visible operator received a reduced-family rule; use neutral transform.")
+        lines.append("Contextual fallback selection")
+        if q_op not in self._NATURAL_OPS:
+            lines.append(
+                "Non-standard unseen target: choose a likely missing operation family from the visible family set rather than copying the visible family."
+            )
+        lines.append(f"Family choice reason: {family_reason}")
+        lines.append(f"Chosen contextual fallback rule: {self._hypothesis_name(hyp)}")
+        lines.append("")
+        return hyp, lines

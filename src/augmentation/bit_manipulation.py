@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -29,7 +29,14 @@ _BEST_PREFIX = {
     "AND-NOT": "AND-NOT",
     "OR-NOT": "OR-NOT",
     "XOR-NOT": "XOR-NOT",
+    "MAJ": "MAJ",
+    "MIN": "MIN",
+    "CHOICE": "CHOICE",
+    "NCHOICE": "NCHOICE",
 }
+
+TERNARY_SECTIONS = frozenset({"MAJ", "MIN", "CHOICE", "NCHOICE"})
+PAIR_GROUP_SECTIONS = frozenset({"AND", "OR", "XOR", "AND-NOT", "OR-NOT", "XOR-NOT"})
 
 BIT_PROMPT_MARKER = "secret bit manipulation rule transforms 8-bit binary numbers"
 
@@ -86,13 +93,99 @@ class BitMatchingAugmentGenerator:
         ]
 
     @staticmethod
-    def _format_section_data_lines(analysis: Any, section: str) -> List[str]:
-        """Equivalent to matching.py data_lines: no section header, keep group blanks."""
+    def _section_view(analysis: Any, section: str) -> Tuple[List[Any], List[List[Any]]]:
+        """Return the same deterministic section view used by the solver trace.
+
+        The solver evaluates every ternary candidate, but renders a compact view:
+        the selected exact chain plus at most 16 deterministic partial matches that
+        improve output-bit coverage. Matching augmentation must use that same view;
+        otherwise MAJ/MIN/CHOICE/NCHOICE examples become much larger than the CoT
+        they are intended to teach.
+        """
+        section_records = list(analysis.records.get(section, []))
+        per_bit = [list(cands) for cands in analysis.matches.get(section, [[] for _ in range(8)])]
+
+        if section not in TERNARY_SECTIONS:
+            return section_records, per_bit
+
+        # Keep every record that belongs to the injected exact program.
+        # Reading program_key directly is safer than inferring the chain from
+        # analysis.selected, which may contain mixed fallback rules.
+        chosen_labels: set[str] = {
+            compact_rule(cand)
+            for bit_cands in per_bit
+            for cand in bit_cands
+            if getattr(cand, "program_key", None) is not None
+        }
+
+        covered: set[int] = set()
+        for rec in section_records:
+            if rec.label in chosen_labels:
+                covered.update(rec.matches)
+
+        for rec in sorted(section_records, key=lambda item: (-len(item.matches), item.label, item.col)):
+            if len(chosen_labels) >= 16:
+                break
+            if rec.label in chosen_labels:
+                continue
+            if any(bit not in covered for bit in rec.matches):
+                chosen_labels.add(rec.label)
+                covered.update(rec.matches)
+
+        filtered_records = [rec for rec in section_records if rec.label in chosen_labels]
+        allowed_exprs = {f"{section}{label}" for label in chosen_labels}
+        filtered_matches: List[List[Any]] = []
+        for bit_cands in per_bit:
+            filtered_matches.append([
+                cand
+                for cand in bit_cands
+                if getattr(cand, "expr", "") in allowed_exprs
+                or getattr(cand, "program_key", None) is not None
+            ])
+
+        # An injected exact-program rule is stored in analysis.matches only at
+        # its intended output position so Left/Right can recover one coherent
+        # eight-bit program. Its Record, however, can legitimately match other
+        # output columns with identical demonstration vectors. Matching tasks
+        # must expose those matches too. Add plain (program_key-free) copies at
+        # every additional matching output bit while retaining the keyed copy
+        # at the intended position.
+        templates: Dict[str, Any] = {}
+        for bit_cands in per_bit:
+            for cand in bit_cands:
+                label = compact_rule(cand)
+                if label in chosen_labels:
+                    current = templates.get(label)
+                    if current is None or (
+                        getattr(current, "program_key", None) is not None
+                        and getattr(cand, "program_key", None) is None
+                    ):
+                        templates[label] = cand
+
+        for rec in filtered_records:
+            template = templates.get(rec.label)
+            if template is None:
+                continue
+            for out_bit in rec.matches:
+                if any(compact_rule(cand) == rec.label for cand in filtered_matches[out_bit]):
+                    continue
+                filtered_matches[out_bit].append(replace(template, program_key=None))
+
+        return filtered_records, filtered_matches
+
+    @staticmethod
+    def _format_section_data_lines(section: str, section_records: Sequence[Any]) -> List[str]:
+        """Equivalent to matching.py data_lines: no section header, keep legacy group blanks."""
         lines: List[str] = []
         prev_diff: Optional[int] = None
 
-        for rec in analysis.records[section]:
-            if len(rec.label) >= 2 and rec.label[0].isdigit() and rec.label[1].isdigit():
+        for rec in section_records:
+            if (
+                section in PAIR_GROUP_SECTIONS
+                and len(rec.label) >= 2
+                and rec.label[0].isdigit()
+                and rec.label[1].isdigit()
+            ):
                 diff = (int(rec.label[1]) - int(rec.label[0])) % 8
                 if prev_diff is not None and diff != prev_diff:
                     lines.append("")
@@ -108,19 +201,25 @@ class BitMatchingAugmentGenerator:
         return lines
 
     @staticmethod
-    def _format_matching_output_lines(analysis: Any, section: str) -> List[str]:
+    def _format_matching_output_lines(section: str, per_bit: Sequence[Sequence[Any]]) -> List[str]:
         """Equivalent to matching.py output_text: no 'Matching output' header."""
-        per_bit = analysis.matches[section]
-
         mo_lines: List[str] = []
         for bit in range(8):
             cands = per_bit[bit]
             if cands:
-                mo_lines.append(f"{bit} " + " ".join(compact_rule(c) for c in cands))
+                seen: set[str] = set()
+                labels: List[str] = []
+                for cand in cands:
+                    label = compact_rule(cand)
+                    if label not in seen:
+                        seen.add(label)
+                        labels.append(label)
+                mo_lines.append(f"{bit} " + " ".join(labels))
             else:
                 mo_lines.append(f"{bit} absent")
 
-        left_chain, best_left, right_chain, best_right = lr_from_matches(per_bit)
+        per_bit_lists = [list(cands) for cands in per_bit]
+        left_chain, best_left, right_chain, best_right = lr_from_matches(per_bit_lists)
         best_left = BitMatchingAugmentGenerator._strip_best_prefix(section, f"Best: {best_left}")
         best_right = BitMatchingAugmentGenerator._strip_best_prefix(section, f"Best: {best_right}")
 
@@ -135,14 +234,14 @@ class BitMatchingAugmentGenerator:
         )
 
     @staticmethod
-    def _section_flags(analysis: Any, section: str, output_lines: Sequence[str], data_lines: Sequence[str]) -> Dict[str, bool]:
-        per_bit = analysis.matches[section]
-        left_chain, _, right_chain, _ = lr_from_matches(per_bit)
+    def _section_flags(per_bit: Sequence[Sequence[Any]], data_lines: Sequence[str]) -> Dict[str, bool]:
+        per_bit_lists = [list(cands) for cands in per_bit]
+        left_chain, _, right_chain, _ = lr_from_matches(per_bit_lists)
         chain_text = " ".join(left_chain + right_chain)
         n_matches = sum(1 for line in data_lines if "match" in line)
         return {
-            "has_x": bool(re.search(r"\dx", chain_text)),
-            "has_y": bool(re.search(r"\dy", chain_text)),
+            "has_x": bool(re.search(r"(?:^|\s)[^\s]*x(?:\s|$)", chain_text)),
+            "has_y": bool(re.search(r"(?:^|\s)[^\s]*y(?:\s|$)", chain_text)),
             "all_absent": n_matches == 0,
             "both_none": left_chain == ["none"] and right_chain == ["none"],
             "few_matches": n_matches < 4,
@@ -171,10 +270,11 @@ class BitMatchingAugmentGenerator:
         source_solver_correct: bool,
     ) -> Optional[Dict[str, Any]]:
         obc_block = self._format_output_bit_columns(analysis)
-        data_lines = self._format_section_data_lines(analysis, section)
-        output_lines = self._format_matching_output_lines(analysis, section)
+        section_records, per_bit = self._section_view(analysis, section)
+        data_lines = self._format_section_data_lines(section, section_records)
+        output_lines = self._format_matching_output_lines(section, per_bit)
 
-        flags = self._section_flags(analysis, section, output_lines, data_lines)
+        flags = self._section_flags(per_bit, data_lines)
         if not self._keep_section(source_id, section, flags):
             return None
 
